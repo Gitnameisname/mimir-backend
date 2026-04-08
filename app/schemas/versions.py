@@ -118,6 +118,46 @@ class DraftSaveRequest(BaseModel):
         return v
 
 
+class DraftNodeItem(BaseModel):
+    """PATCH /documents/{id}/versions/{vid}/draft 에 포함되는 단일 노드 입력.
+
+    프론트엔드 DocumentNode 인터페이스와 1:1 매핑.
+    id가 없으면 DB에서 UUID 자동 생성.
+    """
+
+    id: Optional[str] = Field(None, description="클라이언트 제공 UUID (없으면 DB 자동 생성)")
+    node_type: str = Field(default="paragraph", min_length=1, max_length=100)
+    order: int = Field(default=0, ge=0, description="루트 레벨 순서 (frontend `order` 필드)")
+    parent_id: Optional[str] = Field(None, description="부모 노드 UUID (없으면 루트 노드)")
+    title: Optional[str] = Field(None, max_length=500)
+    content: Optional[str] = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("metadata", mode="before")
+    @classmethod
+    def validate_metadata(cls, v: Any) -> dict[str, Any]:
+        if v is None:
+            return {}
+        if not isinstance(v, dict):
+            raise ValueError("metadata must be a key-value object (dict)")
+        return v
+
+
+class DraftNodeSaveRequest(BaseModel):
+    """PATCH /documents/{id}/versions/{vid}/draft request body.
+
+    에디터에서 노드 트리 + 제목을 저장할 때 사용하는 엔드포인트.
+    - nodes: 현재 버전의 전체 노드 목록 (기존 노드를 모두 교체).
+    - title: 변경된 제목 (없으면 기존 title_snapshot 유지).
+    """
+
+    title: Optional[str] = Field(None, min_length=1, max_length=500)
+    summary: Optional[str] = Field(None, max_length=2000)
+    label: Optional[str] = Field(None, max_length=200)
+    change_summary: Optional[str] = None
+    nodes: list[DraftNodeItem] = Field(default_factory=list)
+
+
 class PublishRequest(BaseModel):
     """POST /documents/{id}/publish request body."""
 
@@ -163,6 +203,11 @@ class VersionResponse(BaseModel):
     # Phase 4 확장
     parent_version_id: Optional[str] = None
     restored_from_version_id: Optional[str] = None
+    title_snapshot: Optional[str] = Field(
+        default=None,
+        description="Draft/Publish 시점에 저장된 문서 제목 스냅샷. 에디터 초기 제목 로드에 사용.",
+    )
+    summary_snapshot: Optional[str] = None
     published_by: Optional[str] = None
     published_at: Optional[datetime] = None
 

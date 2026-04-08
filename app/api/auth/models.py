@@ -53,6 +53,8 @@ class ActorContext:
         is_authenticated: 실제 검증 성공 여부
         auth_method:      어떤 입력 소스로 식별 시도했는지
         tenant_id:        멀티테넌시 scope (미검증 시 None)
+        role:             전역 역할명 (VIEWER / AUTHOR / REVIEWER / APPROVER / ORG_ADMIN / SUPER_ADMIN)
+                          인증되지 않은 경우 None.
     """
 
     actor_type: ActorType
@@ -60,6 +62,7 @@ class ActorContext:
     is_authenticated: bool
     auth_method: Optional[AuthMethod]
     tenant_id: Optional[str]
+    role: Optional[str] = None
 
     @property
     def is_anonymous(self) -> bool:

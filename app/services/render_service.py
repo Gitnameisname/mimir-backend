@@ -22,6 +22,7 @@ import logging
 from typing import Any, Optional
 
 from app.models.version import Version
+from app.schemas.render import RenderBlock, RenderDocument, RenderWarning, StatusBadge, TocItem
 
 logger = logging.getLogger(__name__)
 
@@ -194,32 +195,28 @@ class RenderService:
         current_draft_id: Optional[str] = None,
         current_published_id: Optional[str] = None,
         include_toc: bool = True,
-    ) -> dict[str, Any]:
-        """Version → RenderDocument dict 변환.
+    ) -> RenderDocument:
+        """Version → RenderDocument 변환.
 
         content_snapshot이 None이면 빈 문서를 반환한다.
         """
         mode = _render_mode(version, current_draft_id, current_published_id)
-        badge = _status_badge(mode, version.version_number)
+        badge_dict = _status_badge(mode, version.version_number)
+        badge = StatusBadge(**badge_dict)
         warnings: list[dict] = []
         unsupported_types: list[str] = []
 
         snapshot = version.content_snapshot
         if not snapshot:
-            return {
-                "source_document_id": version.document_id,
-                "source_version_id": version.id,
-                "source_version_number": version.version_number,
-                "render_mode": mode,
-                "title": version.title_snapshot or "",
-                "summary": version.summary_snapshot,
-                "status_badge": badge,
-                "toc": [],
-                "blocks": [],
-                "appendix_blocks": [],
-                "warnings": [],
-                "unsupported_blocks": [],
-            }
+            return RenderDocument(
+                source_document_id=version.document_id,
+                source_version_id=version.id,
+                source_version_number=version.version_number,
+                render_mode=mode,
+                title=version.title_snapshot or "",
+                summary=version.summary_snapshot,
+                status_badge=badge,
+            )
 
         # 루트가 document 타입인지 확인
         if not isinstance(snapshot, dict):
@@ -246,22 +243,22 @@ class RenderService:
         _collect_unsupported(blocks)
 
         main_blocks, appendix_blocks = _split_appendix(blocks)
-        toc = _extract_toc(main_blocks) if include_toc else []
+        toc_dicts = _extract_toc(main_blocks) if include_toc else []
 
-        return {
-            "source_document_id": version.document_id,
-            "source_version_id": version.id,
-            "source_version_number": version.version_number,
-            "render_mode": mode,
-            "title": version.title_snapshot or "",
-            "summary": version.summary_snapshot,
-            "status_badge": badge,
-            "toc": toc,
-            "blocks": main_blocks,
-            "appendix_blocks": appendix_blocks,
-            "warnings": warnings,
-            "unsupported_blocks": unsupported_types,
-        }
+        return RenderDocument(
+            source_document_id=version.document_id,
+            source_version_id=version.id,
+            source_version_number=version.version_number,
+            render_mode=mode,
+            title=version.title_snapshot or "",
+            summary=version.summary_snapshot,
+            status_badge=badge,
+            toc=[TocItem(**t) for t in toc_dicts],
+            blocks=[RenderBlock(**b) for b in main_blocks],
+            appendix_blocks=[RenderBlock(**b) for b in appendix_blocks],
+            warnings=[RenderWarning(**w) for w in warnings],
+            unsupported_blocks=unsupported_types,
+        )
 
 
 # 모듈 수준 싱글턴

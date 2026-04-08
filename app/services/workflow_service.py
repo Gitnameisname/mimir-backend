@@ -41,14 +41,24 @@ from app.repositories.workflow_repository import workflow_repository
 
 logger = logging.getLogger(__name__)
 
-# WorkflowRole 값 → WorkflowRole Enum 변환 (없으면 AUTHOR 기본값)
-_ROLE_MAP: dict[str, WorkflowRole] = {r.value: r for r in WorkflowRole}
+# 문자열 역할 → WorkflowRole Enum 변환 테이블.
+# WorkflowRole 자체 값 외에 Phase 2 RBAC 역할명(대/소문자 무관)도 포함한다.
+_ROLE_MAP: dict[str, WorkflowRole] = {
+    # WorkflowRole 직접 값 (소문자)
+    **{r.value: r for r in WorkflowRole},
+    # Phase 2 RBAC 역할 → WorkflowRole 매핑
+    "viewer":      WorkflowRole.AUTHOR,   # 뷰어는 최소 권한(AUTHOR)으로 처리; RBAC에서 차단됨
+    "org_admin":   WorkflowRole.ADMIN,
+    "super_admin": WorkflowRole.ADMIN,
+}
 
 
 def _resolve_role(role_str: Optional[str]) -> WorkflowRole:
     """문자열 역할을 WorkflowRole Enum으로 변환한다.
 
-    알 수 없는 역할은 AUTHOR로 폴백.
+    WorkflowRole 값(author/reviewer/approver/admin)과
+    Phase 2 RBAC 역할명(VIEWER/AUTHOR/REVIEWER/APPROVER/ORG_ADMIN/SUPER_ADMIN)
+    을 모두 처리한다. 알 수 없는 역할은 AUTHOR로 폴백.
     """
     if role_str is None:
         return WorkflowRole.AUTHOR

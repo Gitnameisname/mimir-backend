@@ -16,8 +16,9 @@ Documents 서비스 계층.
   - versions / audit logging은 이 서비스를 확장하거나 별도 서비스로 분리해 붙인다.
 """
 
+import json
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 import psycopg2.extensions
 
@@ -28,6 +29,37 @@ from app.repositories.documents_repository import documents_repository
 from app.schemas.documents import DocumentCreateRequest, DocumentResponse, DocumentUpdateRequest
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_metadata_against_schema(
+    conn: psycopg2.extensions.connection,
+    document_type: str,
+    metadata: dict[str, Any],
+) -> None:
+    """document_types.schema_fields의 required 필드가 metadata에 모두 존재하는지 검증.
+
+    document_type이 DB에 없거나 schema_fields가 비어있으면 검증을 건너뛴다.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT schema_fields FROM document_types WHERE type_code = %s AND status = 'active'",
+            (document_type,),
+        )
+        row = cur.fetchone()
+
+    if row is None or not row[0]:
+        return  # 미등록 타입이거나 스키마 없음 — 검증 생략
+
+    schema_fields = row[0] if isinstance(row[0], list) else json.loads(row[0])
+    missing = [
+        f["name"]
+        for f in schema_fields
+        if f.get("required") and f["name"] not in metadata
+    ]
+    if missing:
+        raise ApiValidationError(
+            f"metadata에 필수 필드가 없습니다: {', '.join(missing)}"
+        )
 
 
 def _to_response(doc: Document) -> DocumentResponse:
@@ -67,6 +99,7 @@ class DocumentsService:
         TODO (Task I-9): 이 메서드 상단이 idempotency hook 삽입 슬롯이다.
             idempotency_key가 주어지면 replay 여부를 먼저 확인한다.
         """
+        _validate_metadata_against_schema(conn, request.document_type, request.metadata)
         doc = documents_repository.create(
             conn,
             title=request.title,
@@ -137,6 +170,11 @@ class DocumentsService:
         if not request.has_updates():
             # 수정할 내용이 없으면 현재 문서 반환 (no-op)
             return self.get_document(conn, document_id)
+
+        # metadata가 교체되는 경우 schema 검증 수행
+        if request.metadata is not None:
+            current = self.get_document(conn, document_id)
+            _validate_metadata_against_schema(conn, current.document_type, request.metadata)
 
         updated = documents_repository.update(
             conn,

@@ -15,7 +15,7 @@ Phase 5 워크플로 액션 엔드포인트:
   - 액션별 엔드포인트: OpenAPI 명확성 + 권한 정책 분리 + 감사 추적 용이성
   - 라우터는 얇게 유지 (파싱/위임/응답만)
   - 비즈니스 로직은 WorkflowService에 위임
-  - 역할(actor_role)은 X-Actor-Role 헤더 또는 ActorContext에서 추출 (stub 기간)
+  - 역할(actor_role)은 ActorContext.role(DB 조회) → X-Actor-Role 헤더(개발용) 순으로 추출
 """
 
 from typing import Optional
@@ -49,9 +49,9 @@ def _actor_info(actor: ActorContext, x_actor_role: Optional[str]) -> tuple[Optio
     """actor_id와 actor_role을 반환한다.
 
     actor_role 우선순위:
-      1. ActorContext.role (실제 인증 연동 후)
-      2. X-Actor-Role 헤더 (stub 기간 테스트용)
-      3. None (AUTHOR로 폴백됨)
+      1. ActorContext.role — API key / dev header / bearer(DB 조회) 경로에서 채워짐
+      2. X-Actor-Role 헤더 — ActorContext.role이 None일 때만 사용 (개발 편의용)
+      3. None — workflow_service에서 AUTHOR로 폴백
     """
     actor_id = actor.actor_id if actor.is_authenticated else None
     role = getattr(actor, "role", None) or x_actor_role
@@ -124,7 +124,7 @@ def submit_review(
         actor=actor,
         action="workflow.submit_review",
         resource=ResourceRef(resource_type="version", resource_id=version_id, parent_id=document_id),
-        require_authenticated=False,
+        require_authenticated=True,
     )
     request_id, trace_id = _ctx(request)
     actor_id, actor_role = _actor_info(actor, x_actor_role)
@@ -173,7 +173,7 @@ def approve(
         actor=actor,
         action="workflow.approve",
         resource=ResourceRef(resource_type="version", resource_id=version_id, parent_id=document_id),
-        require_authenticated=False,
+        require_authenticated=True,
     )
     request_id, trace_id = _ctx(request)
     actor_id, actor_role = _actor_info(actor, x_actor_role)
@@ -223,7 +223,7 @@ def reject(
         actor=actor,
         action="workflow.reject",
         resource=ResourceRef(resource_type="version", resource_id=version_id, parent_id=document_id),
-        require_authenticated=False,
+        require_authenticated=True,
     )
     request_id, trace_id = _ctx(request)
     actor_id, actor_role = _actor_info(actor, x_actor_role)
@@ -273,7 +273,7 @@ def publish(
         actor=actor,
         action="workflow.publish",
         resource=ResourceRef(resource_type="version", resource_id=version_id, parent_id=document_id),
-        require_authenticated=False,
+        require_authenticated=True,
     )
     request_id, trace_id = _ctx(request)
     actor_id, actor_role = _actor_info(actor, x_actor_role)
@@ -323,7 +323,7 @@ def archive(
         actor=actor,
         action="workflow.archive",
         resource=ResourceRef(resource_type="version", resource_id=version_id, parent_id=document_id),
-        require_authenticated=False,
+        require_authenticated=True,
     )
     request_id, trace_id = _ctx(request)
     actor_id, actor_role = _actor_info(actor, x_actor_role)
@@ -372,7 +372,7 @@ def return_to_draft(
         actor=actor,
         action="workflow.return_to_draft",
         resource=ResourceRef(resource_type="version", resource_id=version_id, parent_id=document_id),
-        require_authenticated=False,
+        require_authenticated=True,
     )
     request_id, trace_id = _ctx(request)
     actor_id, actor_role = _actor_info(actor, x_actor_role)

@@ -31,7 +31,8 @@ from app.api.query import FilterFieldSpec, ListQuerySpec, ParsedListQuery, make_
 from app.api.responses import SuccessResponse, list_response, success_response
 from app.db import get_db
 from app.schemas.documents import DocumentCreateRequest, DocumentResponse, DocumentUpdateRequest
-from app.schemas.versions import DraftSaveRequest, PublishRequest, RestoreRequest, VersionCreateRequest
+from app.schemas.render import RenderDocument
+from app.schemas.versions import DraftNodeSaveRequest, DraftSaveRequest, PublishRequest, RestoreRequest, VersionCreateRequest
 from app.services.documents_service import documents_service
 from app.services.draft_service import draft_service
 from app.services.render_service import render_service
@@ -155,7 +156,7 @@ def create_document(
         actor=actor,
         action="document.create",
         resource=ResourceRef(resource_type="document"),
-        require_authenticated=False,
+        require_authenticated=True,
     )
 
     request_id, trace_id = _ctx(request)
@@ -282,7 +283,7 @@ def update_document(
         actor=actor,
         action="document.update",
         resource=ResourceRef(resource_type="document", resource_id=document_id),
-        require_authenticated=False,
+        require_authenticated=True,
     )
 
     request_id, trace_id = _ctx(request)
@@ -404,7 +405,7 @@ def create_document_version(
         actor=actor,
         action="version.create",
         resource=ResourceRef(resource_type="version", parent_id=document_id),
-        require_authenticated=False,
+        require_authenticated=True,
     )
 
     request_id, trace_id = _ctx(request)
@@ -497,7 +498,7 @@ def save_draft(
         actor=actor,
         action="draft.save",
         resource=ResourceRef(resource_type="version", parent_id=document_id),
-        require_authenticated=False,
+        require_authenticated=True,
     )
     request_id, trace_id = _ctx(request)
     actor_id = actor.actor_id if actor.is_authenticated else None
@@ -516,6 +517,67 @@ def save_draft(
         request_id=request_id,
         trace_id=trace_id,
         metadata={"document_id": document_id, "version_number": version.version_number},
+    )
+
+    return success_response(data=version.model_dump(), request_id=request_id, trace_id=trace_id)
+
+
+# ---------------------------------------------------------------------------
+# PATCH /documents/{document_id}/versions/{version_id}/draft — 에디터 노드 저장
+# ---------------------------------------------------------------------------
+
+
+@router.patch(
+    "/{document_id}/versions/{version_id}/draft",
+    status_code=200,
+    summary="Draft 노드 저장 (에디터)",
+    description=(
+        "에디터에서 편집한 노드 목록 + 제목을 Draft 버전에 저장한다.\n\n"
+        "- `nodes`: 현재 버전의 전체 노드 목록으로 교체 (기존 노드 모두 삭제 후 삽입).\n"
+        "- `title`: 지정 시 `title_snapshot` 및 `documents.title`을 동기화한다.\n"
+        "- version_id가 현재 Draft 버전이 아니면 409.\n"
+        "- 워크플로 상태가 편집 불가(IN_REVIEW/APPROVED/PUBLISHED)이면 409.\n\n"
+        "**권한**: editor 이상"
+    ),
+    response_model=SuccessResponse,
+    tags=["draft"],
+)
+def save_draft_nodes(
+    document_id: str,
+    version_id: str,
+    request: Request,
+    body: DraftNodeSaveRequest,
+    actor: ActorContext = Depends(resolve_current_actor),
+) -> SuccessResponse:
+    authorization_service.authorize(
+        actor=actor,
+        action="draft.save",
+        resource=ResourceRef(resource_type="version", resource_id=version_id, parent_id=document_id),
+        require_authenticated=True,
+    )
+    request_id, trace_id = _ctx(request)
+    actor_id = actor.actor_id if actor.is_authenticated else None
+
+    with get_db() as conn:
+        version = draft_service.save_draft_nodes(
+            conn, document_id, version_id, body, actor_id=actor_id
+        )
+
+    from app.audit.emitter import audit_emitter
+    audit_emitter.emit(
+        event_type="draft.nodes_saved",
+        action="draft.save",
+        actor_id=actor_id,
+        resource_type="version",
+        resource_id=version.id,
+        result="success",
+        request_id=request_id,
+        trace_id=trace_id,
+        metadata={
+            "document_id": document_id,
+            "version_number": version.version_number,
+            "node_count": len(body.nodes),
+        },
     )
 
     return success_response(data=version.model_dump(), request_id=request_id, trace_id=trace_id)
@@ -548,7 +610,7 @@ def discard_draft(
         actor=actor,
         action="draft.discard",
         resource=ResourceRef(resource_type="version", parent_id=document_id),
-        require_authenticated=False,
+        require_authenticated=True,
     )
     request_id, trace_id = _ctx(request)
     actor_id = actor.actor_id if actor.is_authenticated else None
@@ -603,7 +665,7 @@ def publish_document(
         actor=actor,
         action="document.publish",
         resource=ResourceRef(resource_type="document", resource_id=document_id),
-        require_authenticated=False,
+        require_authenticated=True,
     )
     request_id, trace_id = _ctx(request)
     actor_id = actor.actor_id if actor.is_authenticated else None
@@ -713,7 +775,7 @@ def restore_version(
         actor=actor,
         action="version.restore",
         resource=ResourceRef(resource_type="version", resource_id=version_id, parent_id=document_id),
-        require_authenticated=False,
+        require_authenticated=True,
     )
     request_id, trace_id = _ctx(request)
     actor_id = actor.actor_id if actor.is_authenticated else None
@@ -763,7 +825,7 @@ def restore_version(
         "- `view=draft`: current_draft 기준 렌더링 (editor+ 권한 필요).\n"
         "- 해당 버전이 없으면 404 반환."
     ),
-    response_model=SuccessResponse,
+    response_model=SuccessResponse[RenderDocument],
     tags=["render"],
 )
 def render_document(
@@ -804,7 +866,7 @@ def render_document(
         current_published_id=doc.current_published_version_id,
     )
 
-    return success_response(data=render_result, request_id=request_id, trace_id=trace_id)
+    return success_response(data=render_result.model_dump(), request_id=request_id, trace_id=trace_id)
 
 
 # ---------------------------------------------------------------------------
@@ -820,7 +882,7 @@ def render_document(
         "- 버전이 존재하지 않거나 해당 문서에 속하지 않으면 404 반환.\n"
         "- 이력 탐색/복원 확인 용도로 사용한다."
     ),
-    response_model=SuccessResponse,
+    response_model=SuccessResponse[RenderDocument],
     tags=["render"],
 )
 def render_version_endpoint(
@@ -860,4 +922,4 @@ def render_version_endpoint(
         current_published_id=doc.current_published_version_id,
     )
 
-    return success_response(data=render_result, request_id=request_id, trace_id=trace_id)
+    return success_response(data=render_result.model_dump(), request_id=request_id, trace_id=trace_id)

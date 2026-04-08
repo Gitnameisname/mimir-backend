@@ -33,6 +33,7 @@ from app.models.version import Version
 from app.repositories.documents_repository import documents_repository
 from app.repositories.versions_repository import versions_repository
 from app.schemas.versions import (
+    DraftNodeSaveRequest,
     DraftSaveRequest,
     PublishRequest,
     RestoreRequest,
@@ -75,6 +76,8 @@ def _to_version_response(version: Version, workflow_status: Optional[str] = None
         created_at=version.created_at,
         parent_version_id=version.parent_version_id,
         restored_from_version_id=version.restored_from_version_id,
+        title_snapshot=version.title_snapshot,
+        summary_snapshot=version.summary_snapshot,
         published_by=version.published_by,
         published_at=version.published_at,
     )
@@ -215,6 +218,15 @@ class DraftService:
             logger.info(
                 "Draft updated: doc=%s ver=%s v%d actor=%s",
                 document_id, version.id, version.version_number, actor_id,
+            )
+
+        # documents.title 동기화 — 에디터에서 제목 변경 시 목록 뷰에도 즉시 반영
+        if request.title and request.title != doc.title:
+            documents_repository.update(
+                conn,
+                document_id,
+                title=request.title,
+                updated_by=actor_id,
             )
 
         from app.repositories.workflow_repository import workflow_repository
@@ -539,6 +551,101 @@ class DraftService:
                 restore_blocked_reason=reason,
             ),
         )
+
+    # ------------------------------------------------------------------
+    # save_draft_nodes
+    # ------------------------------------------------------------------
+
+    def save_draft_nodes(
+        self,
+        conn: psycopg2.extensions.connection,
+        document_id: str,
+        version_id: str,
+        request: DraftNodeSaveRequest,
+        *,
+        actor_id: Optional[str] = None,
+    ) -> VersionResponse:
+        """에디터에서 전달한 노드 목록으로 Draft를 저장한다.
+
+        PUT /draft (content_snapshot 기반) 와 달리, 노드를 nodes 테이블에 직접 저장한다.
+
+        흐름:
+          1. version_id가 document의 current_draft_version_id인지 검증
+          2. 워크플로 상태 검사 (편집 불가 상태면 409)
+          3. 노드 교체 (DELETE + INSERT)
+          4. title_snapshot / summary_snapshot 갱신
+          5. documents.title 동기화 (title 변경 시)
+        """
+        from app.repositories.nodes_repository import nodes_repository
+        from app.repositories.workflow_repository import workflow_repository
+        from app.domain.workflow.policies import EDITABLE_STATUSES
+        from app.domain.workflow.enums import WorkflowStatus
+
+        doc = documents_repository.get_by_id(conn, document_id)
+        if doc is None:
+            raise ApiNotFoundError(f"Document '{document_id}' not found")
+
+        if doc.current_draft_version_id != version_id:
+            raise ApiConflictError(
+                "Version is not the current draft of this document",
+                details={"current_draft_version_id": doc.current_draft_version_id},
+            )
+
+        draft = versions_repository.get_by_id(conn, version_id)
+        if draft is None:
+            raise ApiNotFoundError(f"Version '{version_id}' not found")
+
+        # 워크플로 상태 검사
+        raw_wf = workflow_repository.get_workflow_status(conn, version_id)
+        wf_status_str = raw_wf if raw_wf else draft.status
+        try:
+            wf_status = WorkflowStatus(wf_status_str)
+        except ValueError:
+            wf_status = WorkflowStatus.DRAFT
+        if wf_status not in EDITABLE_STATUSES:
+            raise ApiVersionNotEditableError(
+                f"Cannot edit version in '{wf_status.value}' state. Return to draft first.",
+                details={"workflow_status": wf_status.value},
+            )
+
+        # 노드 교체 — frontend order → DB order_index 매핑
+        node_items = [
+            {
+                "id": item.id,
+                "node_type": item.node_type,
+                "order_index": item.order,
+                "parent_id": item.parent_id,
+                "title": item.title,
+                "content": item.content,
+                "metadata": item.metadata,
+            }
+            for item in request.nodes
+        ]
+        nodes_repository.replace_for_version(conn, version_id, node_items)
+
+        # title_snapshot / summary_snapshot 갱신
+        title_snap = request.title if request.title is not None else (draft.title_snapshot or doc.title)
+        summary_snap = request.summary if request.summary is not None else draft.summary_snapshot
+        version = versions_repository.update_content(
+            conn,
+            version_id,
+            label=request.label,
+            change_summary=request.change_summary,
+            title_snapshot=title_snap,
+            summary_snapshot=summary_snap,
+        )
+
+        # documents.title 동기화
+        if request.title and request.title != doc.title:
+            documents_repository.update(conn, document_id, title=request.title, updated_by=actor_id)
+
+        logger.info(
+            "Draft nodes saved: doc=%s ver=%s nodes=%d actor=%s",
+            document_id, version_id, len(node_items), actor_id,
+        )
+
+        wf_status_val = workflow_repository.get_workflow_status(conn, version.id) or version.status
+        return _to_version_response(version, workflow_status=wf_status_val)
 
 
 # 모듈 수준 싱글턴

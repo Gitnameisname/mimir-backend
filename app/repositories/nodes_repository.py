@@ -15,7 +15,7 @@ Nodes persistence repository.
 import json
 import logging
 from typing import Any, Optional
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import psycopg2.extensions
 
@@ -102,6 +102,62 @@ class NodesRepository:
             cur.execute(sql, (version_id,))
             rows = cur.fetchall()
         return [_row_to_node(dict(row)) for row in rows]
+
+    def replace_for_version(
+        self,
+        conn: psycopg2.extensions.connection,
+        version_id: str,
+        node_items: list[dict[str, Any]],
+    ) -> list[Node]:
+        """버전의 모든 노드를 교체한다 (DELETE 후 INSERT).
+
+        에디터 저장 시 전체 노드 트리를 한 번에 교체한다.
+        node_items의 id 필드가 있으면 그대로 사용하고, 없으면 UUID를 새로 생성한다.
+
+        Args:
+            node_items: list of dicts with keys:
+                id (Optional[str]), parent_id (Optional[str]),
+                node_type, order_index, title, content, metadata
+        """
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM nodes WHERE version_id = %s", (version_id,))
+
+        if not node_items:
+            return []
+
+        sql = """
+            INSERT INTO nodes
+                (id, version_id, parent_id, node_type, order_index, title, content, metadata)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id, version_id, parent_id, node_type, order_index,
+                      title, content, metadata, created_at
+        """
+        created: list[Node] = []
+        with conn.cursor() as cur:
+            for item in node_items:
+                # 클라이언트 UUID가 있고 유효하면 재사용, 아니면 새로 생성
+                raw_id = item.get("id")
+                try:
+                    node_id = str(UUID(raw_id)) if raw_id else str(uuid4())
+                except (ValueError, AttributeError):
+                    node_id = str(uuid4())
+
+                cur.execute(
+                    sql,
+                    (
+                        node_id,
+                        version_id,
+                        item.get("parent_id"),
+                        item.get("node_type", "paragraph"),
+                        item.get("order_index", 0),
+                        item.get("title"),
+                        item.get("content"),
+                        json.dumps(item.get("metadata", {}), ensure_ascii=False),
+                    ),
+                )
+                row = cur.fetchone()
+                created.append(_row_to_node(dict(row)))
+        return created
 
     def get_by_id_and_version_id(
         self,
