@@ -138,5 +138,8 @@ class DocumentResponse(BaseModel):
     updated_by: Optional[str] = Field(None, description="최종 수정자 actor_id")
     created_at: datetime
     updated_at: datetime
+    # Phase 4: 현재 활성 버전 포인터
+    current_draft_version_id: Optional[str] = Field(None, description="현재 활성 Draft 버전 UUID")
+    current_published_version_id: Optional[str] = Field(None, description="현재 공식 Published 버전 UUID")
 
     model_config = {"from_attributes": True}

@@ -54,6 +54,14 @@ def _row_to_document(row: dict[str, Any]) -> Document:
         updated_by=row.get("updated_by"),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        current_draft_version_id=(
+            str(row["current_draft_version_id"])
+            if row.get("current_draft_version_id") else None
+        ),
+        current_published_version_id=(
+            str(row["current_published_version_id"])
+            if row.get("current_published_version_id") else None
+        ),
     )
 
 
@@ -99,7 +107,8 @@ def _build_list_query(
 
     data_sql = f"""
         SELECT id, title, document_type, status, metadata, summary,
-               created_by, updated_by, created_at, updated_at
+               created_by, updated_by, created_at, updated_at,
+               current_draft_version_id, current_published_version_id
         FROM documents
         {where_sql}
         {order_sql}
@@ -137,7 +146,8 @@ class DocumentsRepository:
             VALUES (%s, %s, %s, %s, %s, %s, %s)
             RETURNING
                 id, title, document_type, status, metadata, summary,
-                created_by, updated_by, created_at, updated_at
+                created_by, updated_by, created_at, updated_at,
+                current_draft_version_id, current_published_version_id
         """
         with conn.cursor() as cur:
             cur.execute(
@@ -162,7 +172,8 @@ class DocumentsRepository:
     ) -> Optional[Document]:
         sql = """
             SELECT id, title, document_type, status, metadata, summary,
-                   created_by, updated_by, created_at, updated_at
+                   created_by, updated_by, created_at, updated_at,
+                   current_draft_version_id, current_published_version_id
             FROM documents
             WHERE id = %s
         """
@@ -238,7 +249,60 @@ class DocumentsRepository:
             WHERE id = %s
             RETURNING
                 id, title, document_type, status, metadata, summary,
-                created_by, updated_by, created_at, updated_at
+                created_by, updated_by, created_at, updated_at,
+                current_draft_version_id, current_published_version_id
+        """
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            row = cur.fetchone()
+        if row is None:
+            return None
+        return _row_to_document(dict(row))
+
+
+    def update_version_pointers(
+        self,
+        conn: psycopg2.extensions.connection,
+        document_id: str,
+        *,
+        current_draft_version_id: Optional[str] = None,
+        current_published_version_id: Optional[str] = None,
+        clear_draft: bool = False,
+        updated_by: Optional[str] = None,
+    ) -> Optional[Document]:
+        """current_draft_version_id / current_published_version_id 포인터를 업데이트한다.
+
+        Args:
+            clear_draft: True이면 current_draft_version_id를 NULL로 설정.
+                         current_draft_version_id와 동시에 사용하지 않는다.
+        """
+        set_clauses: list[str] = ["updated_at = NOW()"]
+        params: list[Any] = []
+
+        if clear_draft:
+            set_clauses.append("current_draft_version_id = NULL")
+        elif current_draft_version_id is not None:
+            set_clauses.append("current_draft_version_id = %s")
+            params.append(current_draft_version_id)
+
+        if current_published_version_id is not None:
+            set_clauses.append("current_published_version_id = %s")
+            params.append(current_published_version_id)
+
+        if updated_by is not None:
+            set_clauses.append("updated_by = %s")
+            params.append(updated_by)
+
+        params.append(document_id)
+
+        sql = f"""
+            UPDATE documents
+            SET {', '.join(set_clauses)}
+            WHERE id = %s
+            RETURNING
+                id, title, document_type, status, metadata, summary,
+                created_by, updated_by, created_at, updated_at,
+                current_draft_version_id, current_published_version_id
         """
         with conn.cursor() as cur:
             cur.execute(sql, params)

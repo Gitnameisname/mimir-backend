@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     # Security
     jwt_secret: str = ""
     jwt_expire_minutes: int = 120
+    admin_api_key: str = "dev-admin-key"  # Phase 7 개발용 단순 인증 키
 
     # CORS
     cors_allow_origins: str = "http://localhost:3000"

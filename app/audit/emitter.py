@@ -2,31 +2,23 @@
 AuditEmitter — 감사 이벤트 emit interface.
 
 역할:
-  - 플랫폼 내 "누가 무엇을 했는지"를 audit candidate로 emit한다.
-  - 현재는 structured log + stub (no-op persistence) 구현.
-  - 이후 DB 저장 / message bus 발행 / webhook 발행으로 확장 가능.
+  - 플랫폼 내 "누가 무엇을 했는지"를 audit_events 테이블에 기록한다.
+  - 구조화 로그도 병행 출력 (운영 모니터링용).
 
-운영 로그와의 구분:
-  - 운영 로그: 성능/오류/추적 (middleware 레벨)
-  - 감사 이벤트: 누가 무엇을 했는지의 변경 추적 (write action 레벨)
+DB 저장 전략:
+  - emit()은 메인 트랜잭션과 독립된 별도 커넥션을 사용한다.
+  - 메인 요청이 성공한 후 호출되므로, 감사 이벤트는 항상 성공 케이스만 기록.
+  - DB 저장 실패 시 로그만 남기고 요청은 계속 진행한다 (non-blocking).
 
-audit candidate 기준:
-  - document create / update
-  - version create
-  - authorization denied
-  - idempotency conflict
-  (health check, 단순 read는 포함 안 함)
+audit_events 컬럼 매핑:
+  - resource_type="document" → document_id = resource_id
+  - resource_type="version"  → version_id = resource_id,
+                                document_id = metadata["document_id"]
+  - target_version_id / previous_state / new_state는 선택 파라미터로 수신
 
 안전 원칙:
   - raw auth token, 전체 request body, 민감 metadata는 절대 포함 안 함.
   - actor_id (정규화 식별자), resource_id, action, result만 기록.
-
-TODO:
-  - audit_events 테이블 persistence backend 연결
-  - message bus (Kafka/Redis Streams) 발행
-  - webhook delivery correlation
-  - retention policy (TTL, archival)
-  - admin API를 통한 audit log 조회
 """
 
 import logging
@@ -39,8 +31,9 @@ _audit_logger = logging.getLogger("mimir.audit")
 class AuditEmitter:
     """감사 이벤트를 emit하는 인터페이스.
 
-    현재: structured log 기반 stub (no-op persistence).
-    이후: emit → DB insert / message publish 로 확장.
+    emit() 호출 시:
+      1. structured log 출력
+      2. audit_events 테이블 INSERT (별도 트랜잭션)
     """
 
     def emit(
@@ -56,22 +49,32 @@ class AuditEmitter:
         trace_id: Optional[str] = None,
         tenant_id: Optional[str] = None,
         metadata: Optional[dict[str, Any]] = None,
+        # 확장 파라미터 (Phase 4 감사 이벤트용)
+        actor_role: Optional[str] = None,
+        target_version_id: Optional[str] = None,
+        previous_state: Optional[str] = None,
+        new_state: Optional[str] = None,
     ) -> None:
         """감사 이벤트를 emit한다.
 
         Args:
-            event_type    : 이벤트 식별자 (예: document.created, version.created)
-            action        : 수행된 action (예: document.create)
-            actor_id      : 수행 주체 actor_id (None = anonymous)
-            resource_type : 대상 리소스 타입 (document / version / node)
-            resource_id   : 대상 리소스 UUID
-            result        : 결과 분류 (success / failure / denied / conflict / replayed)
-            request_id    : 상관관계 추적
-            trace_id      : 상관관계 추적
-            tenant_id     : 테넌트 scope
-            metadata      : 추가 컨텍스트 (민감하지 않은 항목만)
+            event_type        : 이벤트 식별자 (예: document.created, draft.updated)
+            action            : 수행된 action (예: document.create)
+            actor_id          : 수행 주체 actor_id (None = anonymous)
+            resource_type     : 대상 리소스 타입 (document / version / node)
+            resource_id       : 대상 리소스 UUID
+            result            : 결과 분류 (success / failure / denied / conflict / replayed)
+            request_id        : 상관관계 추적
+            trace_id          : 상관관계 추적 (로그 전용)
+            tenant_id         : 테넌트 scope (로그 전용)
+            metadata          : 추가 컨텍스트 — document_id / version_number 등 포함 가능
+            actor_role        : 수행 주체 역할 (viewer/editor/publisher/admin)
+            target_version_id : 복원 대상 버전 UUID 등 보조 버전 참조
+            previous_state    : 상태 전이 전 값 (예: draft)
+            new_state         : 상태 전이 후 값 (예: published)
         """
-        event: dict[str, Any] = {
+        # --- 1. structured log ---
+        log_event: dict[str, Any] = {
             "audit_event": event_type,
             "action": action,
             "actor_id": actor_id or "anonymous",
@@ -80,22 +83,104 @@ class AuditEmitter:
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         if resource_id:
-            event["resource_id"] = resource_id
+            log_event["resource_id"] = resource_id
         if request_id:
-            event["request_id"] = request_id
+            log_event["request_id"] = request_id
         if trace_id:
-            event["trace_id"] = trace_id
+            log_event["trace_id"] = trace_id
         if tenant_id:
-            event["tenant_id"] = tenant_id
+            log_event["tenant_id"] = tenant_id
         if metadata:
-            event["metadata"] = metadata
+            log_event["metadata"] = metadata
 
-        _audit_logger.info("AUDIT %s", event)
+        _audit_logger.info("AUDIT %s", log_event)
 
-        # TODO: persist to DB / publish to message bus
-        # self._persist(event)
-        # self._publish(event)
+        # --- 2. DB persistence ---
+        self._persist(
+            event_type=event_type,
+            actor_id=actor_id,
+            actor_role=actor_role,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            result=result,
+            request_id=request_id,
+            metadata=metadata,
+            target_version_id=target_version_id,
+            previous_state=previous_state,
+            new_state=new_state,
+        )
+
+    def _persist(
+        self,
+        *,
+        event_type: str,
+        actor_id: Optional[str],
+        actor_role: Optional[str],
+        resource_type: str,
+        resource_id: Optional[str],
+        result: str,
+        request_id: Optional[str],
+        metadata: Optional[dict[str, Any]],
+        target_version_id: Optional[str],
+        previous_state: Optional[str],
+        new_state: Optional[str],
+    ) -> None:
+        """audit_events 테이블에 INSERT한다 (독립 트랜잭션).
+
+        실패 시 로그만 남기고 조용히 반환 — 감사 저장 실패가 요청을 막지 않도록.
+        """
+        # resource_type에 따라 document_id / version_id 매핑
+        document_id: Optional[str] = None
+        version_id: Optional[str] = None
+
+        if resource_type == "document":
+            document_id = resource_id
+        elif resource_type == "version":
+            version_id = resource_id
+            if metadata:
+                document_id = metadata.get("document_id")
+
+        # metadata에서 document_id 보정 (resource_type 무관)
+        if document_id is None and metadata:
+            document_id = metadata.get("document_id")
+
+        sql = """
+            INSERT INTO audit_events (
+                event_type, actor_user_id, actor_role,
+                document_id, version_id, target_version_id,
+                previous_state, new_state,
+                action_result, request_id
+            ) VALUES (
+                %s, %s, %s,
+                %s, %s, %s,
+                %s, %s,
+                %s, %s
+            )
+        """
+        params = (
+            event_type,
+            actor_id,
+            actor_role,
+            document_id,
+            version_id,
+            target_version_id,
+            previous_state,
+            new_state,
+            result,
+            request_id,
+        )
+
+        try:
+            from app.db.connection import get_db
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(sql, params)
+        except Exception as exc:  # noqa: BLE001
+            _audit_logger.error(
+                "audit_persist_failed event_type=%s resource_id=%s error=%s",
+                event_type, resource_id, exc,
+            )
 
 
-# 모듈 수준 싱글턴 (stub/no-op persistence)
+# 모듈 수준 싱글턴
 audit_emitter = AuditEmitter()

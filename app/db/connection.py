@@ -53,6 +53,20 @@ CREATE INDEX IF NOT EXISTS idx_documents_title
     ON documents(title);
 """
 
+# Phase 4: documents 테이블 버전 포인터 컬럼 추가 마이그레이션
+_DOCUMENTS_MIGRATION_DDL = """
+ALTER TABLE documents
+    ADD COLUMN IF NOT EXISTS current_draft_version_id UUID REFERENCES versions(id) ON DELETE SET NULL,
+    ADD COLUMN IF NOT EXISTS current_published_version_id UUID REFERENCES versions(id) ON DELETE SET NULL;
+
+CREATE INDEX IF NOT EXISTS idx_documents_current_draft
+    ON documents(current_draft_version_id)
+    WHERE current_draft_version_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_documents_current_published
+    ON documents(current_published_version_id)
+    WHERE current_published_version_id IS NOT NULL;
+"""
+
 
 def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
     global _pool
@@ -114,6 +128,25 @@ CREATE INDEX IF NOT EXISTS idx_versions_version_number
     ON versions(document_id, version_number DESC);
 """
 
+# Phase 4: versions 테이블 확장 컬럼 추가 마이그레이션
+_VERSIONS_MIGRATION_DDL = """
+ALTER TABLE versions
+    ADD COLUMN IF NOT EXISTS parent_version_id UUID REFERENCES versions(id) ON DELETE SET NULL,
+    ADD COLUMN IF NOT EXISTS restored_from_version_id UUID REFERENCES versions(id) ON DELETE SET NULL,
+    ADD COLUMN IF NOT EXISTS title_snapshot VARCHAR(500),
+    ADD COLUMN IF NOT EXISTS summary_snapshot TEXT,
+    ADD COLUMN IF NOT EXISTS metadata_snapshot JSONB,
+    ADD COLUMN IF NOT EXISTS content_snapshot JSONB,
+    ADD COLUMN IF NOT EXISTS published_by VARCHAR(255),
+    ADD COLUMN IF NOT EXISTS published_at TIMESTAMPTZ;
+
+CREATE INDEX IF NOT EXISTS idx_versions_status
+    ON versions(document_id, status);
+CREATE INDEX IF NOT EXISTS idx_versions_restored_from
+    ON versions(restored_from_version_id)
+    WHERE restored_from_version_id IS NOT NULL;
+"""
+
 # nodes 테이블 DDL
 _NODES_DDL = """
 CREATE TABLE IF NOT EXISTS nodes (
@@ -134,6 +167,273 @@ CREATE INDEX IF NOT EXISTS idx_nodes_parent_id
     ON nodes(parent_id);
 CREATE INDEX IF NOT EXISTS idx_nodes_order
     ON nodes(version_id, order_index ASC);
+"""
+
+# audit_events 테이블 DDL (Phase 4)
+_AUDIT_EVENTS_DDL = """
+CREATE TABLE IF NOT EXISTS audit_events (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    event_type      VARCHAR(100) NOT NULL,
+    occurred_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    actor_user_id   VARCHAR(255),
+    actor_role      VARCHAR(100),
+    document_id     UUID,
+    version_id      UUID,
+    target_version_id UUID,
+    previous_state  VARCHAR(100),
+    new_state       VARCHAR(100),
+    action_result   VARCHAR(50) NOT NULL DEFAULT 'success',
+    reason          VARCHAR(500),
+    request_id      VARCHAR(255)
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_events_document_id
+    ON audit_events(document_id)
+    WHERE document_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_audit_events_actor
+    ON audit_events(actor_user_id)
+    WHERE actor_user_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_audit_events_event_type
+    ON audit_events(event_type);
+CREATE INDEX IF NOT EXISTS idx_audit_events_occurred_at
+    ON audit_events(occurred_at DESC);
+"""
+
+# ---------------------------------------------------------------------------
+# Phase 5: Workflow 관련 테이블 DDL
+# ---------------------------------------------------------------------------
+
+# versions 테이블 workflow_status 컬럼 추가 마이그레이션
+_VERSIONS_WORKFLOW_MIGRATION_DDL = """
+ALTER TABLE versions
+    ADD COLUMN IF NOT EXISTS workflow_status VARCHAR(50);
+
+-- 기존 rows: status 값을 workflow_status로 복사 (NULL인 경우에만)
+UPDATE versions
+SET workflow_status = status
+WHERE workflow_status IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_versions_workflow_status
+    ON versions(document_id, workflow_status);
+"""
+
+# review_actions 테이블 DDL
+_REVIEW_ACTIONS_DDL = """
+CREATE TABLE IF NOT EXISTS review_actions (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    document_id     UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    version_id      UUID NOT NULL REFERENCES versions(id) ON DELETE CASCADE,
+    action_type     VARCHAR(50) NOT NULL,
+    from_status     VARCHAR(50) NOT NULL,
+    to_status       VARCHAR(50) NOT NULL,
+    actor_id        VARCHAR(255),
+    actor_role      VARCHAR(100),
+    comment         TEXT,
+    reason          TEXT,
+    metadata        JSONB NOT NULL DEFAULT '{}',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_review_actions_document_id
+    ON review_actions(document_id);
+CREATE INDEX IF NOT EXISTS idx_review_actions_version_id
+    ON review_actions(version_id);
+CREATE INDEX IF NOT EXISTS idx_review_actions_created_at
+    ON review_actions(created_at DESC);
+"""
+
+# review_actions 테이블 Phase 5 마이그레이션 (actor_role, metadata 컬럼 추가)
+_REVIEW_ACTIONS_MIGRATION_DDL = """
+ALTER TABLE review_actions
+    ADD COLUMN IF NOT EXISTS actor_role VARCHAR(100),
+    ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}';
+"""
+
+# workflow_history 테이블 DDL
+_WORKFLOW_HISTORY_DDL = """
+CREATE TABLE IF NOT EXISTS workflow_history (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    document_id     UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    version_id      UUID NOT NULL REFERENCES versions(id) ON DELETE CASCADE,
+    from_status     VARCHAR(50) NOT NULL,
+    to_status       VARCHAR(50) NOT NULL,
+    action          VARCHAR(50) NOT NULL,
+    actor_id        VARCHAR(255),
+    actor_role      VARCHAR(100),
+    comment         TEXT,
+    reason          TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_workflow_history_document_id
+    ON workflow_history(document_id);
+CREATE INDEX IF NOT EXISTS idx_workflow_history_version_id
+    ON workflow_history(version_id);
+CREATE INDEX IF NOT EXISTS idx_workflow_history_created_at
+    ON workflow_history(created_at DESC);
+"""
+
+# workflow_history 테이블 Phase 5 마이그레이션 (actor_role 컬럼 추가)
+_WORKFLOW_HISTORY_MIGRATION_DDL = """
+ALTER TABLE workflow_history
+    ADD COLUMN IF NOT EXISTS actor_role VARCHAR(100);
+"""
+
+# change_logs 테이블 DDL
+_CHANGE_LOGS_DDL = """
+CREATE TABLE IF NOT EXISTS change_logs (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    document_id     UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    version_id      UUID REFERENCES versions(id) ON DELETE SET NULL,
+    change_type     VARCHAR(100) NOT NULL,
+    reason          TEXT,
+    actor_id        VARCHAR(255),
+    actor_role      VARCHAR(100),
+    metadata        JSONB NOT NULL DEFAULT '{}',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_change_logs_document_id
+    ON change_logs(document_id);
+CREATE INDEX IF NOT EXISTS idx_change_logs_created_at
+    ON change_logs(created_at DESC);
+"""
+
+# change_logs 테이블 Phase 5 마이그레이션 (actor_role 컬럼 추가)
+_CHANGE_LOGS_MIGRATION_DDL = """
+ALTER TABLE change_logs
+    ADD COLUMN IF NOT EXISTS actor_role VARCHAR(100);
+"""
+
+# ---------------------------------------------------------------------------
+# Phase 7: Admin 관련 테이블 DDL
+# ---------------------------------------------------------------------------
+
+_ORGANIZATIONS_DDL = """
+CREATE TABLE IF NOT EXISTS organizations (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name        VARCHAR(255) NOT NULL,
+    description TEXT,
+    status      VARCHAR(50) NOT NULL DEFAULT 'ACTIVE',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_organizations_status ON organizations(status);
+"""
+
+_ROLES_DDL = """
+CREATE TABLE IF NOT EXISTS roles (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name        VARCHAR(100) NOT NULL UNIQUE,
+    description TEXT,
+    is_system   BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+INSERT INTO roles (name, description, is_system) VALUES
+    ('SUPER_ADMIN', '플랫폼 전체 관리 권한', TRUE),
+    ('ORG_ADMIN', '조직 범위 관리 권한', TRUE),
+    ('AUTHOR', '문서 작성 권한', TRUE),
+    ('REVIEWER', '문서 검토 권한', TRUE),
+    ('APPROVER', '문서 승인 권한', TRUE),
+    ('VIEWER', '문서 조회 권한', TRUE)
+ON CONFLICT (name) DO NOTHING;
+"""
+
+_USERS_DDL = """
+CREATE TABLE IF NOT EXISTS users (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    email           VARCHAR(255) NOT NULL UNIQUE,
+    display_name    VARCHAR(255) NOT NULL,
+    status          VARCHAR(50) NOT NULL DEFAULT 'ACTIVE',
+    role_name       VARCHAR(100) NOT NULL DEFAULT 'VIEWER',
+    last_login_at   TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_users_status ON users(status);
+CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+CREATE INDEX IF NOT EXISTS idx_users_created_at ON users(created_at DESC);
+"""
+
+_USER_ORG_ROLES_DDL = """
+CREATE TABLE IF NOT EXISTS user_org_roles (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    org_id          UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    role_name       VARCHAR(100) NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (user_id, org_id, role_name)
+);
+CREATE INDEX IF NOT EXISTS idx_user_org_roles_user ON user_org_roles(user_id);
+CREATE INDEX IF NOT EXISTS idx_user_org_roles_org ON user_org_roles(org_id);
+"""
+
+_DOCUMENT_TYPES_DDL = """
+CREATE TABLE IF NOT EXISTS document_types (
+    type_code       VARCHAR(100) PRIMARY KEY,
+    display_name    VARCHAR(255) NOT NULL,
+    description     TEXT,
+    status          VARCHAR(50) NOT NULL DEFAULT 'ACTIVE',
+    schema_fields   JSONB NOT NULL DEFAULT '[]',
+    plugin_config   JSONB NOT NULL DEFAULT '{}',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+INSERT INTO document_types (type_code, display_name, description, schema_fields, plugin_config) VALUES
+    ('POLICY', '정책 문서', '조직의 규정 및 정책 문서',
+     '[{"name":"title","type":"string","required":true},{"name":"author","type":"string","required":true},{"name":"effective_date","type":"date","required":true},{"name":"version","type":"string","required":false,"default":"1.0"},{"name":"department","type":"string","required":true},{"name":"tags","type":"array","required":false,"default":"[]"}]',
+     '{"editor":"richtext-editor-v2","renderer":"policy-renderer-v1","default_workflow":"policy-approval-flow","chunking":"section-based"}'),
+    ('MANUAL', '업무 매뉴얼', '업무 절차 및 운영 매뉴얼',
+     '[{"name":"title","type":"string","required":true},{"name":"author","type":"string","required":true},{"name":"version","type":"string","required":false,"default":"1.0"},{"name":"category","type":"string","required":false}]',
+     '{"editor":"richtext-editor-v2","renderer":"default-renderer-v1","default_workflow":"standard-approval-flow","chunking":"section-based"}'),
+    ('REPORT', '보고서', '분석 및 현황 보고서',
+     '[{"name":"title","type":"string","required":true},{"name":"author","type":"string","required":true},{"name":"period","type":"string","required":false}]',
+     '{"editor":"richtext-editor-v2","renderer":"default-renderer-v1","default_workflow":"report-review-flow","chunking":"paragraph-based"}')
+ON CONFLICT (type_code) DO NOTHING;
+"""
+
+_BACKGROUND_JOBS_DDL = """
+CREATE TABLE IF NOT EXISTS background_jobs (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    job_type        VARCHAR(100) NOT NULL,
+    resource_type   VARCHAR(100),
+    resource_id     VARCHAR(255),
+    resource_name   VARCHAR(500),
+    status          VARCHAR(50) NOT NULL DEFAULT 'PENDING',
+    progress        INTEGER DEFAULT 0,
+    requester_id    VARCHAR(255),
+    requester_name  VARCHAR(255),
+    error_code      VARCHAR(100),
+    error_message   TEXT,
+    metadata        JSONB NOT NULL DEFAULT '{}',
+    started_at      TIMESTAMPTZ,
+    ended_at        TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_status ON background_jobs(status);
+CREATE INDEX IF NOT EXISTS idx_jobs_job_type ON background_jobs(job_type);
+CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON background_jobs(created_at DESC);
+"""
+
+_API_KEYS_DDL = """
+CREATE TABLE IF NOT EXISTS api_keys (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name            VARCHAR(255) NOT NULL,
+    description     TEXT,
+    key_prefix      VARCHAR(20) NOT NULL,
+    key_hash        VARCHAR(255) NOT NULL,
+    scope           VARCHAR(100) NOT NULL DEFAULT 'READ_ONLY',
+    status          VARCHAR(50) NOT NULL DEFAULT 'ACTIVE',
+    issuer_id       VARCHAR(255),
+    issuer_name     VARCHAR(255),
+    last_used_at    TIMESTAMPTZ,
+    last_used_ip    VARCHAR(50),
+    use_count       INTEGER NOT NULL DEFAULT 0,
+    expires_at      TIMESTAMPTZ,
+    revoked_reason  TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_api_keys_status ON api_keys(status);
 """
 
 # idempotency_records 테이블 DDL
@@ -165,18 +465,37 @@ CREATE INDEX IF NOT EXISTS idx_idempotency_created_at
 
 
 def init_db() -> None:
-    """앱 시작 시 모든 테이블을 생성한다 (idempotent).
-
-    main.py의 startup 이벤트에서 호출한다.
-    """
+    """앱 시작 시 모든 테이블을 생성하고 마이그레이션을 적용한다 (idempotent)."""
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
+                # Phase 1~3 기본 테이블
                 cur.execute(_DOCUMENTS_DDL)
                 cur.execute(_VERSIONS_DDL)
                 cur.execute(_NODES_DDL)
                 cur.execute(_IDEMPOTENCY_DDL)
-        logger.info("DB schema initialized (documents, versions, nodes, idempotency_records tables ready)")
+                cur.execute(_AUDIT_EVENTS_DDL)
+                # Phase 4 마이그레이션 (ADD COLUMN IF NOT EXISTS — 멱등)
+                cur.execute(_VERSIONS_MIGRATION_DDL)
+                cur.execute(_DOCUMENTS_MIGRATION_DDL)
+                # Phase 5 테이블 생성 (멱등)
+                cur.execute(_REVIEW_ACTIONS_DDL)
+                cur.execute(_WORKFLOW_HISTORY_DDL)
+                cur.execute(_CHANGE_LOGS_DDL)
+                # Phase 5 마이그레이션
+                cur.execute(_VERSIONS_WORKFLOW_MIGRATION_DDL)
+                cur.execute(_REVIEW_ACTIONS_MIGRATION_DDL)
+                cur.execute(_WORKFLOW_HISTORY_MIGRATION_DDL)
+                cur.execute(_CHANGE_LOGS_MIGRATION_DDL)
+                # Phase 7 Admin 테이블 (멱등)
+                cur.execute(_ORGANIZATIONS_DDL)
+                cur.execute(_ROLES_DDL)
+                cur.execute(_USERS_DDL)
+                cur.execute(_USER_ORG_ROLES_DDL)
+                cur.execute(_DOCUMENT_TYPES_DDL)
+                cur.execute(_BACKGROUND_JOBS_DDL)
+                cur.execute(_API_KEYS_DDL)
+        logger.info("DB schema initialized (Phase 7 admin tables included)")
     except Exception as exc:
         logger.error("DB schema initialization failed: %s", exc)
         raise

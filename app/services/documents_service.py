@@ -43,6 +43,8 @@ def _to_response(doc: Document) -> DocumentResponse:
         updated_by=doc.updated_by,
         created_at=doc.created_at,
         updated_at=doc.updated_at,
+        current_draft_version_id=doc.current_draft_version_id,
+        current_published_version_id=doc.current_published_version_id,
     )
 
 

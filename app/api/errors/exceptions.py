@@ -142,6 +142,47 @@ class ApiIdempotencyError(ApiError):
     default_message = "Idempotency key conflict detected"
 
 
+class ApiWorkflowTransitionError(ApiConflictError):
+    """허용되지 않은 워크플로 상태 전이 요청 (Phase 5).
+
+    상태 전이 규칙(ALLOWED_TRANSITIONS)에 없는 이동 시 발생.
+    """
+
+    error_code = "invalid_workflow_transition"
+    default_message = "The requested workflow transition is not allowed"
+
+
+class ApiWorkflowStateConflictError(ApiConflictError):
+    """워크플로 상태 충돌 (Phase 5).
+
+    expected_current_status와 실제 상태가 다를 때 발생 (낙관적 락).
+    """
+
+    error_code = "workflow_state_conflict"
+    default_message = "The document version status has changed since it was loaded"
+
+
+class ApiWorkflowPermissionError(ApiPermissionDeniedError):
+    """워크플로 액션 권한 없음 (Phase 5).
+
+    상태 전이는 가능하지만 해당 역할에 권한이 없을 때 발생.
+    """
+
+    error_code = "forbidden_workflow_action"
+    default_message = "You do not have permission to perform this workflow action"
+
+
+class ApiVersionNotEditableError(ApiConflictError):
+    """편집 불가 워크플로 상태의 버전 수정 시도 (Phase 5, DEF-04).
+
+    IN_REVIEW / APPROVED / PUBLISHED 상태의 버전에 draft 저장 시도 시 발생.
+    수정하려면 REJECTED → DRAFT 복귀 후 편집해야 한다.
+    """
+
+    error_code = "version_not_editable"
+    default_message = "This version cannot be edited in its current workflow state"
+
+
 # ---------------------------------------------------------------------------
 # 503 — Service Unavailable (optional)
 # ---------------------------------------------------------------------------

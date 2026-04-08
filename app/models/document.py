@@ -37,3 +37,6 @@ class Document:
     summary: Optional[str] = None
     created_by: Optional[str] = None
     updated_by: Optional[str] = None
+    # Phase 4: 현재 활성 버전 포인터
+    current_draft_version_id: Optional[str] = None
+    current_published_version_id: Optional[str] = None

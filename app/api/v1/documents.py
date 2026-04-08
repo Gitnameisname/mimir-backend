@@ -31,8 +31,10 @@ from app.api.query import FilterFieldSpec, ListQuerySpec, ParsedListQuery, make_
 from app.api.responses import SuccessResponse, list_response, success_response
 from app.db import get_db
 from app.schemas.documents import DocumentCreateRequest, DocumentResponse, DocumentUpdateRequest
-from app.schemas.versions import VersionCreateRequest
+from app.schemas.versions import DraftSaveRequest, PublishRequest, RestoreRequest, VersionCreateRequest
 from app.services.documents_service import documents_service
+from app.services.draft_service import draft_service
+from app.services.render_service import render_service
 from app.services.versions_service import versions_service
 
 router = APIRouter()
@@ -346,8 +348,12 @@ def list_document_versions(
     )
     request_id, trace_id = _ctx(request)
 
+    actor_role = actor.role if hasattr(actor, "role") else None
+
     with get_db() as conn:
-        versions, total = versions_service.list_versions(conn, document_id, query)
+        versions, total = draft_service.list_versions(
+            conn, document_id, query, actor_role=actor_role
+        )
 
     page = query.page if query.page else 1
     page_size = query.page_size if query.page_size else 20
@@ -455,3 +461,403 @@ def create_document_version(
     )
 
     return response
+
+
+# ===========================================================================
+# Phase 4: Draft / Publish / Restore / Version Detail / Render 엔드포인트
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# PUT /documents/{document_id}/draft — Draft 저장 (생성 또는 전체 교체)
+# ---------------------------------------------------------------------------
+
+
+@router.put(
+    "/{document_id}/draft",
+    status_code=200,
+    summary="Draft 저장",
+    description=(
+        "문서의 현재 Draft를 전체 교체하거나 새 Draft를 생성한다.\n\n"
+        "- Draft가 없으면 새로 생성 (version_number 자동 증가).\n"
+        "- Draft가 있으면 content_snapshot을 포함한 내용 전체를 교체한다.\n"
+        "- `content_snapshot`: type='document' 루트를 포함하는 전체 본문 트리.\n\n"
+        "**권한**: editor 이상"
+    ),
+    response_model=SuccessResponse,
+    tags=["draft"],
+)
+def save_draft(
+    document_id: str,
+    request: Request,
+    body: DraftSaveRequest,
+    actor: ActorContext = Depends(resolve_current_actor),
+) -> SuccessResponse:
+    authorization_service.authorize(
+        actor=actor,
+        action="draft.save",
+        resource=ResourceRef(resource_type="version", parent_id=document_id),
+        require_authenticated=False,
+    )
+    request_id, trace_id = _ctx(request)
+    actor_id = actor.actor_id if actor.is_authenticated else None
+
+    with get_db() as conn:
+        version = draft_service.save_draft(conn, document_id, body, actor_id=actor_id)
+
+    from app.audit.emitter import audit_emitter
+    audit_emitter.emit(
+        event_type="draft.updated",
+        action="draft.save",
+        actor_id=actor_id,
+        resource_type="version",
+        resource_id=version.id,
+        result="success",
+        request_id=request_id,
+        trace_id=trace_id,
+        metadata={"document_id": document_id, "version_number": version.version_number},
+    )
+
+    return success_response(data=version.model_dump(), request_id=request_id, trace_id=trace_id)
+
+
+# ---------------------------------------------------------------------------
+# DELETE /documents/{document_id}/draft — Draft 폐기
+# ---------------------------------------------------------------------------
+
+
+@router.delete(
+    "/{document_id}/draft",
+    status_code=200,
+    summary="Draft 폐기",
+    description=(
+        "현재 활성 Draft를 폐기한다.\n\n"
+        "- Draft 버전 status를 `discarded`로 변경하고 포인터를 해제한다.\n"
+        "- 활성 Draft가 없으면 409 반환.\n\n"
+        "**권한**: editor 이상"
+    ),
+    response_model=SuccessResponse,
+    tags=["draft"],
+)
+def discard_draft(
+    document_id: str,
+    request: Request,
+    actor: ActorContext = Depends(resolve_current_actor),
+) -> SuccessResponse:
+    authorization_service.authorize(
+        actor=actor,
+        action="draft.discard",
+        resource=ResourceRef(resource_type="version", parent_id=document_id),
+        require_authenticated=False,
+    )
+    request_id, trace_id = _ctx(request)
+    actor_id = actor.actor_id if actor.is_authenticated else None
+
+    with get_db() as conn:
+        draft_service.discard_draft(conn, document_id, actor_id=actor_id)
+
+    from app.audit.emitter import audit_emitter
+    audit_emitter.emit(
+        event_type="draft.discarded",
+        action="draft.discard",
+        actor_id=actor_id,
+        resource_type="document",
+        resource_id=document_id,
+        result="success",
+        request_id=request_id,
+        trace_id=trace_id,
+    )
+
+    return success_response(
+        data={"message": "Draft discarded successfully"},
+        request_id=request_id,
+        trace_id=trace_id,
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /documents/{document_id}/publish — Draft → Published 발행
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/{document_id}/publish",
+    status_code=200,
+    summary="문서 발행",
+    description=(
+        "현재 활성 Draft를 Published 상태로 전환한다.\n\n"
+        "- 기존 Published 버전은 `superseded` 상태로 변경된다.\n"
+        "- 활성 Draft가 없으면 409 반환.\n\n"
+        "**권한**: publisher 이상"
+    ),
+    response_model=SuccessResponse,
+    tags=["draft"],
+)
+def publish_document(
+    document_id: str,
+    request: Request,
+    body: PublishRequest,
+    actor: ActorContext = Depends(resolve_current_actor),
+) -> SuccessResponse:
+    authorization_service.authorize(
+        actor=actor,
+        action="document.publish",
+        resource=ResourceRef(resource_type="document", resource_id=document_id),
+        require_authenticated=False,
+    )
+    request_id, trace_id = _ctx(request)
+    actor_id = actor.actor_id if actor.is_authenticated else None
+
+    with get_db() as conn:
+        version = draft_service.publish(conn, document_id, body, actor_id=actor_id)
+
+    from app.audit.emitter import audit_emitter
+    actor_role = actor.role if hasattr(actor, "role") else None
+    audit_emitter.emit(
+        event_type="document.published",
+        action="document.publish",
+        actor_id=actor_id,
+        actor_role=actor_role,
+        resource_type="version",
+        resource_id=version.id,
+        result="success",
+        request_id=request_id,
+        trace_id=trace_id,
+        metadata={"document_id": document_id, "version_number": version.version_number},
+        previous_state="draft",
+        new_state="published",
+    )
+
+    return success_response(data=version.model_dump(), request_id=request_id, trace_id=trace_id)
+
+
+# ---------------------------------------------------------------------------
+# GET /documents/{document_id}/versions — 버전 목록 (Phase 4 교체)
+# 기존 list_document_versions는 유지하되, draft_service.list_versions로 교체
+# ---------------------------------------------------------------------------
+
+# (기존 엔드포인트는 그대로 유지, draft_service가 is_current_* 플래그 포함 반환)
+
+
+# ---------------------------------------------------------------------------
+# GET /documents/{document_id}/versions/{version_id} — 버전 상세 조회
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/{document_id}/versions/{version_id}",
+    summary="버전 상세 조회",
+    description=(
+        "특정 버전의 상세 정보를 반환한다.\n\n"
+        "- content_snapshot, lineage, publish_info, actions 포함.\n"
+        "- `include_content=false` 쿼리 파라미터로 content_snapshot 제외 가능.\n"
+        "- `is_current_draft` / `is_current_published` 플래그 포함.\n"
+        "- `actions.can_restore` 로 복원 가능 여부 확인 가능."
+    ),
+    response_model=SuccessResponse,
+    tags=["versions"],
+)
+def get_version_detail(
+    document_id: str,
+    version_id: str,
+    request: Request,
+    include_content: bool = True,
+    actor: ActorContext = Depends(resolve_current_actor),
+) -> SuccessResponse:
+    authorization_service.authorize(
+        actor=actor,
+        action="version.read",
+        resource=ResourceRef(resource_type="version", resource_id=version_id, parent_id=document_id),
+        require_authenticated=False,
+    )
+    request_id, trace_id = _ctx(request)
+    actor_role = actor.role if hasattr(actor, "role") else None
+
+    with get_db() as conn:
+        detail = draft_service.get_version_detail(
+            conn, document_id, version_id,
+            actor_role=actor_role,
+            include_content=include_content,
+        )
+
+    return success_response(data=detail.model_dump(), request_id=request_id, trace_id=trace_id)
+
+
+# ---------------------------------------------------------------------------
+# POST /documents/{document_id}/versions/{version_id}/restore — 버전 복원
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/{document_id}/versions/{version_id}/restore",
+    status_code=201,
+    summary="버전 복원",
+    description=(
+        "과거 버전을 기준으로 새 Draft를 생성한다.\n\n"
+        "- 복원 대상: `published` 또는 `superseded` 상태 버전만 허용.\n"
+        "- 기존 활성 Draft가 있으면 409 반환 (먼저 폐기 필요).\n"
+        "- 복원 결과 새 Draft에 `restored_from_version_id` 기록.\n\n"
+        "**권한**: publisher 이상"
+    ),
+    response_model=SuccessResponse,
+    tags=["versions"],
+)
+def restore_version(
+    document_id: str,
+    version_id: str,
+    request: Request,
+    body: RestoreRequest,
+    actor: ActorContext = Depends(resolve_current_actor),
+) -> SuccessResponse:
+    authorization_service.authorize(
+        actor=actor,
+        action="version.restore",
+        resource=ResourceRef(resource_type="version", resource_id=version_id, parent_id=document_id),
+        require_authenticated=False,
+    )
+    request_id, trace_id = _ctx(request)
+    actor_id = actor.actor_id if actor.is_authenticated else None
+    actor_role = actor.role if hasattr(actor, "role") else "publisher"  # stub: 권한 실제 연동 전 publisher로 간주
+
+    with get_db() as conn:
+        new_draft = draft_service.restore(
+            conn, document_id, version_id, body,
+            actor_id=actor_id,
+            actor_role=actor_role,
+        )
+
+    from app.audit.emitter import audit_emitter
+    audit_emitter.emit(
+        event_type="version.restored",
+        action="version.restore",
+        actor_id=actor_id,
+        actor_role=actor_role,
+        resource_type="version",
+        resource_id=new_draft.id,
+        result="success",
+        request_id=request_id,
+        trace_id=trace_id,
+        metadata={"document_id": document_id, "new_version_number": new_draft.version_number},
+        target_version_id=version_id,
+        new_state="draft",
+    )
+
+    return success_response(
+        data=new_draft.model_dump(),
+        request_id=request_id,
+        trace_id=trace_id,
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /documents/{document_id}/render — 현재 문서 렌더링
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/{document_id}/render",
+    summary="현재 문서 렌더링",
+    description=(
+        "현재 문서를 렌더링 ViewModel로 반환한다.\n\n"
+        "- `view=published` (기본): current_published 기준 렌더링.\n"
+        "- `view=draft`: current_draft 기준 렌더링 (editor+ 권한 필요).\n"
+        "- 해당 버전이 없으면 404 반환."
+    ),
+    response_model=SuccessResponse,
+    tags=["render"],
+)
+def render_document(
+    document_id: str,
+    request: Request,
+    view: str = "published",
+    actor: ActorContext = Depends(resolve_current_actor),
+) -> SuccessResponse:
+    authorization_service.authorize(
+        actor=actor,
+        action="document.render",
+        resource=ResourceRef(resource_type="document", resource_id=document_id),
+        require_authenticated=False,
+    )
+    request_id, trace_id = _ctx(request)
+
+    from app.api.errors.exceptions import ApiNotFoundError
+    from app.repositories.versions_repository import versions_repository
+
+    with get_db() as conn:
+        doc = documents_service.get_document(conn, document_id)
+
+        if view == "draft":
+            if not doc.current_draft_version_id:
+                raise ApiNotFoundError("No active draft for this document")
+            version = versions_repository.get_by_id(conn, doc.current_draft_version_id)
+        else:
+            if not doc.current_published_version_id:
+                raise ApiNotFoundError("No published version for this document")
+            version = versions_repository.get_by_id(conn, doc.current_published_version_id)
+
+    if version is None:
+        raise ApiNotFoundError("Version not found")
+
+    render_result = render_service.render_version(
+        version,
+        current_draft_id=doc.current_draft_version_id,
+        current_published_id=doc.current_published_version_id,
+    )
+
+    return success_response(data=render_result, request_id=request_id, trace_id=trace_id)
+
+
+# ---------------------------------------------------------------------------
+# GET /documents/{document_id}/versions/{version_id}/render — 특정 버전 렌더링
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/{document_id}/versions/{version_id}/render",
+    summary="특정 버전 렌더링",
+    description=(
+        "특정 버전을 렌더링 ViewModel로 반환한다.\n\n"
+        "- 버전이 존재하지 않거나 해당 문서에 속하지 않으면 404 반환.\n"
+        "- 이력 탐색/복원 확인 용도로 사용한다."
+    ),
+    response_model=SuccessResponse,
+    tags=["render"],
+)
+def render_version_endpoint(
+    document_id: str,
+    version_id: str,
+    request: Request,
+    actor: ActorContext = Depends(resolve_current_actor),
+) -> SuccessResponse:
+    authorization_service.authorize(
+        actor=actor,
+        action="version.render",
+        resource=ResourceRef(resource_type="version", resource_id=version_id, parent_id=document_id),
+        require_authenticated=False,
+    )
+    request_id, trace_id = _ctx(request)
+
+    from app.api.errors.exceptions import ApiNotFoundError
+    from app.repositories.documents_repository import documents_repository
+    from app.repositories.versions_repository import versions_repository
+
+    with get_db() as conn:
+        doc = documents_repository.get_by_id(conn, document_id)
+        if doc is None:
+            raise ApiNotFoundError(f"Document '{document_id}' not found")
+
+        version = versions_repository.get_by_document_and_version_id(
+            conn, document_id, version_id
+        )
+        if version is None:
+            raise ApiNotFoundError(
+                f"Version '{version_id}' not found in document '{document_id}'"
+            )
+
+    render_result = render_service.render_version(
+        version,
+        current_draft_id=doc.current_draft_version_id,
+        current_published_id=doc.current_published_version_id,
+    )
+
+    return success_response(data=render_result, request_id=request_id, trace_id=trace_id)

@@ -19,6 +19,7 @@ TODO (향후 연결 예정):
 from fastapi import APIRouter
 
 from app.api.v1 import admin, documents, nodes, operations, retrieval, system, versions, webhooks
+from app.api.v1 import workflow
 
 v1_router = APIRouter()
 
@@ -30,8 +31,15 @@ v1_router.include_router(documents.router, prefix="/documents", tags=["documents
 v1_router.include_router(versions.router, prefix="/versions", tags=["versions"])
 v1_router.include_router(nodes.router, prefix="/versions", tags=["nodes"])
 
+# Phase 5: Workflow Action API
+# /documents/{document_id}/versions/{version_id}/workflow/...
+v1_router.include_router(
+    workflow.router,
+    prefix="/documents/{document_id}/versions/{version_id}/workflow",
+    tags=["workflow"],
+)
+
 # 확장 예정 — placeholder 수준
-# TODO: 아래 router들은 각 Task에서 실제 구현 후 활성화
 v1_router.include_router(admin.router, prefix="/admin", tags=["admin"])
 v1_router.include_router(operations.router, prefix="/operations", tags=["operations"])
 v1_router.include_router(webhooks.router, prefix="/webhooks", tags=["webhooks"])
