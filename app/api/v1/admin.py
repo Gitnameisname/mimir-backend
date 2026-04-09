@@ -34,8 +34,11 @@ Admin router — /api/v1/admin
   - DELETE /admin/document-types/{type_code}
 """
 
+import logging
 import re
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, EmailStr
@@ -114,6 +117,21 @@ def get_dashboard_metrics(_=Depends(require_admin_access)):
             """)
             audit_row = cur.fetchone()
 
+            # Phase 10: 벡터화 지표
+            vec_row = None
+            try:
+                cur.execute("""
+                    SELECT
+                        COUNT(*) FILTER (WHERE is_current = TRUE) AS current_chunks,
+                        COUNT(*) FILTER (WHERE is_current = TRUE AND embedding IS NOT NULL) AS embedded_chunks,
+                        COUNT(*) FILTER (WHERE is_current = TRUE AND embedding IS NULL) AS pending_chunks,
+                        COUNT(DISTINCT document_id) FILTER (WHERE is_current = TRUE) AS vectorized_docs
+                    FROM document_chunks
+                """)
+                vec_row = cur.fetchone()
+            except Exception as _vec_exc:
+                logger.debug("벡터화 지표 조회 스킵 (테이블 미존재 또는 오류): %s", _vec_exc)
+
     return success_response(data={
         "users": {
             "total": user_row["total"] if user_row else 0,
@@ -127,7 +145,12 @@ def get_dashboard_metrics(_=Depends(require_admin_access)):
             "failed": job_row["failed"] if job_row else 0,
         },
         "audit_events_24h": audit_row["total"] if audit_row else 0,
-        "indexing_failed": 0,  # Phase 10 연계 전 placeholder
+        "vectorization": {
+            "current_chunks": vec_row["current_chunks"] if vec_row else 0,
+            "embedded_chunks": vec_row["embedded_chunks"] if vec_row else 0,
+            "pending_chunks": vec_row["pending_chunks"] if vec_row else 0,
+            "vectorized_docs": vec_row["vectorized_docs"] if vec_row else 0,
+        },
     })
 
 

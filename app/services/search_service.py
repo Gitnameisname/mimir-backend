@@ -1,11 +1,11 @@
 """
-검색 서비스 — PostgreSQL Full-Text Search 기반.
+검색 서비스 — FTS + pgvector 하이브리드 검색.
 
 설계 원칙:
-  - 검색 레이어 추상화: 내부 구현은 PostgreSQL FTS이지만,
-    Phase 10에서 pgvector 하이브리드 검색으로 교체 가능한 구조 유지.
+  - 검색 레이어 추상화: FTS (mode=fts, 기본) 및 하이브리드 (mode=hybrid) 지원.
+  - HybridSearchProvider: FTS 점수 + 벡터 유사도를 RRF(k=60)로 통합.
   - 권한 우선: 검색 결과는 요청자의 권한 범위 내에서만 반환.
-    현재는 문서 상태(status) 기반 필터링. Phase 2 ACL 연동 시 확장.
+  - API 계약 유지: mode 파라미터 추가 외 기존 Phase 8 계약 동일.
   - DocumentType-aware: 타입별 검색 가중치를 document_types 테이블 설정에서 읽어옴.
   - 스니펫: ts_headline()로 키워드 하이라이팅 포함 스니펫 반환.
 """
@@ -457,6 +457,166 @@ class SearchService:
                     break
                 current_id = str(node["parent_id"])
         return breadcrumb
+
+    # ---------------------------------------------------------------------------
+    # 하이브리드 검색 (FTS + pgvector RRF)
+    # ---------------------------------------------------------------------------
+
+    def search_documents_hybrid(
+        self,
+        conn: psycopg2.extensions.connection,
+        q: str,
+        *,
+        doc_type: Optional[str] = None,
+        status: Optional[str] = None,
+        sort: str = "relevance",
+        page: int = 1,
+        limit: int = 20,
+        actor_role: Optional[str] = None,
+        rrf_k: int = 60,
+        top_k: int = 50,
+    ) -> DocumentSearchResponse:
+        """FTS + pgvector 유사도 검색 결과를 RRF로 통합한 하이브리드 검색.
+
+        알고리즘:
+          1. FTS 상위 top_k 결과 수집 (document 단위)
+          2. 벡터 유사도 상위 top_k 결과 수집 (chunk → document 집계)
+          3. RRF 스코어 = Σ 1/(rrf_k + rank_i) 로 통합 랭킹
+          4. 상위 결과 반환 (페이지네이션)
+        """
+        visible_statuses = self._resolve_visible_statuses(status, actor_role)
+
+        # --- FTS 결과 수집 ---
+        fts_docs: dict[str, float] = {}
+        ts_query = _safe_ts_query(q)
+        if ts_query:
+            fts_sql, fts_params = self._build_document_query(
+                ts_query=ts_query,
+                doc_type=doc_type,
+                visible_statuses=visible_statuses,
+                from_date=None,
+                to_date=None,
+                sort="relevance",
+                count_only=False,
+                limit=top_k,
+                offset=0,
+            )
+            with conn.cursor() as cur:
+                cur.execute(fts_sql, fts_params)
+                fts_rows = cur.fetchall()
+            for rank_pos, row in enumerate(fts_rows, start=1):
+                doc_id = str(row["id"])
+                fts_docs[doc_id] = 1.0 / (rrf_k + rank_pos)
+
+        # --- 벡터 검색 결과 수집 (chunk → document 집계) ---
+        vec_docs: dict[str, float] = {}
+        try:
+            from app.services.vectorization_service import vectorization_pipeline
+            chunk_results = vectorization_pipeline.semantic_search(
+                conn,
+                query=q,
+                actor_role=actor_role,
+                document_type=doc_type,
+                top_k=top_k,
+            )
+            # document별 최고 유사도 청크의 rank 위치로 RRF 계산
+            seen_docs: dict[str, int] = {}
+            for rank_pos, chunk in enumerate(chunk_results, start=1):
+                doc_id = chunk["document_id"]
+                if doc_id not in seen_docs:
+                    seen_docs[doc_id] = rank_pos
+                    vec_docs[doc_id] = 1.0 / (rrf_k + rank_pos)
+        except Exception as exc:
+            logger.warning("하이브리드 검색 중 벡터 검색 실패 (FTS만 사용): %s", exc)
+
+        # --- RRF 통합 ---
+        all_doc_ids = set(fts_docs) | set(vec_docs)
+        rrf_scores: dict[str, float] = {}
+        for doc_id in all_doc_ids:
+            rrf_scores[doc_id] = fts_docs.get(doc_id, 0.0) + vec_docs.get(doc_id, 0.0)
+
+        if not rrf_scores:
+            return DocumentSearchResponse(
+                query=q,
+                results=[],
+                pagination=SearchPagination(page=page, limit=limit, total=0, has_next=False),
+                search_engine="hybrid_rrf",
+            )
+
+        # 정렬된 document_id 목록
+        sorted_doc_ids = sorted(rrf_scores, key=lambda d: rrf_scores[d], reverse=True)
+        total = len(sorted_doc_ids)
+
+        # 페이지네이션
+        offset = (page - 1) * limit
+        page_doc_ids = sorted_doc_ids[offset: offset + limit]
+
+        if not page_doc_ids:
+            return DocumentSearchResponse(
+                query=q,
+                results=[],
+                pagination=SearchPagination(page=page, limit=limit, total=total, has_next=False),
+                search_engine="hybrid_rrf",
+            )
+
+        # 문서 상세 정보 조회
+        placeholders = ",".join(["%s::uuid"] * len(page_doc_ids))
+        with conn.cursor() as cur:
+            # 스니펫을 위한 ts_query 빌드
+            snippet_ts = ts_query or "''"
+            if ts_query:
+                cur.execute(
+                    f"""
+                    SELECT
+                        d.id, d.title, d.document_type, d.status, d.summary,
+                        d.metadata, d.created_by, d.created_at, d.updated_at,
+                        d.current_published_version_id,
+                        0.0::float AS rank,
+                        ts_headline('simple', COALESCE(d.title,''), to_tsquery('simple', %s), '{_HEADLINE_OPTS_SHORT}') AS title_headline,
+                        ts_headline('simple', COALESCE(d.summary,''), to_tsquery('simple', %s), '{_HEADLINE_OPTS}') AS summary_headline
+                    FROM documents d
+                    WHERE d.id IN ({placeholders})
+                      AND d.status IN ({",".join(["%s"] * len(visible_statuses))})
+                    """,
+                    [ts_query, ts_query] + page_doc_ids + visible_statuses,
+                )
+            else:
+                cur.execute(
+                    f"""
+                    SELECT
+                        d.id, d.title, d.document_type, d.status, d.summary,
+                        d.metadata, d.created_by, d.created_at, d.updated_at,
+                        d.current_published_version_id,
+                        0.0::float AS rank,
+                        '' AS title_headline, '' AS summary_headline
+                    FROM documents d
+                    WHERE d.id IN ({placeholders})
+                      AND d.status IN ({",".join(["%s"] * len(visible_statuses))})
+                    """,
+                    page_doc_ids + visible_statuses,
+                )
+            rows = cur.fetchall()
+
+        # doc_id → row 매핑
+        row_map = {str(r["id"]): r for r in rows}
+
+        results = []
+        for doc_id in page_doc_ids:
+            row = row_map.get(doc_id)
+            if row:
+                result = self._map_document_row(row, actor_role)
+                result.rank = rrf_scores.get(doc_id, 0.0)
+                results.append(result)
+
+        return DocumentSearchResponse(
+            query=q,
+            results=results,
+            pagination=SearchPagination(
+                page=page, limit=limit, total=total,
+                has_next=(page * limit) < total,
+            ),
+            search_engine="hybrid_rrf",
+        )
 
     # ---------------------------------------------------------------------------
     # 통합 검색

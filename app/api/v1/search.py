@@ -167,6 +167,7 @@ def unified_search(
         "- `status`: 문서 상태 필터\n"
         "- `from_date`, `to_date`: 생성일 범위 (YYYY-MM-DD)\n"
         "- `sort`: `relevance` | `created_at` | `updated_at`\n"
+        "- `mode`: `fts` (기본, Full-Text Search) | `hybrid` (FTS + 벡터 RRF 통합)\n"
         "- `page`, `limit`: 페이지네이션\n\n"
         "**응답**: 각 결과에 `snippets` (키워드 하이라이팅 포함) 포함."
     ),
@@ -182,6 +183,7 @@ def search_documents(
     from_date: Optional[str] = None,
     to_date: Optional[str] = None,
     sort: str = "relevance",
+    mode: str = "fts",
     page: int = 1,
     limit: int = 20,
     actor: ActorContext = Depends(resolve_current_actor),
@@ -198,19 +200,34 @@ def search_documents(
     request_id, trace_id = get_request_ids(request)
     actor_role = getattr(actor, "role", None)
 
+    if mode not in ("fts", "hybrid"):
+        raise HTTPException(status_code=400, detail=f"지원하지 않는 mode입니다: '{mode}'. 허용 값: fts, hybrid")
+
     with get_db() as conn:
-        result = search_service.search_documents(
-            conn,
-            q,
-            doc_type=type,
-            status=status,
-            from_date=from_date,
-            to_date=to_date,
-            sort=sort,
-            page=max(1, page),
-            limit=min(100, max(1, limit)),
-            actor_role=actor_role,
-        )
+        if mode == "hybrid":
+            result = search_service.search_documents_hybrid(
+                conn,
+                q,
+                doc_type=type,
+                status=status,
+                sort=sort,
+                page=max(1, page),
+                limit=min(100, max(1, limit)),
+                actor_role=actor_role,
+            )
+        else:
+            result = search_service.search_documents(
+                conn,
+                q,
+                doc_type=type,
+                status=status,
+                from_date=from_date,
+                to_date=to_date,
+                sort=sort,
+                page=max(1, page),
+                limit=min(100, max(1, limit)),
+                actor_role=actor_role,
+            )
 
     return success_response(data=result.model_dump(), request_id=request_id, trace_id=trace_id)
 

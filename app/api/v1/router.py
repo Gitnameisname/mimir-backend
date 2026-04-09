@@ -21,6 +21,7 @@ from fastapi import APIRouter
 from app.api.v1 import admin, documents, nodes, operations, retrieval, search, system, versions, webhooks
 from app.api.v1 import workflow
 from app.api.v1 import diff
+from app.api.v1 import vectorization
 
 v1_router = APIRouter()
 
@@ -50,6 +51,9 @@ v1_router.include_router(
     prefix="/documents/{document_id}/versions",
     tags=["diff"],
 )
+
+# Phase 10: 벡터화 파이프라인 API
+v1_router.include_router(vectorization.router, prefix="/vectorization", tags=["vectorization"])
 
 # 확장 예정 — placeholder 수준
 v1_router.include_router(admin.router, prefix="/admin", tags=["admin"])

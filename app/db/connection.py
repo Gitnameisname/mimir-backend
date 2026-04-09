@@ -437,6 +437,75 @@ CREATE INDEX IF NOT EXISTS idx_api_keys_status ON api_keys(status);
 """
 
 # ---------------------------------------------------------------------------
+# Phase 10: pgvector 확장 및 document_chunks 테이블
+# ---------------------------------------------------------------------------
+
+_PGVECTOR_EXTENSION_DDL = """
+CREATE EXTENSION IF NOT EXISTS vector;
+"""
+
+_DOCUMENT_CHUNKS_DDL = """
+CREATE TABLE IF NOT EXISTS document_chunks (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    document_id         UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    version_id          UUID NOT NULL REFERENCES versions(id) ON DELETE CASCADE,
+    node_id             UUID REFERENCES nodes(id) ON DELETE SET NULL,
+    chunk_index         INTEGER NOT NULL,
+    source_text         TEXT NOT NULL,
+    embedding           vector(1536),
+    embedding_model     VARCHAR(100),
+    token_count         INTEGER,
+    node_path           TEXT[] NOT NULL DEFAULT '{}',
+    document_type       VARCHAR(100) NOT NULL,
+    document_status     VARCHAR(50) NOT NULL,
+    accessible_roles    TEXT[] NOT NULL DEFAULT '{}',
+    accessible_user_ids TEXT[] NOT NULL DEFAULT '{}',
+    accessible_org_ids  TEXT[] NOT NULL DEFAULT '{}',
+    is_public           BOOLEAN NOT NULL DEFAULT FALSE,
+    is_current          BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_chunks_document_id
+    ON document_chunks(document_id);
+CREATE INDEX IF NOT EXISTS idx_chunks_version_id
+    ON document_chunks(version_id);
+CREATE INDEX IF NOT EXISTS idx_chunks_is_current
+    ON document_chunks(is_current)
+    WHERE is_current = TRUE;
+CREATE INDEX IF NOT EXISTS idx_chunks_document_type
+    ON document_chunks(document_type);
+"""
+
+# HNSW 인덱스: 테이블 생성 후 별도 DDL (embedding NULL인 행 제외)
+_DOCUMENT_CHUNKS_VECTOR_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_chunks_embedding_hnsw
+    ON document_chunks USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64)
+    WHERE embedding IS NOT NULL AND is_current = TRUE;
+"""
+
+# embedding_token_usage 테이블: 임베딩 API 비용 추적
+_EMBEDDING_TOKEN_USAGE_DDL = """
+CREATE TABLE IF NOT EXISTS embedding_token_usage (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    job_id          UUID REFERENCES background_jobs(id) ON DELETE SET NULL,
+    document_id     UUID REFERENCES documents(id) ON DELETE SET NULL,
+    model           VARCHAR(100) NOT NULL,
+    total_tokens    INTEGER NOT NULL DEFAULT 0,
+    chunk_count     INTEGER NOT NULL DEFAULT 0,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_token_usage_created_at
+    ON embedding_token_usage(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_token_usage_document_id
+    ON embedding_token_usage(document_id)
+    WHERE document_id IS NOT NULL;
+"""
+
+# ---------------------------------------------------------------------------
 # Phase 8: Full-Text Search 마이그레이션
 # ---------------------------------------------------------------------------
 
@@ -615,7 +684,12 @@ def init_db() -> None:
                 # Phase 8 FTS 마이그레이션
                 cur.execute(_FTS_MIGRATION_DDL)
                 cur.execute(_SEARCH_INDEX_STATS_DDL)
-        logger.info("DB schema initialized (Phase 8 FTS included)")
+                # Phase 10 pgvector 확장 및 문서 청크 테이블
+                cur.execute(_PGVECTOR_EXTENSION_DDL)
+                cur.execute(_DOCUMENT_CHUNKS_DDL)
+                cur.execute(_DOCUMENT_CHUNKS_VECTOR_INDEX_DDL)
+                cur.execute(_EMBEDDING_TOKEN_USAGE_DDL)
+        logger.info("DB schema initialized (Phase 10 pgvector included)")
     except Exception as exc:
         logger.error("DB schema initialization failed: %s", exc)
         raise

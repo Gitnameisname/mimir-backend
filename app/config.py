@@ -36,6 +36,12 @@ class Settings(BaseSettings):
     # CORS
     cors_allow_origins: str = "http://localhost:3000"
 
+    # OpenAI / Embedding
+    openai_api_key: str = ""
+    embedding_model: str = "text-embedding-3-small"
+    embedding_dimensions: int = 1536
+    embedding_batch_size: int = 100
+
     # Valkey / Redis
     valkey_host: str = "localhost"
     valkey_port: int = 6379

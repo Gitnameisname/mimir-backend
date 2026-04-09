@@ -18,7 +18,17 @@ Phase 5 워크플로 액션 엔드포인트:
   - 역할(actor_role)은 ActorContext.role(DB 조회)에서만 추출 (VULN-006 수정)
 """
 
+import concurrent.futures
+import logging
 from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+# 벡터화 백그라운드 작업 전용 스레드 풀 (최대 3개 동시 실행)
+_VECTORIZATION_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=3,
+    thread_name_prefix="vec-bg",
+)
 
 from fastapi import APIRouter, Depends, Query, Request
 
@@ -271,10 +281,42 @@ def publish(
             request_id=request_id, trace_id=trace_id,
         )
 
+    # Phase 10: Published 전이 시 자동 벡터화 트리거 (비동기 실행)
+    _trigger_vectorization_async(document_id, version_id)
+
     return success_response(
         data=WorkflowActionResponse(**result).model_dump(),
         request_id=request_id, trace_id=trace_id,
     )
+
+
+def _trigger_vectorization_async(document_id: str, version_id: str) -> None:
+    """Published 전이 후 벡터화를 백그라운드에서 트리거한다.
+
+    스레드 풀(_VECTORIZATION_EXECUTOR, max_workers=3)에 작업을 제출하여
+    동시 실행 수를 제한한다. 실패해도 주 요청에 영향을 주지 않는다.
+    """
+    from app.db import get_db as _get_db
+    from app.services.vectorization_service import vectorization_pipeline as _pipeline
+
+    _log = logger
+
+    def _run() -> None:
+        try:
+            with _get_db() as conn:
+                _pipeline.vectorize_version(
+                    conn,
+                    document_id=document_id,
+                    version_id=version_id,
+                )
+            _log.info("자동 벡터화 완료: document_id=%s, version_id=%s", document_id, version_id)
+        except Exception as exc:
+            _log.error("자동 벡터화 실패 (document_id=%s): %s", document_id, exc)
+
+    try:
+        _VECTORIZATION_EXECUTOR.submit(_run)
+    except RuntimeError:
+        _log.warning("벡터화 스레드 풀이 종료됨 — 벡터화 스킵: document_id=%s", document_id)
 
 
 # ---------------------------------------------------------------------------
