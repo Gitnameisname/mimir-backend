@@ -20,6 +20,7 @@ from fastapi import APIRouter
 
 from app.api.v1 import admin, documents, nodes, operations, retrieval, search, system, versions, webhooks
 from app.api.v1 import workflow
+from app.api.v1 import diff
 
 v1_router = APIRouter()
 
@@ -41,6 +42,14 @@ v1_router.include_router(
 
 # Phase 8: 검색 API
 v1_router.include_router(search.router, prefix="/search", tags=["search"])
+
+# Phase 9: Diff API
+# /documents/{document_id}/versions/{v_id}/diff[/{v2_id}][/summary]
+v1_router.include_router(
+    diff.router,
+    prefix="/documents/{document_id}/versions",
+    tags=["diff"],
+)
 
 # 확장 예정 — placeholder 수준
 v1_router.include_router(admin.router, prefix="/admin", tags=["admin"])
