@@ -644,6 +644,10 @@ def list_document_types(
     search: Optional[str] = Query(default=None),
     _=Depends(require_admin_access),
 ):
+    from app.plugins.base import DocumentTypeRegistry
+    registry = DocumentTypeRegistry.instance()
+    builtin_types = set(registry.list_type_names())
+
     conditions = []
     params: list = []
     if status:
@@ -673,6 +677,24 @@ def list_document_types(
             )
             rows = cur.fetchall()
 
+    # Phase 12: 내장 플러그인 타입은 DB에 없어도 목록에 포함
+    db_type_codes = {r["type_code"] for r in rows}
+    extra_items = []
+    for type_name in builtin_types:
+        if type_name not in db_type_codes:
+            p = registry.get(type_name)
+            extra_items.append({
+                "type_code": type_name,
+                "display_name": p.get_display_name(),
+                "description": p.get_description(),
+                "status": "ACTIVE",
+                "schema_field_count": 0,
+                "document_count": 0,
+                "is_builtin": True,
+                "plugin_registered": True,
+                "created_at": None,
+            })
+
     items = [
         {
             "type_code": r["type_code"],
@@ -681,21 +703,45 @@ def list_document_types(
             "status": r["status"],
             "schema_field_count": r["field_count"] or 0,
             "document_count": r["document_count"],
+            "is_builtin": r["type_code"] in builtin_types,
+            "plugin_registered": r["type_code"] in builtin_types,
             "created_at": r["created_at"].isoformat() if r["created_at"] else None,
         }
         for r in rows
-    ]
+    ] + extra_items
+
+    items.sort(key=lambda x: x["type_code"])
     return success_response(data={"items": items})
 
 
 @router.get("/document-types/{type_code}", summary="DocumentType 상세")
 def get_document_type(type_code: str, _=Depends(require_admin_access)):
+    from app.plugins.base import DocumentTypeRegistry
+    registry = DocumentTypeRegistry.instance()
+
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM document_types WHERE type_code = %s", (type_code,))
             row = cur.fetchone()
+
+            # Phase 12: DB 레코드 없는 내장 플러그인 타입도 상세 반환
             if not row:
-                raise HTTPException(status_code=404, detail="DocumentType을 찾을 수 없습니다.")
+                if not registry.is_builtin(type_code):
+                    raise HTTPException(status_code=404, detail="DocumentType을 찾을 수 없습니다.")
+                plugin = registry.get(type_code)
+                return success_response(data={
+                    "type_code": type_code,
+                    "display_name": plugin.get_display_name(),
+                    "description": plugin.get_description(),
+                    "status": "ACTIVE",
+                    "schema_fields": [],
+                    "plugin_config": {},
+                    "document_count": 0,
+                    "active_document_count": 0,
+                    "created_at": None,
+                    "updated_at": None,
+                    "is_builtin": True,
+                })
 
             cur.execute(
                 """
@@ -718,6 +764,7 @@ def get_document_type(type_code: str, _=Depends(require_admin_access)):
         "active_document_count": doc_counts["active"] if doc_counts else 0,
         "created_at": row["created_at"].isoformat() if row["created_at"] else None,
         "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
+        "is_builtin": registry.is_builtin(type_code),
     })
 
 
@@ -1343,6 +1390,13 @@ def update_document_type(
 @router.delete("/document-types/{type_code}", summary="DocumentType 비활성화", status_code=204)
 def deactivate_document_type(type_code: str, _=Depends(require_admin_access)):
     """실제 삭제 대신 status를 INACTIVE로 변경한다 (참조 무결성 보호)."""
+    # Phase 12: 내장 플러그인 타입은 삭제 불가
+    from app.plugins.base import DocumentTypeRegistry
+    if DocumentTypeRegistry.instance().is_builtin(type_code):
+        raise HTTPException(
+            status_code=422,
+            detail=f"'{type_code}'는 내장 플러그인 타입으로 삭제할 수 없습니다."
+        )
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -1351,3 +1405,265 @@ def deactivate_document_type(type_code: str, _=Depends(require_admin_access)):
             )
             if cur.rowcount == 0:
                 raise HTTPException(status_code=404, detail="DocumentType을 찾을 수 없습니다.")
+
+
+# ===========================================================================
+# Phase 12 — DocumentType 플러그인 설정 관리 API
+# ===========================================================================
+
+class UpdateDocTypePluginConfigBody(BaseModel):
+    """플러그인 설정 업데이트 요청 본문."""
+    chunking_config: Optional[dict[str, Any]] = None
+    rag_config: Optional[dict[str, Any]] = None
+    search_config: Optional[dict[str, Any]] = None
+    metadata_schema: Optional[dict[str, Any]] = None
+    editor_config: Optional[dict[str, Any]] = None
+    renderer_config: Optional[dict[str, Any]] = None
+    workflow_config: Optional[dict[str, Any]] = None
+
+
+@router.get("/document-types/{type_code}/plugin", summary="플러그인 현황 조회")
+def get_document_type_plugin(type_code: str, _=Depends(require_admin_access)):
+    """DocumentType 플러그인 현황과 유효 설정을 반환한다."""
+    # P12-SEC-05: type_code 형식 검증
+    _validate_type_code_format(type_code)
+
+    from app.plugins.base import DocumentTypeRegistry
+    registry = DocumentTypeRegistry.instance()
+    is_builtin = registry.is_builtin(type_code)
+
+    # 플러그인 기본값 조회
+    plugin = registry.get(type_code)
+    chunking_cfg = plugin.chunking_plugin().get_config()
+    ctx_cfg = plugin.rag_plugin().get_context_config()
+    search_boost = plugin.search_plugin().get_boost_config()
+    metadata_schema = plugin.metadata_schema_plugin().get_schema()
+    metadata_ui_schema = plugin.metadata_schema_plugin().get_ui_schema()
+    workflow = {
+        "requires_approval": plugin.workflow_plugin().requires_approval(),
+        "review_roles": plugin.workflow_plugin().get_review_roles(),
+    }
+    editor = {
+        "allowed_node_types": plugin.editor_plugin().get_allowed_node_types(),
+        "default_structure": plugin.editor_plugin().get_default_structure(),
+    }
+
+    # DB 오버라이드 설정 조회
+    db_override: dict = {}
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT plugin_config FROM document_types WHERE type_code = %s",
+                (type_code,),
+            )
+            row = cur.fetchone()
+            if row and row.get("plugin_config"):
+                db_override = row["plugin_config"]
+
+    return success_response(data={
+        "type_code": type_code,
+        "is_builtin": is_builtin,
+        "effective_config": {
+            "chunking": {
+                "strategy": chunking_cfg.strategy,
+                "max_chunk_tokens": chunking_cfg.max_chunk_tokens,
+                "min_chunk_tokens": chunking_cfg.min_chunk_tokens,
+                "overlap_tokens": chunking_cfg.overlap_tokens,
+                "include_parent_context": chunking_cfg.include_parent_context,
+                "parent_context_depth": chunking_cfg.parent_context_depth,
+                "index_version_policy": chunking_cfg.index_version_policy,
+                "exclude_node_types": chunking_cfg.exclude_node_types,
+                "merge_strategy": chunking_cfg.merge_strategy,
+            },
+            "rag": ctx_cfg,
+            "search_boost": search_boost,
+            "metadata_schema": metadata_schema,
+            "metadata_ui_schema": metadata_ui_schema,
+            "workflow": workflow,
+            "editor": editor,
+        },
+        "db_override": db_override,
+        "display_name": plugin.get_display_name(),
+        "description": plugin.get_description(),
+    })
+
+
+_TYPE_CODE_PATTERN = re.compile(r'^[A-Z][A-Z0-9_]*$')
+
+
+def _validate_type_code_format(type_code: str) -> None:
+    """P12-SEC-05: type_code 경로 파라미터 형식 검증."""
+    if not _TYPE_CODE_PATTERN.match(type_code):
+        raise HTTPException(
+            status_code=422,
+            detail="type_code는 영문 대문자, 숫자, 밑줄만 허용됩니다."
+        )
+
+
+def _validate_chunking_config(cfg: dict) -> None:
+    """P12-SEC-02: chunking_config 숫자 범위 검증."""
+    max_tokens = cfg.get("max_chunk_tokens")
+    min_tokens = cfg.get("min_chunk_tokens")
+    overlap = cfg.get("overlap_tokens")
+    depth = cfg.get("parent_context_depth")
+
+    errors = []
+    if max_tokens is not None:
+        if not isinstance(max_tokens, int) or max_tokens <= 0:
+            errors.append("max_chunk_tokens는 1 이상의 정수여야 합니다.")
+        elif max_tokens > 32768:
+            errors.append("max_chunk_tokens는 32768 이하여야 합니다.")
+    if min_tokens is not None:
+        if not isinstance(min_tokens, int) or min_tokens < 0:
+            errors.append("min_chunk_tokens는 0 이상의 정수여야 합니다.")
+    if overlap is not None:
+        if not isinstance(overlap, int) or overlap < 0:
+            errors.append("overlap_tokens는 0 이상의 정수여야 합니다.")
+    if depth is not None:
+        if not isinstance(depth, int) or depth < 0:
+            errors.append("parent_context_depth는 0 이상의 정수여야 합니다.")
+        elif depth > 10:
+            errors.append("parent_context_depth는 10 이하여야 합니다.")
+    if max_tokens and min_tokens and max_tokens <= min_tokens:
+        errors.append("max_chunk_tokens는 min_chunk_tokens보다 커야 합니다.")
+    if overlap and max_tokens and overlap >= max_tokens:
+        errors.append("overlap_tokens는 max_chunk_tokens보다 작아야 합니다.")
+
+    if errors:
+        raise HTTPException(status_code=422, detail=" / ".join(errors))
+
+
+@router.put("/document-types/{type_code}/plugin", summary="플러그인 설정 업데이트")
+def update_document_type_plugin_config(
+    type_code: str,
+    body: UpdateDocTypePluginConfigBody,
+    actor: ActorContext = Depends(resolve_current_actor),
+    _=Depends(require_admin_access),
+):
+    """DocumentType 플러그인 설정을 DB에 저장한다 (내장 타입은 오버라이드).
+
+    변경 시 감사 이벤트를 기록한다.
+    """
+    import json as json_lib
+    from app.audit.emitter import audit_emitter
+
+    # P12-SEC-05: type_code 형식 검증
+    _validate_type_code_format(type_code)
+
+    changed_fields = []
+    plugin_config_update: dict[str, Any] = {}
+
+    if body.chunking_config is not None:
+        # P12-SEC-02: 숫자 범위 검증
+        _validate_chunking_config(body.chunking_config)
+        plugin_config_update["chunking_config"] = body.chunking_config
+        changed_fields.append("chunking_config")
+
+    if body.rag_config is not None:
+        plugin_config_update["rag_config"] = body.rag_config
+        changed_fields.append("rag_config")
+
+    if body.search_config is not None:
+        plugin_config_update["search_config"] = body.search_config
+        changed_fields.append("search_config")
+
+    if body.metadata_schema is not None:
+        # JSON Schema 유효성 검사 (P12-SEC-03: 예외 상세 미노출)
+        try:
+            import jsonschema
+            jsonschema.Draft7Validator.check_schema(body.metadata_schema)
+        except ImportError:
+            pass  # jsonschema 미설치 시 검증 건너뜀
+        except Exception:
+            raise HTTPException(
+                status_code=422,
+                detail="유효하지 않은 JSON Schema (Draft-07) 형식입니다. 스키마 구조를 확인하세요."
+            )
+        plugin_config_update["metadata_schema"] = body.metadata_schema
+        changed_fields.append("metadata_schema")
+
+    if body.editor_config is not None:
+        plugin_config_update["editor_config"] = body.editor_config
+        changed_fields.append("editor_config")
+
+    if body.renderer_config is not None:
+        plugin_config_update["renderer_config"] = body.renderer_config
+        changed_fields.append("renderer_config")
+
+    if body.workflow_config is not None:
+        plugin_config_update["workflow_config"] = body.workflow_config
+        changed_fields.append("workflow_config")
+
+    if not changed_fields:
+        raise HTTPException(status_code=422, detail="변경할 설정이 없습니다.")
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            # 기존 plugin_config 조회
+            cur.execute(
+                "SELECT plugin_config FROM document_types WHERE type_code = %s",
+                (type_code,),
+            )
+            row = cur.fetchone()
+
+            if row is None:
+                # DB에 없는 경우 — 내장 플러그인의 경우 DB 레코드 생성
+                from app.plugins.base import DocumentTypeRegistry
+                plugin = DocumentTypeRegistry.instance().get(type_code)
+                cur.execute(
+                    """
+                    INSERT INTO document_types (type_code, display_name, description, plugin_config)
+                    VALUES (%s, %s, %s, %s::jsonb)
+                    ON CONFLICT (type_code) DO UPDATE
+                      SET plugin_config = document_types.plugin_config || EXCLUDED.plugin_config,
+                          updated_at = NOW()
+                    """,
+                    (
+                        type_code,
+                        plugin.get_display_name(),
+                        plugin.get_description(),
+                        json_lib.dumps(plugin_config_update),
+                    ),
+                )
+            else:
+                # 기존 plugin_config와 병합 (P12-SEC-04: COALESCE로 NULL 전파 방어)
+                cur.execute(
+                    """
+                    UPDATE document_types
+                    SET plugin_config = COALESCE(plugin_config, '{}') || %s::jsonb,
+                        updated_at = NOW()
+                    WHERE type_code = %s
+                    """,
+                    (json_lib.dumps(plugin_config_update), type_code),
+                )
+
+    # 감사 이벤트 기록
+    try:
+        audit_emitter.emit(
+            event_type="DOCUMENT_TYPE_PLUGIN_CONFIG_CHANGED",
+            actor_id=actor.actor_id,
+            actor_role=actor.role,
+            metadata={
+                "type_code": type_code,
+                "changed_fields": changed_fields,
+            },
+        )
+    except Exception as exc:
+        logger.warning("감사 이벤트 기록 실패: %s", exc)
+
+    return success_response(data={
+        "type_code": type_code,
+        "updated_fields": changed_fields,
+    })
+
+
+@router.get("/document-types/{type_code}/plugin/schema", summary="Metadata Schema 조회")
+def get_metadata_schema(type_code: str, _=Depends(require_admin_access)):
+    """타입의 metadata JSON Schema와 UI Schema를 반환한다."""
+    from app.plugins.base import DocumentTypeRegistry
+    plugin = DocumentTypeRegistry.instance().get(type_code)
+    return success_response(data={
+        "type_code": type_code,
+        "schema": plugin.metadata_schema_plugin().get_schema(),
+        "ui_schema": plugin.metadata_schema_plugin().get_ui_schema(),
+    })

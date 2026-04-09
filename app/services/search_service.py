@@ -70,6 +70,18 @@ def _safe_ts_query(q: str) -> str:
     return " & ".join(parts)
 
 
+def _get_search_boost_for_type(document_type: Optional[str]) -> dict:
+    """Phase 12: SearchPlugin을 통해 타입별 검색 가중치를 조회한다."""
+    if not document_type:
+        return {}
+    try:
+        from app.plugins.base import DocumentTypeRegistry
+        plugin = DocumentTypeRegistry.instance().get(document_type)
+        return plugin.search_plugin().get_boost_config()
+    except Exception:
+        return {}
+
+
 class SearchService:
     """검색 서비스 — FTS 기반 문서/노드 검색."""
 

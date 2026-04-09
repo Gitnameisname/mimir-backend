@@ -451,7 +451,16 @@ _SYSTEM_PROMPT_TEMPLATE = """당신은 문서 기반 지식 도우미입니다.
 
 
 def build_system_prompt(context: str, document_type: Optional[str] = None) -> str:
-    """시스템 프롬프트 생성. Phase 12에서 document_type별 커스터마이징 가능."""
+    """시스템 프롬프트 생성. Phase 12: DocumentTypeRegistry 경유로 타입별 템플릿 사용."""
+    if document_type:
+        try:
+            from app.plugins.base import DocumentTypeRegistry
+            plugin = DocumentTypeRegistry.instance().get(document_type)
+            return plugin.rag_plugin().get_prompt_template().render(context)
+        except Exception as exc:
+            logger.warning(
+                "RAG 플러그인 프롬프트 템플릿 조회 실패 (%s), 기본값 사용: %s", document_type, exc
+            )
     return _SYSTEM_PROMPT_TEMPLATE.format(context=context)
 
 
@@ -525,6 +534,7 @@ class RAGService:
         *,
         actor_role: Optional[str] = None,
         document_id: Optional[str] = None,
+        document_type: Optional[str] = None,
         history: Optional[list[dict]] = None,
     ) -> tuple[str, list[RetrievedChunk], list[dict]]:
         """Retrieve → Rerank → ContextBuilder 단계만 실행한다.
@@ -535,6 +545,19 @@ class RAGService:
         """
         question = self._qp.normalize(question)
 
+        # Phase 12: 타입별 RAG 설정 사전 로드 (top_n, max_context_tokens)
+        max_tokens = settings.rag_max_context_tokens
+        top_n = settings.rag_top_n
+        if document_type:
+            try:
+                from app.plugins.base import DocumentTypeRegistry
+                plugin = DocumentTypeRegistry.instance().get(document_type)
+                ctx_cfg = plugin.rag_plugin().get_context_config()
+                max_tokens = ctx_cfg.get("max_context_tokens", max_tokens)
+                top_n = ctx_cfg.get("top_n", top_n)
+            except Exception:
+                pass
+
         # 1. Retrieve
         raw_chunks = self._retriever.retrieve(
             conn, question,
@@ -543,20 +566,18 @@ class RAGService:
             top_k=settings.rag_top_k,
         )
 
-        # 2. Rerank
+        # 2. Rerank (타입별 top_n 적용)
         if settings.rag_reranker_enabled:
             chunks = self._reranker.rerank(
                 raw_chunks,
-                top_n=settings.rag_top_n,
+                top_n=top_n,
                 threshold=settings.rag_reranker_threshold,
             )
         else:
-            chunks = raw_chunks[:settings.rag_top_n]
+            chunks = raw_chunks[:top_n]
 
-        # 3. Build context
-        context, included_chunks = self._cb.build(
-            chunks, max_tokens=settings.rag_max_context_tokens
-        )
+        # 3. Build context (타입별 max_context_tokens 적용)
+        context, included_chunks = self._cb.build(chunks, max_tokens=max_tokens)
 
         # 4. Build messages
         messages = _build_messages(question, history or [])
@@ -575,6 +596,7 @@ class RAGService:
         *,
         conversation_id: str,
         message_id: Optional[str] = None,
+        document_type: Optional[str] = None,
     ) -> AsyncGenerator[str, None]:
         """LLM 스트리밍 단계 — DB 연결 없이 실행.
 
@@ -585,7 +607,7 @@ class RAGService:
 
         try:
             llm = self._get_llm()
-            system_prompt = build_system_prompt(context)
+            system_prompt = build_system_prompt(context, document_type=document_type)
 
             # start 이벤트
             yield _sse_data({"event": "start", "data": {

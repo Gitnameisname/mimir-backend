@@ -23,12 +23,19 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ChunkingConfig:
     """DocumentType별 청킹 설정."""
-    strategy: str = "node_based"           # node_based | fixed_size | semantic
-    max_chunk_tokens: int = 512            # 청크 최대 토큰 수
-    min_chunk_tokens: int = 50             # 청크 최소 토큰 수 (이하면 부모와 합치기)
-    overlap_tokens: int = 50               # 청크 간 오버랩 토큰 수
-    include_parent_context: bool = True    # 부모 노드 제목을 청크 앞에 포함
-    index_version_policy: str = "published_only"  # published_only | latest | all
+    strategy: str = "node_based"                    # node_based | fixed_size | semantic
+    max_chunk_tokens: int = 512                     # 청크 최대 토큰 수
+    min_chunk_tokens: int = 50                      # 청크 최소 토큰 수 (이하면 부모와 합치기)
+    overlap_tokens: int = 50                        # 청크 간 오버랩 토큰 수
+    include_parent_context: bool = True             # 부모 노드 제목을 청크 앞에 포함
+    parent_context_depth: int = 2                   # 포함할 부모 제목 단계 수 (0=전체)
+    index_version_policy: str = "published_only"   # published_only | latest | all
+    exclude_node_types: list = None                 # 청킹 제외 노드 타입
+    merge_strategy: str = "merge_siblings"          # merge_siblings | ...
+
+    def __post_init__(self):
+        if self.exclude_node_types is None:
+            self.exclude_node_types = []
 
 
 # ---------------------------------------------------------------------------
@@ -215,7 +222,9 @@ class ChunkingService:
             # 현재 노드 텍스트 구성
             parts = []
             if config.include_parent_context and parent_path:
-                parts.append(" > ".join(parent_path))
+                depth = config.parent_context_depth
+                context_path = parent_path[-depth:] if depth > 0 else parent_path
+                parts.append(" > ".join(context_path))
             if node.title:
                 parts.append(node.title)
             if node.content:
@@ -361,13 +370,17 @@ class ChunkingService:
         if not raw_config:
             return self._DEFAULT_CONFIG
 
+        d = self._DEFAULT_CONFIG
         return ChunkingConfig(
-            strategy=raw_config.get("strategy", self._DEFAULT_CONFIG.strategy),
-            max_chunk_tokens=int(raw_config.get("max_chunk_tokens", self._DEFAULT_CONFIG.max_chunk_tokens)),
-            min_chunk_tokens=int(raw_config.get("min_chunk_tokens", self._DEFAULT_CONFIG.min_chunk_tokens)),
-            overlap_tokens=int(raw_config.get("overlap_tokens", self._DEFAULT_CONFIG.overlap_tokens)),
-            include_parent_context=bool(raw_config.get("include_parent_context", self._DEFAULT_CONFIG.include_parent_context)),
-            index_version_policy=raw_config.get("index_version_policy", self._DEFAULT_CONFIG.index_version_policy),
+            strategy=raw_config.get("strategy", d.strategy),
+            max_chunk_tokens=int(raw_config.get("max_chunk_tokens", d.max_chunk_tokens)),
+            min_chunk_tokens=int(raw_config.get("min_chunk_tokens", d.min_chunk_tokens)),
+            overlap_tokens=int(raw_config.get("overlap_tokens", d.overlap_tokens)),
+            include_parent_context=bool(raw_config.get("include_parent_context", d.include_parent_context)),
+            parent_context_depth=int(raw_config.get("parent_context_depth", d.parent_context_depth)),
+            index_version_policy=raw_config.get("index_version_policy", d.index_version_policy),
+            exclude_node_types=list(raw_config.get("exclude_node_types", d.exclude_node_types)),
+            merge_strategy=raw_config.get("merge_strategy", d.merge_strategy),
         )
 
     def get_chunking_config_for_type(
@@ -375,31 +388,46 @@ class ChunkingService:
         conn,
         document_type: str,
     ) -> ChunkingConfig:
-        """DB에서 DocumentType의 chunking_config를 조회한다."""
+        """DocumentTypeRegistry를 경유해 DocumentType별 청킹 설정을 조회한다.
+
+        Phase 12: 플러그인 레지스트리 경유로 마이그레이션.
+        내장 타입(POLICY 등)은 플러그인 기본값을 사용하고,
+        DB 오버라이드가 있으면 병합해서 반환한다.
+        """
         try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT plugin_config FROM document_types WHERE type_code = %s",
-                    (document_type,),
-                )
-                row = cur.fetchone()
-                if not row:
-                    logger.warning(
-                        "document_type='%s'가 document_types 테이블에 없어 기본 청킹 설정을 사용합니다.",
-                        document_type,
-                    )
-                    return self._DEFAULT_CONFIG
-                plugin_config = row.get("plugin_config") or {}
-                raw_config = plugin_config.get("chunking_config")
-                if raw_config:
-                    return self._resolve_config(raw_config)
-                logger.warning(
-                    "document_type='%s' plugin_config에 chunking_config가 없어 기본 청킹 설정을 사용합니다.",
-                    document_type,
-                )
+            from app.plugins.base import DocumentTypeRegistry
+            import dataclasses
+            registry = DocumentTypeRegistry.instance()
+            plugin = registry.get(document_type, conn=conn)
+            pc = plugin.chunking_plugin().get_config()
+            # 플러그인 ChunkingConfig → 서비스 ChunkingConfig 변환 (필드 매핑)
+            return ChunkingConfig(
+                strategy=pc.strategy,
+                max_chunk_tokens=pc.max_chunk_tokens,
+                min_chunk_tokens=pc.min_chunk_tokens,
+                overlap_tokens=pc.overlap_tokens,
+                include_parent_context=pc.include_parent_context,
+                parent_context_depth=pc.parent_context_depth,
+                index_version_policy=pc.index_version_policy,
+                exclude_node_types=list(pc.exclude_node_types),
+                merge_strategy=pc.merge_strategy,
+            )
         except Exception as exc:
-            logger.warning("DocumentType '%s' chunking_config 조회 실패: %s", document_type, exc)
+            logger.warning(
+                "DocumentType '%s' chunking_config 플러그인 조회 실패, 기본값 사용: %s",
+                document_type, exc,
+            )
         return self._DEFAULT_CONFIG
+
+    def should_index_version(self, document_type: str, version_status: str) -> bool:
+        """해당 버전 상태의 문서를 벡터화할지 여부를 플러그인에서 판단한다."""
+        try:
+            from app.plugins.base import DocumentTypeRegistry
+            plugin = DocumentTypeRegistry.instance().get(document_type)
+            return plugin.chunking_plugin().should_index(version_status)
+        except Exception:
+            # 기본값: published_only
+            return version_status in ("PUBLISHED", "published")
 
 
 chunking_service = ChunkingService()

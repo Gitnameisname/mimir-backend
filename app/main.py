@@ -74,6 +74,14 @@ def create_app() -> FastAPI:
         except Exception as exc:
             logger.warning("RAG tables init skipped (connection unavailable): %s", exc)
 
+        # Phase 12: 내장 DocumentType 플러그인 자동 등록
+        try:
+            from app.plugins.builtin import register_builtin_plugins
+            register_builtin_plugins()
+            logger.info("DocumentType 내장 플러그인 등록 완료 (POLICY, MANUAL, REPORT, FAQ)")
+        except Exception as exc:
+            logger.warning("DocumentType 플러그인 등록 실패: %s", exc)
+
     return app
 
 

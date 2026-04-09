@@ -97,6 +97,7 @@ async def rag_query(
                 user_id=user_id,
                 actor_role=actor.role,
                 document_id=body.document_id,
+                document_type=getattr(body, "document_type", None),
             ),
             media_type="text/event-stream",
             headers={
@@ -163,6 +164,7 @@ async def _stream_rag(
     user_id: str,
     actor_role: Optional[str],
     document_id: Optional[str],
+    document_type: Optional[str] = None,
 ) -> AsyncGenerator[bytes, None]:
     """SSE 스트리밍 생성기.
 
@@ -195,6 +197,7 @@ async def _stream_rag(
                 conn, question,
                 actor_role=actor_role,
                 document_id=document_id,
+                document_type=document_type,
                 history=history,
             )
         # conn이 이 지점에서 반환됨 — 이후 LLM 스트리밍 중 DB 연결 미점유
@@ -209,6 +212,7 @@ async def _stream_rag(
             context, included_chunks, messages,
             conversation_id=conversation_id,
             message_id=message_id,
+            document_type=document_type,
         ):
             yield sse_line.encode("utf-8")
 

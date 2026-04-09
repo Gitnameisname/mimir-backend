@@ -107,6 +107,7 @@ class RAGQueryRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000)
     conversation_id: Optional[str] = None  # 대화 이력 연속 시 필수
     document_id: Optional[str] = None      # 특정 문서 범위 제한 (optional)
+    document_type: Optional[str] = None    # Phase 12: 타입별 RAG 플러그인 선택
     stream: bool = True                     # SSE 스트리밍 여부
 
     @field_validator("conversation_id")
