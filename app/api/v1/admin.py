@@ -34,6 +34,7 @@ Admin router — /api/v1/admin
   - DELETE /admin/document-types/{type_code}
 """
 
+import re
 from typing import Any, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
@@ -497,6 +498,18 @@ def get_role(role_id: str, _=Depends(require_admin_access)):
 # 감사 로그
 # ---------------------------------------------------------------------------
 
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2})?)?Z?$")
+
+
+def _validate_date_param(value: Optional[str], param_name: str) -> None:
+    """VULN-016: date 파라미터가 ISO 8601 형식인지 검증한다."""
+    if value and not _ISO_DATE_RE.match(value):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid date format for '{param_name}'. Use ISO 8601 (e.g. 2024-01-01 or 2024-01-01T00:00:00).",
+        )
+
+
 @router.get("/audit-logs", summary="감사 로그 목록")
 def list_audit_logs(
     page: int = Query(default=1, ge=1),
@@ -508,6 +521,9 @@ def list_audit_logs(
     result: Optional[str] = Query(default=None),
     _=Depends(require_admin_access),
 ):
+    _validate_date_param(from_dt, "from")
+    _validate_date_param(to_dt, "to")
+
     offset = (page - 1) * limit
     conditions = []
     params: list = []

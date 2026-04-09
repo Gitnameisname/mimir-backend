@@ -136,10 +136,13 @@ async def api_error_handler(request: Request, exc: ApiError) -> JSONResponse:
     if exc.http_status in (401, 403):
         try:
             from app.audit.emitter import audit_emitter
+            # VULN-023: request.state.context.actor에서 actor_id 추출
+            _actor = getattr(getattr(request.state, "context", None), "actor", None)
+            _actor_id = getattr(_actor, "actor_id", None) if _actor else None
             audit_emitter.emit(
                 event_type="authz.denied",
                 action="authz.check",
-                actor_id=None,
+                actor_id=_actor_id,
                 resource_type="unknown",
                 result="denied",
                 request_id=meta.request_id,

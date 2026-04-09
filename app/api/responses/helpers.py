@@ -12,6 +12,7 @@
 
 from typing import Any, Optional
 
+from app.api.query import ParsedListQuery
 from app.api.responses.models import (
     AcceptedData,
     AcceptedResponse,
@@ -83,6 +84,39 @@ def list_response(
 
     meta = ListMeta(request_id=request_id, trace_id=trace_id, pagination=pagination)
     return SuccessResponse(data=data, meta=meta)
+
+
+def paginated_list_response(
+    data: list,
+    *,
+    query: ParsedListQuery,
+    total: int,
+    request_id: Optional[str] = None,
+    trace_id: Optional[str] = None,
+) -> SuccessResponse:
+    """ParsedListQuery 기반 목록 응답을 만든다.
+
+    라우터에서 반복되는 page/page_size 계산 + list_response 조합을 캡슐화한다.
+
+    Args:
+        data: 응답 항목 배열
+        query: make_list_query_dependency()가 반환한 ParsedListQuery
+        total: 전체 항목 수
+        request_id: 요청 추적 ID
+        trace_id: 분산 트레이싱 ID
+    """
+    page = query.page or 1
+    page_size = query.page_size or 20
+    has_next = (page * page_size) < total
+    return list_response(
+        data=data,
+        request_id=request_id,
+        trace_id=trace_id,
+        page=page,
+        page_size=page_size,
+        total=total,
+        has_next=has_next,
+    )
 
 
 def accepted_response(

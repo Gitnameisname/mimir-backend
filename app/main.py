@@ -12,22 +12,29 @@ logger = logging.getLogger(__name__)
 
 
 def create_app() -> FastAPI:
+    # VULN-015: production에서 /docs, /redoc 비활성화
+    is_production = settings.environment == "production"
     app = FastAPI(
         title="Mimir Platform API",
         description="범용 문서/지식 플랫폼 API",
         version=settings.api_version,
-        docs_url="/docs",
-        redoc_url="/redoc",
-        openapi_url="/openapi.json",
+        docs_url=None if is_production else "/docs",
+        redoc_url=None if is_production else "/redoc",
+        openapi_url=None if is_production else "/openapi.json",
     )
 
-    # CORS
+    # CORS — VULN-012/013: 와일드카드 제거, 명시적 method/header 목록 지정
+    _ALLOWED_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+    _ALLOWED_HEADERS = [
+        "Authorization", "Content-Type", "X-Request-Id", "X-Trace-Id",
+        "X-Actor-Id", "X-Actor-Role", "X-Service-Token", "X-API-Key",
+    ]
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,
         allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_methods=_ALLOWED_METHODS,
+        allow_headers=_ALLOWED_HEADERS,
     )
 
     # RequestContext 미들웨어 (Task I-4/I-5)

@@ -182,5 +182,50 @@ class AuditEmitter:
             )
 
 
+    def emit_for_actor(
+        self,
+        *,
+        event_type: str,
+        action: str,
+        actor: Any,  # ActorContext — 순환 import 방지를 위해 Any 사용
+        resource_type: str,
+        resource_id: Optional[str] = None,
+        request_id: Optional[str] = None,
+        trace_id: Optional[str] = None,
+        metadata: Optional[dict[str, Any]] = None,
+        previous_state: Optional[str] = None,
+        new_state: Optional[str] = None,
+        target_version_id: Optional[str] = None,
+    ) -> None:
+        """ActorContext를 받아 actor_id / actor_role을 자동 추출하고 emit한다.
+
+        라우터에서 반복되는::
+
+            audit_emitter.emit(
+                event_type=..., action=...,
+                actor_id=actor_id,
+                actor_role=actor.role,
+                resource_type=..., result="success", ...
+            )
+
+        패턴을 단순화한다.
+        """
+        self.emit(
+            event_type=event_type,
+            action=action,
+            actor_id=getattr(actor, "actor_id", None) if getattr(actor, "is_authenticated", False) else None,
+            actor_role=getattr(actor, "role", None),
+            resource_type=resource_type,
+            resource_id=resource_id,
+            result="success",
+            request_id=request_id,
+            trace_id=trace_id,
+            metadata=metadata,
+            previous_state=previous_state,
+            new_state=new_state,
+            target_version_id=target_version_id,
+        )
+
+
 # 모듈 수준 싱글턴
 audit_emitter = AuditEmitter()

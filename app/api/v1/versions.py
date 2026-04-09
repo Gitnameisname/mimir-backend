@@ -23,18 +23,12 @@ from fastapi import APIRouter, Depends, Request
 
 from app.api.auth import ResourceRef, authorization_service, resolve_current_actor
 from app.api.auth.models import ActorContext
+from app.api.context import get_request_ids
 from app.api.responses import SuccessResponse, success_response
 from app.db import get_db
 from app.services.versions_service import versions_service
 
 router = APIRouter()
-
-
-def _ctx(request: Request) -> tuple[Optional[str], Optional[str]]:
-    ctx = getattr(request.state, "context", None)
-    if ctx is None:
-        return None, None
-    return ctx.request_id, ctx.trace_id
 
 
 # ---------------------------------------------------------------------------
@@ -65,7 +59,7 @@ def get_version(
         require_authenticated=False,
     )
 
-    request_id, trace_id = _ctx(request)
+    request_id, trace_id = get_request_ids(request)
 
     with get_db() as conn:
         version = versions_service.get_version(conn, version_id)

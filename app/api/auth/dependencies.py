@@ -15,23 +15,29 @@ ActorContext로 정규화하고 RequestContext.actor를 갱신한다.
 "이 actor가 이 action을 할 수 있는가"는 AuthorizationService가 판단한다.
 
 인증 입력 소스 우선순위:
-  1. X-Service-Token  → service actor (내부 서비스 간 호출)
+  1. X-Service-Token  → service actor (내부 서비스 간 호출) — settings.internal_service_secret 검증
   2. Authorization: Bearer <token>  → user actor (JWT 등, Phase 8 연동 예정)
   3. X-API-Key  → user actor (API key, DB 조회 포함)
   4. Cookie: session=<token>  → user actor (세션)
   5. 없음  → anonymous
 
-개발용 헤더 (Phase 8 이전 임시):
+개발용 헤더 (settings.debug=True 전용):
   - X-Actor-Id   : actor_id 직접 주입
   - X-Actor-Role : actor role 직접 주입 (VIEWER/AUTHOR/REVIEWER/APPROVER/ORG_ADMIN/SUPER_ADMIN)
   위 두 헤더가 모두 있으면 is_authenticated=True로 처리.
+  ** debug=False(기본값)이면 이 경로는 완전 비활성화된다. **
+
+보안 강화 내역:
+  - VULN-001: X-Service-Token은 settings.internal_service_secret과 HMAC 비교 (빈 문자열이면 해당 경로 차단)
+  - VULN-002: 개발 헤더 게이트를 settings.environment != "production" → settings.debug == True 로 변경
 
 TODO:
-  - X-Service-Token 실제 검증 연결 예정 (internal_service auth)
   - Bearer token JWT verifier 연결 예정 (Phase 8)
   - session resolver (Redis/DB) 연결 예정 (Phase 8)
 """
 
+import hashlib
+import hmac
 import logging
 
 from fastapi import Request
@@ -87,7 +93,7 @@ def resolve_current_actor(request: Request) -> ActorContext:
 def _extract_actor(request: Request) -> ActorContext:
     """인증 입력 소스 우선순위에 따라 ActorContext를 반환한다."""
 
-    # 1. internal service header
+    # 1. internal service header — HMAC 서명 검증 (VULN-001 수정)
     service_token = request.headers.get("X-Service-Token")
     if service_token:
         return _extract_service_actor(service_token)
@@ -109,8 +115,8 @@ def _extract_actor(request: Request) -> ActorContext:
     if session_token:
         return _extract_session_actor(session_token)
 
-    # 5. 개발용 헤더 (X-Actor-Id + X-Actor-Role) — production 환경에서는 차단
-    if settings.environment != "production":
+    # 5. 개발용 헤더 (X-Actor-Id + X-Actor-Role) — debug=True 전용 (VULN-002 수정)
+    if settings.debug:
         actor_id = request.headers.get("X-Actor-Id")
         actor_role = request.headers.get("X-Actor-Role")
         if actor_id and actor_role:
@@ -123,15 +129,41 @@ def _extract_actor(request: Request) -> ActorContext:
 def _extract_service_actor(token: str) -> ActorContext:
     """내부 서비스 토큰으로 service actor를 반환한다.
 
-    현재는 토큰 존재만 확인. is_authenticated=True로 설정해
-    authorize() 1단계(SERVICE actor 전체 허용)가 올바르게 작동하도록 한다.
+    VULN-001 수정: settings.internal_service_secret과 HMAC-SHA256 비교.
+    - secret이 설정되지 않은 경우(빈 문자열): 해당 경로 차단 → anonymous 반환
+    - 검증 실패: anonymous 반환 (fail-closed)
+    - 검증 성공: is_authenticated=True SERVICE actor 반환
 
-    TODO: X-Service-Token 실제 검증 로직 연결 예정 (Phase 8).
+    TODO: Phase 8에서 JWT 방식으로 전환 예정.
     """
+    secret = settings.internal_service_secret
+    if not secret:
+        logger.warning("X-Service-Token received but INTERNAL_SERVICE_SECRET not configured — rejecting")
+        return ActorContext(
+            actor_type=ActorType.ANONYMOUS,
+            actor_id=None,
+            is_authenticated=False,
+            auth_method=None,
+            tenant_id=None,
+            role=None,
+        )
+
+    expected = hmac.HMAC(secret.encode(), b"mimir-internal", hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(token, expected):
+        logger.warning("X-Service-Token HMAC verification failed")
+        return ActorContext(
+            actor_type=ActorType.ANONYMOUS,
+            actor_id=None,
+            is_authenticated=False,
+            auth_method=None,
+            tenant_id=None,
+            role=None,
+        )
+
     return ActorContext(
         actor_type=ActorType.SERVICE,
         actor_id=None,
-        is_authenticated=True,   # 토큰 존재 = 인증된 내부 서비스로 처리
+        is_authenticated=True,
         auth_method=AuthMethod.INTERNAL_SERVICE,
         tenant_id=None,
         role=None,

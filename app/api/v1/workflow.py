@@ -15,15 +15,16 @@ Phase 5 워크플로 액션 엔드포인트:
   - 액션별 엔드포인트: OpenAPI 명확성 + 권한 정책 분리 + 감사 추적 용이성
   - 라우터는 얇게 유지 (파싱/위임/응답만)
   - 비즈니스 로직은 WorkflowService에 위임
-  - 역할(actor_role)은 ActorContext.role(DB 조회) → X-Actor-Role 헤더(개발용) 순으로 추출
+  - 역할(actor_role)은 ActorContext.role(DB 조회)에서만 추출 (VULN-006 수정)
 """
 
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Header, Query, Request
+from fastapi import APIRouter, Depends, Query, Request
 
 from app.api.auth import ResourceRef, authorization_service, resolve_current_actor
 from app.api.auth.models import ActorContext
+from app.api.context import get_request_ids
 from app.api.responses import SuccessResponse, list_response, success_response
 from app.db import get_db
 from app.domain.workflow.enums import WorkflowAction
@@ -38,23 +39,14 @@ from app.services.workflow_service import workflow_service
 router = APIRouter()
 
 
-def _ctx(request: Request) -> tuple[Optional[str], Optional[str]]:
-    ctx = getattr(request.state, "context", None)
-    if ctx is None:
-        return None, None
-    return ctx.request_id, ctx.trace_id
-
-
-def _actor_info(actor: ActorContext, x_actor_role: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+def _actor_info(actor: ActorContext) -> tuple[Optional[str], Optional[str]]:
     """actor_id와 actor_role을 반환한다.
 
-    actor_role 우선순위:
-      1. ActorContext.role — API key / dev header / bearer(DB 조회) 경로에서 채워짐
-      2. X-Actor-Role 헤더 — ActorContext.role이 None일 때만 사용 (개발 편의용)
-      3. None — workflow_service에서 AUTHOR로 폴백
+    VULN-006 수정: X-Actor-Role 헤더 직접 읽기 제거.
+    actor_role은 ActorContext.role(인증 레이어에서 DB 조회 또는 debug 헤더)에서만 추출.
     """
-    actor_id = actor.actor_id if actor.is_authenticated else None
-    role = getattr(actor, "role", None) or x_actor_role
+    actor_id = actor.resolved_id
+    role = getattr(actor, "role", None)
     return actor_id, role
 
 
@@ -114,11 +106,6 @@ def submit_review(
     request: Request,
     body: WorkflowActionRequest,
     actor: ActorContext = Depends(resolve_current_actor),
-    x_actor_role: Optional[str] = Header(
-        default=None,
-        alias="X-Actor-Role",
-        description="워크플로 역할 (stub 기간 테스트용: author|reviewer|approver|admin)",
-    ),
 ) -> SuccessResponse:
     authorization_service.authorize(
         actor=actor,
@@ -126,8 +113,8 @@ def submit_review(
         resource=ResourceRef(resource_type="version", resource_id=version_id, parent_id=document_id),
         require_authenticated=True,
     )
-    request_id, trace_id = _ctx(request)
-    actor_id, actor_role = _actor_info(actor, x_actor_role)
+    request_id, trace_id = get_request_ids(request)
+    actor_id, actor_role = _actor_info(actor)
 
     with get_db() as conn:
         result = workflow_service.submit_review(
@@ -167,7 +154,6 @@ def approve(
     request: Request,
     body: WorkflowActionRequest,
     actor: ActorContext = Depends(resolve_current_actor),
-    x_actor_role: Optional[str] = Header(default=None, alias="X-Actor-Role"),
 ) -> SuccessResponse:
     authorization_service.authorize(
         actor=actor,
@@ -175,8 +161,8 @@ def approve(
         resource=ResourceRef(resource_type="version", resource_id=version_id, parent_id=document_id),
         require_authenticated=True,
     )
-    request_id, trace_id = _ctx(request)
-    actor_id, actor_role = _actor_info(actor, x_actor_role)
+    request_id, trace_id = get_request_ids(request)
+    actor_id, actor_role = _actor_info(actor)
 
     with get_db() as conn:
         result = workflow_service.approve(
@@ -217,7 +203,6 @@ def reject(
     request: Request,
     body: WorkflowActionRequest,
     actor: ActorContext = Depends(resolve_current_actor),
-    x_actor_role: Optional[str] = Header(default=None, alias="X-Actor-Role"),
 ) -> SuccessResponse:
     authorization_service.authorize(
         actor=actor,
@@ -225,8 +210,8 @@ def reject(
         resource=ResourceRef(resource_type="version", resource_id=version_id, parent_id=document_id),
         require_authenticated=True,
     )
-    request_id, trace_id = _ctx(request)
-    actor_id, actor_role = _actor_info(actor, x_actor_role)
+    request_id, trace_id = get_request_ids(request)
+    actor_id, actor_role = _actor_info(actor)
 
     with get_db() as conn:
         result = workflow_service.reject(
@@ -267,7 +252,6 @@ def publish(
     request: Request,
     body: WorkflowActionRequest,
     actor: ActorContext = Depends(resolve_current_actor),
-    x_actor_role: Optional[str] = Header(default=None, alias="X-Actor-Role"),
 ) -> SuccessResponse:
     authorization_service.authorize(
         actor=actor,
@@ -275,8 +259,8 @@ def publish(
         resource=ResourceRef(resource_type="version", resource_id=version_id, parent_id=document_id),
         require_authenticated=True,
     )
-    request_id, trace_id = _ctx(request)
-    actor_id, actor_role = _actor_info(actor, x_actor_role)
+    request_id, trace_id = get_request_ids(request)
+    actor_id, actor_role = _actor_info(actor)
 
     with get_db() as conn:
         result = workflow_service.publish(
@@ -317,7 +301,6 @@ def archive(
     request: Request,
     body: WorkflowActionRequest,
     actor: ActorContext = Depends(resolve_current_actor),
-    x_actor_role: Optional[str] = Header(default=None, alias="X-Actor-Role"),
 ) -> SuccessResponse:
     authorization_service.authorize(
         actor=actor,
@@ -325,8 +308,8 @@ def archive(
         resource=ResourceRef(resource_type="version", resource_id=version_id, parent_id=document_id),
         require_authenticated=True,
     )
-    request_id, trace_id = _ctx(request)
-    actor_id, actor_role = _actor_info(actor, x_actor_role)
+    request_id, trace_id = get_request_ids(request)
+    actor_id, actor_role = _actor_info(actor)
 
     with get_db() as conn:
         result = workflow_service.archive(
@@ -366,7 +349,6 @@ def return_to_draft(
     request: Request,
     body: WorkflowActionRequest,
     actor: ActorContext = Depends(resolve_current_actor),
-    x_actor_role: Optional[str] = Header(default=None, alias="X-Actor-Role"),
 ) -> SuccessResponse:
     authorization_service.authorize(
         actor=actor,
@@ -374,8 +356,8 @@ def return_to_draft(
         resource=ResourceRef(resource_type="version", resource_id=version_id, parent_id=document_id),
         require_authenticated=True,
     )
-    request_id, trace_id = _ctx(request)
-    actor_id, actor_role = _actor_info(actor, x_actor_role)
+    request_id, trace_id = get_request_ids(request)
+    actor_id, actor_role = _actor_info(actor)
 
     with get_db() as conn:
         result = workflow_service.return_to_draft(
@@ -422,7 +404,7 @@ def get_workflow_history(
         resource=ResourceRef(resource_type="version", resource_id=version_id, parent_id=document_id),
         require_authenticated=False,
     )
-    request_id, trace_id = _ctx(request)
+    request_id, trace_id = get_request_ids(request)
 
     with get_db() as conn:
         history, total = workflow_service.get_history(
@@ -464,7 +446,7 @@ def get_review_actions(
         resource=ResourceRef(resource_type="version", resource_id=version_id, parent_id=document_id),
         require_authenticated=False,
     )
-    request_id, trace_id = _ctx(request)
+    request_id, trace_id = get_request_ids(request)
 
     with get_db() as conn:
         actions = workflow_service.get_review_actions(conn, version_id)

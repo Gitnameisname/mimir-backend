@@ -1,4 +1,11 @@
+import logging
+
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger(__name__)
+
+_REQUIRED_IN_PRODUCTION = ["jwt_secret", "postgres_password", "internal_service_secret"]
 
 
 class Settings(BaseSettings):
@@ -25,8 +32,33 @@ class Settings(BaseSettings):
     # Security
     jwt_secret: str = ""
     jwt_expire_minutes: int = 120
+    internal_service_secret: str = ""
     # CORS
     cors_allow_origins: str = "http://localhost:3000"
+
+    @model_validator(mode="after")
+    def _validate_production_secrets(self) -> "Settings":
+        """VULN-008: production 환경에서 필수 시크릿 미설정 시 startup 실패."""
+        if self.environment == "production":
+            missing = [
+                field for field in _REQUIRED_IN_PRODUCTION
+                if not getattr(self, field, None)
+            ]
+            if missing:
+                raise ValueError(
+                    f"Production requires these secrets to be set: {', '.join(missing)}"
+                )
+        elif self.environment != "production":
+            missing = [
+                field for field in _REQUIRED_IN_PRODUCTION
+                if not getattr(self, field, None)
+            ]
+            if missing:
+                logger.warning(
+                    "Security secrets not configured (OK for dev, required for prod): %s",
+                    ", ".join(missing),
+                )
+        return self
 
     @property
     def database_url(self) -> str:

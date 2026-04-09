@@ -10,6 +10,7 @@ System router — /api/v1/system
 향후 내부 전용 운영 endpoint가 필요하면 /admin 하위로 분리한다.
 """
 from fastapi import APIRouter, Query
+from fastapi.responses import JSONResponse
 
 from app.api.errors import (
     ApiAuthenticationError,
@@ -70,7 +71,9 @@ def service_info() -> SuccessResponse:
 def error_test(
     kind: str = Query(default="", description="발생시킬 오류 종류"),
 ) -> SuccessResponse:
-    # TODO: 운영 환경에서는 settings.debug 검사 또는 endpoint 제거 예정
+    # VULN-014: debug=True 전용 — production에서 404 반환
+    if not settings.debug:
+        return JSONResponse(status_code=404, content={"detail": "Not found"})
     match kind:
         case "not_found":
             raise ApiNotFoundError("Test resource was not found")

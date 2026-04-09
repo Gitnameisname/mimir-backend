@@ -71,3 +71,12 @@ class ActorContext:
     @property
     def is_service(self) -> bool:
         return self.actor_type == ActorType.SERVICE
+
+    @property
+    def resolved_id(self) -> Optional[str]:
+        """인증된 경우 actor_id, 미인증이면 None.
+
+        라우터에서 반복되는 ``actor.actor_id if actor.is_authenticated else None``
+        패턴을 대체하는 편의 프로퍼티.
+        """
+        return self.actor_id if self.is_authenticated else None

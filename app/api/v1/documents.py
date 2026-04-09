@@ -27,12 +27,14 @@ from fastapi import APIRouter, Depends, Header, Request
 
 from app.api.auth import ResourceRef, authorization_service, resolve_current_actor
 from app.api.auth.models import ActorContext
+from app.api.context import get_request_ids
 from app.api.query import FilterFieldSpec, ListQuerySpec, ParsedListQuery, make_list_query_dependency
-from app.api.responses import SuccessResponse, list_response, success_response
+from app.api.responses import SuccessResponse, list_response, paginated_list_response, success_response
 from app.db import get_db
 from app.schemas.documents import DocumentCreateRequest, DocumentResponse, DocumentUpdateRequest
 from app.schemas.render import RenderDocument
 from app.schemas.versions import DraftNodeSaveRequest, DraftSaveRequest, PublishRequest, RestoreRequest, VersionCreateRequest
+from app.audit.emitter import audit_emitter
 from app.services.documents_service import documents_service
 from app.services.draft_service import draft_service
 from app.services.render_service import render_service
@@ -67,14 +69,6 @@ _VERSIONS_SPEC = ListQuerySpec(
 )
 
 
-def _ctx(request: Request) -> tuple[Optional[str], Optional[str]]:
-    """request context에서 request_id, trace_id를 추출한다."""
-    ctx = getattr(request.state, "context", None)
-    if ctx is None:
-        return None, None
-    return ctx.request_id, ctx.trace_id
-
-
 # ---------------------------------------------------------------------------
 # GET /documents — 문서 목록
 # ---------------------------------------------------------------------------
@@ -104,23 +98,17 @@ def list_documents(
         require_authenticated=False,  # TODO: enforcement 활성화 시 True로 전환
     )
 
-    request_id, trace_id = _ctx(request)
+    request_id, trace_id = get_request_ids(request)
 
     with get_db() as conn:
         docs, total = documents_service.list_documents(conn, query)
 
-    page = query.page if query.page else 1
-    page_size = query.page_size if query.page_size else 20
-    has_next = (page * page_size) < total
-
-    return list_response(
+    return paginated_list_response(
         data=[doc.model_dump() for doc in docs],
+        query=query,
+        total=total,
         request_id=request_id,
         trace_id=trace_id,
-        page=page,
-        page_size=page_size,
-        total=total,
-        has_next=has_next,
     )
 
 
@@ -159,8 +147,8 @@ def create_document(
         require_authenticated=True,
     )
 
-    request_id, trace_id = _ctx(request)
-    actor_id = actor.actor_id if actor.is_authenticated else None
+    request_id, trace_id = get_request_ids(request)
+    actor_id = actor.resolved_id
 
     # Task I-9: idempotency hook
     from app.services.idempotency_service import idempotency_service
@@ -195,15 +183,12 @@ def create_document(
         trace_id=trace_id,
     )
 
-    # Task I-10: audit candidate emit
-    from app.audit.emitter import audit_emitter
-    audit_emitter.emit(
+    audit_emitter.emit_for_actor(
         event_type="document.created",
         action="document.create",
-        actor_id=actor_id,
+        actor=actor,
         resource_type="document",
         resource_id=doc.id,
-        result="success",
         request_id=request_id,
         trace_id=trace_id,
     )
@@ -238,7 +223,7 @@ def get_document(
         require_authenticated=False,  # TODO: enforcement 활성화 시 True로 전환
     )
 
-    request_id, trace_id = _ctx(request)
+    request_id, trace_id = get_request_ids(request)
 
     with get_db() as conn:
         doc = documents_service.get_document(conn, document_id)
@@ -286,8 +271,8 @@ def update_document(
         require_authenticated=True,
     )
 
-    request_id, trace_id = _ctx(request)
-    actor_id = actor.actor_id if actor.is_authenticated else None
+    request_id, trace_id = get_request_ids(request)
+    actor_id = actor.resolved_id
 
     with get_db() as conn:
         doc = documents_service.update_document(
@@ -297,15 +282,12 @@ def update_document(
             actor_id=actor_id,
         )
 
-    # Task I-10: audit candidate emit
-    from app.audit.emitter import audit_emitter
-    audit_emitter.emit(
+    audit_emitter.emit_for_actor(
         event_type="document.updated",
         action="document.update",
-        actor_id=actor_id,
+        actor=actor,
         resource_type="document",
         resource_id=document_id,
-        result="success",
         request_id=request_id,
         trace_id=trace_id,
     )
@@ -347,7 +329,7 @@ def list_document_versions(
         resource=ResourceRef(resource_type="version", parent_id=document_id),
         require_authenticated=False,
     )
-    request_id, trace_id = _ctx(request)
+    request_id, trace_id = get_request_ids(request)
 
     actor_role = actor.role if hasattr(actor, "role") else None
 
@@ -356,18 +338,12 @@ def list_document_versions(
             conn, document_id, query, actor_role=actor_role
         )
 
-    page = query.page if query.page else 1
-    page_size = query.page_size if query.page_size else 20
-    has_next = (page * page_size) < total
-
-    return list_response(
+    return paginated_list_response(
         data=[v.model_dump() for v in versions],
+        query=query,
+        total=total,
         request_id=request_id,
         trace_id=trace_id,
-        page=page,
-        page_size=page_size,
-        total=total,
-        has_next=has_next,
     )
 
 
@@ -408,8 +384,8 @@ def create_document_version(
         require_authenticated=True,
     )
 
-    request_id, trace_id = _ctx(request)
-    actor_id = actor.actor_id if actor.is_authenticated else None
+    request_id, trace_id = get_request_ids(request)
+    actor_id = actor.resolved_id
 
     # Task I-9: idempotency hook 연결 (x_idempotency_key 처리)
     from app.services.idempotency_service import idempotency_service
@@ -447,15 +423,12 @@ def create_document_version(
         trace_id=trace_id,
     )
 
-    # Task I-10: audit candidate emit
-    from app.audit.emitter import audit_emitter
-    audit_emitter.emit(
+    audit_emitter.emit_for_actor(
         event_type="version.created",
         action="version.create",
-        actor_id=actor_id,
+        actor=actor,
         resource_type="version",
         resource_id=version.id,
-        result="success",
         request_id=request_id,
         trace_id=trace_id,
         metadata={"document_id": document_id, "version_number": version.version_number},
@@ -500,20 +473,18 @@ def save_draft(
         resource=ResourceRef(resource_type="version", parent_id=document_id),
         require_authenticated=True,
     )
-    request_id, trace_id = _ctx(request)
-    actor_id = actor.actor_id if actor.is_authenticated else None
+    request_id, trace_id = get_request_ids(request)
+    actor_id = actor.resolved_id
 
     with get_db() as conn:
         version = draft_service.save_draft(conn, document_id, body, actor_id=actor_id)
 
-    from app.audit.emitter import audit_emitter
-    audit_emitter.emit(
+    audit_emitter.emit_for_actor(
         event_type="draft.updated",
         action="draft.save",
-        actor_id=actor_id,
+        actor=actor,
         resource_type="version",
         resource_id=version.id,
-        result="success",
         request_id=request_id,
         trace_id=trace_id,
         metadata={"document_id": document_id, "version_number": version.version_number},
@@ -555,22 +526,20 @@ def save_draft_nodes(
         resource=ResourceRef(resource_type="version", resource_id=version_id, parent_id=document_id),
         require_authenticated=True,
     )
-    request_id, trace_id = _ctx(request)
-    actor_id = actor.actor_id if actor.is_authenticated else None
+    request_id, trace_id = get_request_ids(request)
+    actor_id = actor.resolved_id
 
     with get_db() as conn:
         version = draft_service.save_draft_nodes(
             conn, document_id, version_id, body, actor_id=actor_id
         )
 
-    from app.audit.emitter import audit_emitter
-    audit_emitter.emit(
+    audit_emitter.emit_for_actor(
         event_type="draft.nodes_saved",
         action="draft.save",
-        actor_id=actor_id,
+        actor=actor,
         resource_type="version",
         resource_id=version.id,
-        result="success",
         request_id=request_id,
         trace_id=trace_id,
         metadata={
@@ -612,20 +581,18 @@ def discard_draft(
         resource=ResourceRef(resource_type="version", parent_id=document_id),
         require_authenticated=True,
     )
-    request_id, trace_id = _ctx(request)
-    actor_id = actor.actor_id if actor.is_authenticated else None
+    request_id, trace_id = get_request_ids(request)
+    actor_id = actor.resolved_id
 
     with get_db() as conn:
         draft_service.discard_draft(conn, document_id, actor_id=actor_id)
 
-    from app.audit.emitter import audit_emitter
-    audit_emitter.emit(
+    audit_emitter.emit_for_actor(
         event_type="draft.discarded",
         action="draft.discard",
-        actor_id=actor_id,
+        actor=actor,
         resource_type="document",
         resource_id=document_id,
-        result="success",
         request_id=request_id,
         trace_id=trace_id,
     )
@@ -667,22 +634,18 @@ def publish_document(
         resource=ResourceRef(resource_type="document", resource_id=document_id),
         require_authenticated=True,
     )
-    request_id, trace_id = _ctx(request)
-    actor_id = actor.actor_id if actor.is_authenticated else None
+    request_id, trace_id = get_request_ids(request)
+    actor_id = actor.resolved_id
 
     with get_db() as conn:
         version = draft_service.publish(conn, document_id, body, actor_id=actor_id)
 
-    from app.audit.emitter import audit_emitter
-    actor_role = actor.role if hasattr(actor, "role") else None
-    audit_emitter.emit(
+    audit_emitter.emit_for_actor(
         event_type="document.published",
         action="document.publish",
-        actor_id=actor_id,
-        actor_role=actor_role,
+        actor=actor,
         resource_type="version",
         resource_id=version.id,
-        result="success",
         request_id=request_id,
         trace_id=trace_id,
         metadata={"document_id": document_id, "version_number": version.version_number},
@@ -732,7 +695,7 @@ def get_version_detail(
         resource=ResourceRef(resource_type="version", resource_id=version_id, parent_id=document_id),
         require_authenticated=False,
     )
-    request_id, trace_id = _ctx(request)
+    request_id, trace_id = get_request_ids(request)
     actor_role = actor.role if hasattr(actor, "role") else None
 
     with get_db() as conn:
@@ -777,8 +740,8 @@ def restore_version(
         resource=ResourceRef(resource_type="version", resource_id=version_id, parent_id=document_id),
         require_authenticated=True,
     )
-    request_id, trace_id = _ctx(request)
-    actor_id = actor.actor_id if actor.is_authenticated else None
+    request_id, trace_id = get_request_ids(request)
+    actor_id = actor.resolved_id
     actor_role = actor.role if hasattr(actor, "role") else "publisher"  # stub: 권한 실제 연동 전 publisher로 간주
 
     with get_db() as conn:
@@ -788,20 +751,17 @@ def restore_version(
             actor_role=actor_role,
         )
 
-    from app.audit.emitter import audit_emitter
-    audit_emitter.emit(
+    audit_emitter.emit_for_actor(
         event_type="version.restored",
         action="version.restore",
-        actor_id=actor_id,
-        actor_role=actor_role,
+        actor=actor,
         resource_type="version",
         resource_id=new_draft.id,
-        result="success",
         request_id=request_id,
         trace_id=trace_id,
         metadata={"document_id": document_id, "new_version_number": new_draft.version_number},
-        target_version_id=version_id,
         new_state="draft",
+        target_version_id=version_id,
     )
 
     return success_response(
@@ -840,7 +800,7 @@ def render_document(
         resource=ResourceRef(resource_type="document", resource_id=document_id),
         require_authenticated=False,
     )
-    request_id, trace_id = _ctx(request)
+    request_id, trace_id = get_request_ids(request)
 
     from app.api.errors.exceptions import ApiNotFoundError
     from app.repositories.versions_repository import versions_repository
@@ -897,7 +857,7 @@ def render_version_endpoint(
         resource=ResourceRef(resource_type="version", resource_id=version_id, parent_id=document_id),
         require_authenticated=False,
     )
-    request_id, trace_id = _ctx(request)
+    request_id, trace_id = get_request_ids(request)
 
     from app.api.errors.exceptions import ApiNotFoundError
     from app.repositories.documents_repository import documents_repository

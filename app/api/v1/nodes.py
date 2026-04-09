@@ -28,18 +28,12 @@ from fastapi import APIRouter, Depends, Request
 
 from app.api.auth import ResourceRef, authorization_service, resolve_current_actor
 from app.api.auth.models import ActorContext
+from app.api.context import get_request_ids
 from app.api.responses import SuccessResponse, list_response, success_response
 from app.db import get_db
 from app.services.nodes_service import nodes_service
 
 router = APIRouter()
-
-
-def _ctx(request: Request) -> tuple[Optional[str], Optional[str]]:
-    ctx = getattr(request.state, "context", None)
-    if ctx is None:
-        return None, None
-    return ctx.request_id, ctx.trace_id
 
 
 # ---------------------------------------------------------------------------
@@ -71,7 +65,7 @@ def list_nodes(
         require_authenticated=False,
     )
 
-    request_id, trace_id = _ctx(request)
+    request_id, trace_id = get_request_ids(request)
 
     with get_db() as conn:
         node_list = nodes_service.list_nodes(conn, version_id)
@@ -120,7 +114,7 @@ def get_node(
         require_authenticated=False,
     )
 
-    request_id, trace_id = _ctx(request)
+    request_id, trace_id = get_request_ids(request)
 
     with get_db() as conn:
         node = nodes_service.get_node(conn, version_id, node_id)
