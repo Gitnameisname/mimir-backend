@@ -22,6 +22,7 @@ from app.api.v1 import admin, documents, nodes, operations, retrieval, search, s
 from app.api.v1 import workflow
 from app.api.v1 import diff
 from app.api.v1 import vectorization
+from app.api.v1 import rag
 
 v1_router = APIRouter()
 
@@ -54,6 +55,9 @@ v1_router.include_router(
 
 # Phase 10: 벡터화 파이프라인 API
 v1_router.include_router(vectorization.router, prefix="/vectorization", tags=["vectorization"])
+
+# Phase 11: RAG 질의응답 API
+v1_router.include_router(rag.router, prefix="/rag", tags=["rag"])
 
 # 확장 예정 — placeholder 수준
 v1_router.include_router(admin.router, prefix="/admin", tags=["admin"])

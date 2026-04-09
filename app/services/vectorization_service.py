@@ -11,6 +11,7 @@
 """
 
 import logging
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Optional
@@ -61,11 +62,15 @@ def _get_permission_snapshot(
             if row["status"] == "published":
                 return PermissionSnapshot(
                     accessible_roles=["VIEWER", "AUTHOR", "REVIEWER", "APPROVER", "PUBLISHER", "ORG_ADMIN", "SUPER_ADMIN"],
+                    # TODO [M-2]: accessible_org_ids 미구현 — Phase 2 ACL에 org 기반
+                    # 접근 제어가 포함된 경우 여기서 조직 ID를 조회·반영해야 한다.
+                    accessible_org_ids=[],
                     is_public=True,
                 )
             # draft 문서: 편집 역할 이상만 접근
             return PermissionSnapshot(
                 accessible_roles=["AUTHOR", "REVIEWER", "APPROVER", "PUBLISHER", "ORG_ADMIN", "SUPER_ADMIN"],
+                accessible_org_ids=[],  # TODO [M-2]: org 기반 ACL 미구현
                 is_public=False,
             )
     except Exception as exc:
@@ -278,6 +283,8 @@ class VectorizationPipeline:
                 failed += 1
             else:
                 succeeded += 1
+            # 연속 API 호출 간 짧은 대기 — OpenAI RPM/TPM Rate Limit 완화
+            time.sleep(0.1)
 
         return {"total": total, "succeeded": succeeded, "failed": failed}
 
@@ -335,6 +342,13 @@ class VectorizationPipeline:
         """
         provider = self._get_provider()
         query_embedding = provider.embed_single(query)
+
+        # 임베딩 생성 실패(zero vector 또는 빈 리스트) 시 검색 불가
+        if not query_embedding or not any(query_embedding):
+            logger.warning(
+                "쿼리 임베딩 생성 실패 — 빈 결과 반환 (query=%s…)", query[:80]
+            )
+            return []
 
         # 권한 필터: is_public이거나 accessible_roles에 actor_role 포함
         role_filter = ""
@@ -460,13 +474,18 @@ class VectorizationPipeline:
         embeddings: list[list[float]],
         model_name: str,
     ) -> tuple[int, int]:
-        """청크와 임베딩을 DB에 저장한다. (saved, failed) 반환."""
+        """청크와 임베딩을 DB에 저장한다. (saved, failed) 반환.
+
+        각 INSERT를 개별 savepoint로 감싸 한 청크 실패가 전체 트랜잭션을
+        aborted 상태로 만들지 않도록 한다.
+        """
         saved = 0
         failed = 0
 
         with conn.cursor() as cur:
             for i, chunk in enumerate(chunks):
                 try:
+                    cur.execute("SAVEPOINT sp_chunk")
                     embedding = embeddings[i] if i < len(embeddings) else None
                     embedding_val = embedding if embedding else None
 
@@ -504,8 +523,10 @@ class VectorizationPipeline:
                             chunk.is_public,
                         ),
                     )
+                    cur.execute("RELEASE SAVEPOINT sp_chunk")
                     saved += 1
                 except Exception as exc:
+                    cur.execute("ROLLBACK TO SAVEPOINT sp_chunk")
                     logger.error("청크 저장 실패 (index=%d): %s", i, exc)
                     failed += 1
 

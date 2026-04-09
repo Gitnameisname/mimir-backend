@@ -184,7 +184,9 @@ class LocalEmbeddingProvider(EmbeddingProvider):
     """로컬 임베딩 모델 제공자 (비용 절감용 대안).
 
     실제 로컬 모델 연동은 향후 구현.
-    현재는 제로 벡터 반환 (placeholder).
+    현재는 빈 리스트 반환 (placeholder) — _save_chunks에서 embedding = NULL로
+    저장되어 semantic_search의 'AND embedding IS NOT NULL' 필터에 의해 자동 제외된다.
+    zero vector를 반환하면 NULL 필터를 우회하여 무의미한 검색 결과가 생기므로 금지.
     """
 
     @property
@@ -196,16 +198,20 @@ class LocalEmbeddingProvider(EmbeddingProvider):
         return settings.embedding_dimensions
 
     def embed_batch(self, texts: list[str]) -> EmbeddingResult:
-        logger.warning("LocalEmbeddingProvider: placeholder 구현 — 실제 벡터가 아닙니다.")
-        zero_vec = [0.0] * self.dimensions
+        logger.warning(
+            "LocalEmbeddingProvider: placeholder 구현 — 실제 벡터가 아닙니다. "
+            "청크 %d건이 embedding=NULL로 저장되어 벡터 검색에서 제외됩니다.",
+            len(texts),
+        )
         return EmbeddingResult(
-            embeddings=[zero_vec] * len(texts),
+            embeddings=[[] for _ in texts],  # NULL로 저장 → 벡터 검색 제외
             model=self.model_name,
             total_tokens=0,
         )
 
     def embed_single(self, text: str) -> list[float]:
-        return [0.0] * self.dimensions
+        # 빈 리스트 반환 → semantic_search의 zero-vector 검사에서 차단
+        return []
 
 
 def get_embedding_provider() -> EmbeddingProvider:

@@ -59,11 +59,20 @@ def create_app() -> FastAPI:
     # DB 초기화: documents 테이블 생성 (idempotent)
     @app.on_event("startup")
     def on_startup() -> None:
-        from app.db import init_db
+        from app.db import get_db, init_db
         try:
             init_db()
         except Exception as exc:
             logger.warning("DB init skipped (connection unavailable): %s", exc)
+
+        # RAG-007: RAG 테이블 초기화를 startup에서 1회만 실행 (라우터 레이어 제거)
+        try:
+            from app.repositories.rag_repository import ensure_tables
+            with get_db() as conn:
+                ensure_tables(conn)
+                conn.commit()
+        except Exception as exc:
+            logger.warning("RAG tables init skipped (connection unavailable): %s", exc)
 
     return app
 

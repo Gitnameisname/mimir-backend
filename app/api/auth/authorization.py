@@ -109,6 +109,12 @@ _PERMISSION_MATRIX: dict[str, frozenset[str]] = {
     "search.index_stats":    frozenset({"ORG_ADMIN", "SUPER_ADMIN"}),
     "search.reindex":        frozenset({"SUPER_ADMIN"}),
 
+    # --- RAG 질의응답 ---
+    "rag.query":               frozenset({"VIEWER", "AUTHOR", "REVIEWER", "APPROVER", "ORG_ADMIN", "SUPER_ADMIN"}),
+    "rag.conversation.read":   frozenset({"VIEWER", "AUTHOR", "REVIEWER", "APPROVER", "ORG_ADMIN", "SUPER_ADMIN"}),
+    "rag.conversation.write":  frozenset({"VIEWER", "AUTHOR", "REVIEWER", "APPROVER", "ORG_ADMIN", "SUPER_ADMIN"}),
+    "rag.conversation.delete": frozenset({"VIEWER", "AUTHOR", "REVIEWER", "APPROVER", "ORG_ADMIN", "SUPER_ADMIN"}),
+
     # --- 관리자 ---
     "admin.read":  frozenset({"ORG_ADMIN", "SUPER_ADMIN"}),
     "admin.write": frozenset({"SUPER_ADMIN"}),

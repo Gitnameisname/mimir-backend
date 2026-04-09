@@ -383,9 +383,20 @@ class ChunkingService:
                     (document_type,),
                 )
                 row = cur.fetchone()
-                if row and row.get("plugin_config"):
-                    raw_config = row["plugin_config"].get("chunking_config")
+                if not row:
+                    logger.warning(
+                        "document_type='%s'가 document_types 테이블에 없어 기본 청킹 설정을 사용합니다.",
+                        document_type,
+                    )
+                    return self._DEFAULT_CONFIG
+                plugin_config = row.get("plugin_config") or {}
+                raw_config = plugin_config.get("chunking_config")
+                if raw_config:
                     return self._resolve_config(raw_config)
+                logger.warning(
+                    "document_type='%s' plugin_config에 chunking_config가 없어 기본 청킹 설정을 사용합니다.",
+                    document_type,
+                )
         except Exception as exc:
             logger.warning("DocumentType '%s' chunking_config 조회 실패: %s", document_type, exc)
         return self._DEFAULT_CONFIG

@@ -42,6 +42,17 @@ class Settings(BaseSettings):
     embedding_dimensions: int = 1536
     embedding_batch_size: int = 100
 
+    # LLM (Phase 11 RAG)
+    llm_provider: str = "openai"           # "openai" | "anthropic"
+    llm_model: str = "gpt-4o"             # OpenAI: gpt-4o, Anthropic: claude-sonnet-4-6
+    anthropic_api_key: str = ""
+    rag_top_k: int = 20                    # Retriever Top-K
+    rag_top_n: int = 5                     # Reranker Top-N (최종 컨텍스트 청크 수)
+    rag_reranker_enabled: bool = True
+    rag_reranker_threshold: float = 0.0    # 최소 유사도 점수 (0.0 = 비활성)
+    rag_max_context_tokens: int = 6000     # ContextBuilder 최대 토큰 수
+    rag_max_history_turns: int = 10        # Multi-turn 최대 이전 대화 수
+
     # Valkey / Redis
     valkey_host: str = "localhost"
     valkey_port: int = 6379

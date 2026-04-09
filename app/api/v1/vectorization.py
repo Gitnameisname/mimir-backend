@@ -336,6 +336,9 @@ def list_chunks(
     _require_admin(actor, request)
     request_id, trace_id = get_request_ids(request)
 
+    if document_id:
+        _validate_uuid(document_id, "document_id")
+
     conditions = ["is_current = %s"]
     params: list = [is_current]
 
