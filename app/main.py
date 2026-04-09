@@ -1,5 +1,10 @@
 import logging
 
+from app.observability.log_config import configure_logging
+
+# Phase 13-2: 애플리케이션 시작 시 구조화 JSON 로깅 초기화
+configure_logging()
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import _rate_limit_exceeded_handler
@@ -9,6 +14,9 @@ from app.api.context.middleware import RequestContextMiddleware
 from app.api.errors.handlers import register_exception_handlers
 from app.api.rate_limit import limiter
 from app.api.router import api_router
+from app.api.security.headers import SecurityHeadersMiddleware
+from app.api.security.input_validation import RequestSizeLimitMiddleware
+from app.observability.metrics import PrometheusMiddleware
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -39,6 +47,15 @@ def create_app() -> FastAPI:
         allow_methods=_ALLOWED_METHODS,
         allow_headers=_ALLOWED_HEADERS,
     )
+
+    # Phase 13-3: Prometheus 메트릭 수집 미들웨어
+    app.add_middleware(PrometheusMiddleware)
+
+    # Phase 13-1: 보안 헤더 미들웨어 (OWASP Top 10 A05/A07 대응)
+    app.add_middleware(SecurityHeadersMiddleware)
+
+    # Phase 13-1: 요청 크기 제한 (OWASP A05 - 10 MB)
+    app.add_middleware(RequestSizeLimitMiddleware)
 
     # Rate limiter 상태 주입 및 429 핸들러 등록
     app.state.limiter = limiter

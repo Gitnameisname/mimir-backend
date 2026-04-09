@@ -30,8 +30,14 @@ from app.observability.logging import log_request_completion
 
 class RequestContextMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next) -> Response:
-        request_id = request.headers.get("X-Request-ID") or str(uuid4())
-        trace_id = request.headers.get("X-Trace-ID") or None
+        # VULN-P13-02: X-Request-ID / X-Trace-ID 길이를 제한한다.
+        # 길이 제한 없이 수용하면 아주 긴 값이 구조화 로그에 그대로 기록되어
+        # 로그 저장소 과부하(log bloat)를 유발할 수 있다. 128자 초과 시 무시하고 UUID 발급.
+        _MAX_ID_LEN = 128
+        raw_request_id = request.headers.get("X-Request-ID", "")
+        request_id = raw_request_id[:_MAX_ID_LEN] if raw_request_id else str(uuid4())
+        raw_trace_id = request.headers.get("X-Trace-ID", "")
+        trace_id = raw_trace_id[:_MAX_ID_LEN] if raw_trace_id else None
 
         ctx = RequestContext(request_id=request_id, trace_id=trace_id)
         request.state.context = ctx
