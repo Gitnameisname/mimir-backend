@@ -4,42 +4,29 @@ Actor extraction dependency — resolve_current_actor.
 FastAPI dependency로 사용하며, 요청에서 actor를 추출해
 ActorContext로 정규화하고 RequestContext.actor를 갱신한다.
 
-책임 범위:
-  - 인증 입력 소스(헤더/쿠키)를 확인해 actor_type 결정
-  - anonymous / user / service 중 하나로 정규화
-  - X-Actor-Id / X-Actor-Role 개발용 헤더로 actor 주입 지원
-  - RequestContext.actor에 반영
-  - ActorContext 반환 (downstream에서 사용)
-
-이 dependency는 "누가 요청했는가"만 정규화한다.
-"이 actor가 이 action을 할 수 있는가"는 AuthorizationService가 판단한다.
-
 인증 입력 소스 우선순위:
-  1. X-Service-Token  → service actor (내부 서비스 간 호출) — settings.internal_service_secret 검증
-  2. Authorization: Bearer <token>  → user actor (JWT 등, Phase 8 연동 예정)
-  3. X-API-Key  → user actor (API key, DB 조회 포함)
-  4. Cookie: session=<token>  → user actor (세션)
+  1. X-Service-Token  → service actor (내부 서비스 간 호출) — HMAC-SHA256 검증
+  2. Authorization: Bearer <JWT>  → user actor — HS256 서명 검증, sub/role 클레임 추출
+  3. X-API-Key  → user actor — SHA-256 hash 검증 후 DB에서 issuer/role 조회
+  4. Cookie: session=<token>  → user actor (TODO: Redis/DB 리졸버 Phase 9)
   5. 없음  → anonymous
 
 개발용 헤더 (settings.debug=True 전용):
-  - X-Actor-Id   : actor_id 직접 주입
-  - X-Actor-Role : actor role 직접 주입 (VIEWER/AUTHOR/REVIEWER/APPROVER/ORG_ADMIN/SUPER_ADMIN)
-  위 두 헤더가 모두 있으면 is_authenticated=True로 처리.
-  ** debug=False(기본값)이면 이 경로는 완전 비활성화된다. **
+  - X-Actor-Id + X-Actor-Role : actor 직접 주입 (프로덕션에서 완전 비활성화)
 
 보안 강화 내역:
-  - VULN-001: X-Service-Token은 settings.internal_service_secret과 HMAC 비교 (빈 문자열이면 해당 경로 차단)
-  - VULN-002: 개발 헤더 게이트를 settings.environment != "production" → settings.debug == True 로 변경
-
-TODO:
-  - Bearer token JWT verifier 연결 예정 (Phase 8)
-  - session resolver (Redis/DB) 연결 예정 (Phase 8)
+  - VULN-001: X-Service-Token HMAC-SHA256 검증, secret 미설정 시 차단
+  - VULN-002: 개발 헤더 게이트 settings.debug=True 전용
+  - VULN-003: Bearer 경로의 X-Actor-Role 수락을 settings.debug 가드로 보호
+  - VULN-004: API key — SHA-256 hash 검증 + hmac.compare_digest() 타이밍 공격 방지
+  - VULN-005: Bearer JWT — HS256 서명 검증, exp/nbf 자동 확인, secret 미설정 시 차단
 """
 
 import hashlib
 import hmac
 import logging
 
+import jwt
 from fastapi import Request
 
 from app.api.auth.models import ActorContext, ActorType, AuthMethod
@@ -171,19 +158,59 @@ def _extract_service_actor(token: str) -> ActorContext:
 
 
 def _extract_bearer_actor(token: str, request: Request) -> ActorContext:
-    """Bearer 토큰으로 user actor를 반환한다.
+    """Bearer JWT로 user actor를 반환한다.
 
-    Phase 8 이전: X-Actor-Id 헤더로 actor_id를 주입.
-    role 우선순위:
-      1. X-Actor-Role 헤더 (개발 편의용)
-      2. users 테이블 DB 조회 (actor_id 있을 때)
-    TODO: JWT verifier 연결 예정 (Phase 8) — token 자체 검증 후 actor_id 추출.
+    검증 절차:
+      1. settings.jwt_secret 미설정 시: debug 모드에서만 개발 헤더로 폴백, 그 외 anonymous
+      2. jwt.decode()로 HS256 서명 검증 — exp/nbf 자동 확인
+      3. payload의 'sub' → actor_id, 'role' → role 추출
+      4. role이 없으면 DB에서 조회
+
+    JWT 클레임 규약:
+      - sub   : actor_id (사용자 UUID 또는 식별자)
+      - role  : 역할명 (VIEWER/AUTHOR/REVIEWER/APPROVER/ORG_ADMIN/SUPER_ADMIN)
+      - exp   : 만료 시각 (Unix timestamp)
     """
-    actor_id = request.headers.get("X-Actor-Id") or None
-    actor_role = request.headers.get("X-Actor-Role")
-    role: str | None = actor_role if actor_role in _VALID_ROLES else None
+    secret = settings.jwt_secret
 
-    # role이 헤더에 없고 actor_id를 알고 있으면 DB에서 조회
+    if not secret:
+        # jwt_secret 미설정 — debug 환경에서는 개발 헤더 폴백 허용
+        if settings.debug:
+            actor_id = request.headers.get("X-Actor-Id") or None
+            actor_role = request.headers.get("X-Actor-Role")
+            role: str | None = actor_role if actor_role in _VALID_ROLES else None
+            if actor_id and not role:
+                role = _lookup_role_from_db(actor_id)
+            return ActorContext(
+                actor_type=ActorType.USER,
+                actor_id=actor_id,
+                is_authenticated=bool(actor_id),
+                auth_method=AuthMethod.BEARER,
+                tenant_id=None,
+                role=role,
+            )
+        logger.warning("Bearer token received but JWT_SECRET not configured — rejecting")
+        return _anonymous_actor()
+
+    try:
+        payload = jwt.decode(
+            token,
+            secret,
+            algorithms=["HS256"],
+            options={"require": ["sub", "exp"]},
+        )
+    except jwt.ExpiredSignatureError:
+        logger.info("Bearer token expired")
+        return _anonymous_actor()
+    except jwt.InvalidTokenError as exc:
+        logger.warning("Bearer token invalid: %s", exc)
+        return _anonymous_actor()
+
+    actor_id: str | None = payload.get("sub")
+    role_claim: str | None = payload.get("role")
+    role = role_claim if role_claim in _VALID_ROLES else None
+
+    # role이 JWT에 없으면 DB에서 조회
     if actor_id and not role:
         role = _lookup_role_from_db(actor_id)
 
@@ -197,21 +224,35 @@ def _extract_bearer_actor(token: str, request: Request) -> ActorContext:
     )
 
 
+def _hash_api_key(api_key: str) -> str:
+    """API key를 SHA-256으로 해시한다."""
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+
+
 def _extract_api_key_actor(api_key: str) -> ActorContext:
     """API key로 user actor를 반환한다.
 
-    api_keys 테이블에서 key_hash 조회 → user_id, role 채움.
-    TODO: key_hash 검증 로직 완성 (Phase 8).
+    검증 절차:
+      1. key_prefix(앞 8자리)로 후보 행 조회 — DB 인덱스 활용
+      2. 전달된 key의 SHA-256 hash와 DB의 key_hash를 hmac.compare_digest()로 비교
+      3. 불일치 시 인증 실패 (fail-closed)
     """
+    _FAIL = ActorContext(
+        actor_type=ActorType.USER,
+        actor_id=None,
+        is_authenticated=False,
+        auth_method=AuthMethod.API_KEY,
+        tenant_id=None,
+        role=None,
+    )
     try:
         from app.db.connection import get_db
         with get_db() as conn:
             with conn.cursor() as cur:
-                # key_prefix로 후보 조회 후 hash 검증 (현재는 prefix 매칭만)
                 prefix = api_key[:8] if len(api_key) >= 8 else api_key
                 cur.execute(
                     """
-                    SELECT ak.issuer_id, u.role_name
+                    SELECT ak.issuer_id, ak.key_hash, u.role_name
                     FROM api_keys ak
                     LEFT JOIN users u ON u.id::text = ak.issuer_id
                     WHERE ak.key_prefix = %s AND ak.status = 'ACTIVE'
@@ -221,40 +262,66 @@ def _extract_api_key_actor(api_key: str) -> ActorContext:
                     (prefix,),
                 )
                 row = cur.fetchone()
-                if row and row["issuer_id"]:
-                    return ActorContext(
-                        actor_type=ActorType.USER,
-                        actor_id=row["issuer_id"],
-                        is_authenticated=True,
-                        auth_method=AuthMethod.API_KEY,
-                        tenant_id=None,
-                        role=row.get("role_name"),
+                if not row:
+                    return _FAIL
+
+                # SHA-256 hash 비교 — 타이밍 공격 방지
+                expected_hash = row["key_hash"]
+                provided_hash = _hash_api_key(api_key)
+                if not hmac.compare_digest(provided_hash, expected_hash):
+                    logger.warning("api_key hash mismatch for prefix=%s", prefix)
+                    return _FAIL
+
+                # last_used_at 갱신 (실패 무시)
+                try:
+                    cur.execute(
+                        "UPDATE api_keys SET last_used_at = NOW(), use_count = use_count + 1"
+                        " WHERE key_prefix = %s",
+                        (prefix,),
                     )
+                except Exception:
+                    pass
+
+                return ActorContext(
+                    actor_type=ActorType.USER,
+                    actor_id=row["issuer_id"],
+                    is_authenticated=True,
+                    auth_method=AuthMethod.API_KEY,
+                    tenant_id=None,
+                    role=row.get("role_name"),
+                )
     except Exception as exc:
         logger.warning("api_key lookup failed: %s", exc)
 
-    return ActorContext(
-        actor_type=ActorType.USER,
-        actor_id=None,
-        is_authenticated=False,
-        auth_method=AuthMethod.API_KEY,
-        tenant_id=None,
-        role=None,
-    )
+    return _FAIL
 
 
 def _extract_session_actor(session_token: str) -> ActorContext:
     """세션 쿠키로 user actor를 반환한다.
 
-    TODO: session resolver (Redis/DB) 연결 예정 (Phase 8).
+    Valkey에서 session:{token} 키를 조회해 actor_id/role을 추출한다.
+    세션 없음 / 만료 / Valkey 오류 → anonymous 반환 (fail-closed).
     """
+    from app.api.auth.session import resolve_session
+
+    session = resolve_session(session_token)
+    if not session:
+        return _anonymous_actor()
+
+    actor_id: str | None = session.get("actor_id")
+    role_claim: str | None = session.get("role")
+    role = role_claim if role_claim in _VALID_ROLES else None
+
+    if actor_id and not role:
+        role = _lookup_role_from_db(actor_id)
+
     return ActorContext(
         actor_type=ActorType.USER,
-        actor_id=None,
-        is_authenticated=False,
+        actor_id=actor_id,
+        is_authenticated=bool(actor_id),
         auth_method=AuthMethod.SESSION,
         tenant_id=None,
-        role=None,
+        role=role,
     )
 
 

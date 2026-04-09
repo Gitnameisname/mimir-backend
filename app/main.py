@@ -2,9 +2,12 @@ import logging
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 
 from app.api.context.middleware import RequestContextMiddleware
 from app.api.errors.handlers import register_exception_handlers
+from app.api.rate_limit import limiter
 from app.api.router import api_router
 from app.config import settings
 
@@ -36,6 +39,10 @@ def create_app() -> FastAPI:
         allow_methods=_ALLOWED_METHODS,
         allow_headers=_ALLOWED_HEADERS,
     )
+
+    # Rate limiter 상태 주입 및 429 핸들러 등록
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
     # RequestContext 미들웨어 (Task I-4/I-5)
     # request_id / trace_id 생성 및 request.state.context 초기화

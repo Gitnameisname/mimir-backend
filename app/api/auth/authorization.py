@@ -99,6 +99,16 @@ _PERMISSION_MATRIX: dict[str, frozenset[str]] = {
     "workflow.history.read":          frozenset({"VIEWER", "AUTHOR", "REVIEWER", "APPROVER", "ORG_ADMIN", "SUPER_ADMIN"}),
     "workflow.review_actions.read":   frozenset({"VIEWER", "AUTHOR", "REVIEWER", "APPROVER", "ORG_ADMIN", "SUPER_ADMIN"}),
 
+    # --- 검색 ---
+    # 공개 접근 (require_authenticated=False 시 anonymous는 RBAC 생략 — 이 목록은 인증된 사용자용)
+    "search.filter_options": frozenset({"VIEWER", "AUTHOR", "REVIEWER", "APPROVER", "ORG_ADMIN", "SUPER_ADMIN"}),
+    "search.query":          frozenset({"VIEWER", "AUTHOR", "REVIEWER", "APPROVER", "ORG_ADMIN", "SUPER_ADMIN"}),
+    "search.documents":      frozenset({"VIEWER", "AUTHOR", "REVIEWER", "APPROVER", "ORG_ADMIN", "SUPER_ADMIN"}),
+    "search.nodes":          frozenset({"VIEWER", "AUTHOR", "REVIEWER", "APPROVER", "ORG_ADMIN", "SUPER_ADMIN"}),
+    # Admin 전용
+    "search.index_stats":    frozenset({"ORG_ADMIN", "SUPER_ADMIN"}),
+    "search.reindex":        frozenset({"SUPER_ADMIN"}),
+
     # --- 관리자 ---
     "admin.read":  frozenset({"ORG_ADMIN", "SUPER_ADMIN"}),
     "admin.write": frozenset({"SUPER_ADMIN"}),

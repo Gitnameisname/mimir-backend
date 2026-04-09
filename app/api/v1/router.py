@@ -18,7 +18,7 @@ TODO (향후 연결 예정):
 """
 from fastapi import APIRouter
 
-from app.api.v1 import admin, documents, nodes, operations, retrieval, system, versions, webhooks
+from app.api.v1 import admin, documents, nodes, operations, retrieval, search, system, versions, webhooks
 from app.api.v1 import workflow
 
 v1_router = APIRouter()
@@ -38,6 +38,9 @@ v1_router.include_router(
     prefix="/documents/{document_id}/versions/{version_id}/workflow",
     tags=["workflow"],
 )
+
+# Phase 8: 검색 API
+v1_router.include_router(search.router, prefix="/search", tags=["search"])
 
 # 확장 예정 — placeholder 수준
 v1_router.include_router(admin.router, prefix="/admin", tags=["admin"])

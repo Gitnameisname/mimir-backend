@@ -436,6 +436,123 @@ CREATE TABLE IF NOT EXISTS api_keys (
 CREATE INDEX IF NOT EXISTS idx_api_keys_status ON api_keys(status);
 """
 
+# ---------------------------------------------------------------------------
+# Phase 8: Full-Text Search 마이그레이션
+# ---------------------------------------------------------------------------
+
+_FTS_MIGRATION_DDL = """
+-- documents tsvector 컬럼 추가
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS search_vector tsvector;
+
+-- documents 기존 데이터 인덱싱
+UPDATE documents
+SET search_vector =
+    setweight(to_tsvector('simple', COALESCE(title, '')), 'A') ||
+    setweight(to_tsvector('simple', COALESCE(summary, '')), 'C')
+WHERE search_vector IS NULL;
+
+-- documents GIN 인덱스
+CREATE INDEX IF NOT EXISTS idx_documents_search_vector
+    ON documents USING GIN(search_vector);
+
+-- documents 자동 갱신 트리거 함수
+CREATE OR REPLACE FUNCTION update_document_search_vector()
+RETURNS trigger AS $$
+BEGIN
+    NEW.search_vector :=
+        setweight(to_tsvector('simple', COALESCE(NEW.title, '')), 'A') ||
+        setweight(to_tsvector('simple', COALESCE(NEW.summary, '')), 'C');
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_document_search_vector ON documents;
+CREATE TRIGGER trg_document_search_vector
+    BEFORE INSERT OR UPDATE OF title, summary ON documents
+    FOR EACH ROW EXECUTE FUNCTION update_document_search_vector();
+
+-- versions tsvector 컬럼 추가
+ALTER TABLE versions ADD COLUMN IF NOT EXISTS search_vector tsvector;
+
+UPDATE versions
+SET search_vector =
+    setweight(to_tsvector('simple', COALESCE(title_snapshot, '')), 'A') ||
+    setweight(to_tsvector('simple', COALESCE(summary_snapshot, '')), 'B') ||
+    setweight(to_tsvector('simple', COALESCE(change_summary, '')), 'C')
+WHERE search_vector IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_versions_search_vector
+    ON versions USING GIN(search_vector);
+
+CREATE OR REPLACE FUNCTION update_version_search_vector()
+RETURNS trigger AS $$
+BEGIN
+    NEW.search_vector :=
+        setweight(to_tsvector('simple', COALESCE(NEW.title_snapshot, '')), 'A') ||
+        setweight(to_tsvector('simple', COALESCE(NEW.summary_snapshot, '')), 'B') ||
+        setweight(to_tsvector('simple', COALESCE(NEW.change_summary, '')), 'C');
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_version_search_vector ON versions;
+CREATE TRIGGER trg_version_search_vector
+    BEFORE INSERT OR UPDATE OF title_snapshot, summary_snapshot, change_summary ON versions
+    FOR EACH ROW EXECUTE FUNCTION update_version_search_vector();
+
+-- nodes tsvector 컬럼 추가
+ALTER TABLE nodes ADD COLUMN IF NOT EXISTS search_vector tsvector;
+
+UPDATE nodes
+SET search_vector =
+    setweight(to_tsvector('simple', COALESCE(title, '')), 'A') ||
+    setweight(to_tsvector('simple', COALESCE(content, '')), 'B')
+WHERE search_vector IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_nodes_search_vector
+    ON nodes USING GIN(search_vector);
+
+CREATE OR REPLACE FUNCTION update_node_search_vector()
+RETURNS trigger AS $$
+BEGIN
+    NEW.search_vector :=
+        setweight(to_tsvector('simple', COALESCE(NEW.title, '')), 'A') ||
+        setweight(to_tsvector('simple', COALESCE(NEW.content, '')), 'B');
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_node_search_vector ON nodes;
+CREATE TRIGGER trg_node_search_vector
+    BEFORE INSERT OR UPDATE OF title, content ON nodes
+    FOR EACH ROW EXECUTE FUNCTION update_node_search_vector();
+"""
+
+# search_index_stats 뷰 — Admin 인덱싱 현황 조회용
+_SEARCH_INDEX_STATS_DDL = """
+CREATE OR REPLACE VIEW search_index_stats AS
+SELECT
+    'documents' AS table_name,
+    COUNT(*) AS total_rows,
+    COUNT(*) FILTER (WHERE search_vector IS NOT NULL) AS indexed_rows,
+    COUNT(*) FILTER (WHERE search_vector IS NULL) AS unindexed_rows
+FROM documents
+UNION ALL
+SELECT
+    'versions',
+    COUNT(*),
+    COUNT(*) FILTER (WHERE search_vector IS NOT NULL),
+    COUNT(*) FILTER (WHERE search_vector IS NULL)
+FROM versions
+UNION ALL
+SELECT
+    'nodes',
+    COUNT(*),
+    COUNT(*) FILTER (WHERE search_vector IS NOT NULL),
+    COUNT(*) FILTER (WHERE search_vector IS NULL)
+FROM nodes;
+"""
+
 # idempotency_records 테이블 DDL
 _IDEMPOTENCY_DDL = """
 CREATE TABLE IF NOT EXISTS idempotency_records (
@@ -495,7 +612,10 @@ def init_db() -> None:
                 cur.execute(_DOCUMENT_TYPES_DDL)
                 cur.execute(_BACKGROUND_JOBS_DDL)
                 cur.execute(_API_KEYS_DDL)
-        logger.info("DB schema initialized (Phase 7 admin tables included)")
+                # Phase 8 FTS 마이그레이션
+                cur.execute(_FTS_MIGRATION_DDL)
+                cur.execute(_SEARCH_INDEX_STATS_DDL)
+        logger.info("DB schema initialized (Phase 8 FTS included)")
     except Exception as exc:
         logger.error("DB schema initialization failed: %s", exc)
         raise
