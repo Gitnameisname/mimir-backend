@@ -31,8 +31,31 @@ class Settings(BaseSettings):
 
     # Security
     jwt_secret: str = ""
-    jwt_expire_minutes: int = 120
+    jwt_expire_minutes: int = 15  # Phase 14: RT 도입으로 120 → 15분 단축
+    jwt_refresh_expire_days: int = 7
     internal_service_secret: str = ""
+
+    # Password policy (Phase 14)
+    bcrypt_cost_factor: int = 12
+    login_max_attempts: int = 5
+    login_lockout_minutes: int = 15
+
+    # GitLab OAuth (Phase 14-4)
+    gitlab_base_url: str = "https://gitlab.com"
+    gitlab_client_id: str = ""
+    gitlab_client_secret: str = ""
+    gitlab_redirect_uri: str = ""
+    oauth_token_encryption_key: str = ""  # 32바이트 base64 인코딩
+    frontend_url: str = "http://localhost:3000"  # OAuth 콜백 후 프론트엔드 리다이렉트
+
+    # SMTP (Phase 14-5)
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_password: str = ""
+    smtp_from_address: str = "noreply@mimir.local"
+    smtp_use_tls: bool = False
+
     # CORS
     cors_allow_origins: str = "http://localhost:3000"
 
@@ -83,6 +106,19 @@ class Settings(BaseSettings):
                     ", ".join(missing),
                 )
         return self
+
+    @property
+    def is_oauth_enabled(self) -> bool:
+        """GitLab OAuth가 설정되어 있는지 확인."""
+        return bool(self.gitlab_client_id and self.gitlab_client_secret)
+
+    @property
+    def oauth_encryption_key_bytes(self) -> bytes | None:
+        """OAUTH_TOKEN_ENCRYPTION_KEY를 bytes로 디코딩. 미설정 시 None."""
+        if not self.oauth_token_encryption_key:
+            return None
+        import base64
+        return base64.b64decode(self.oauth_token_encryption_key)
 
     @property
     def valkey_host_clean(self) -> str:

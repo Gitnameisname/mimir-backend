@@ -665,6 +665,57 @@ def publish_document(
 
 
 # ---------------------------------------------------------------------------
+# GET /documents/{document_id}/versions/latest — 최신(현재 published) 버전 조회
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/{document_id}/versions/latest",
+    summary="최신 버전 조회",
+    description=(
+        "문서의 현재 Published 버전을 반환한다.\n\n"
+        "- Published 버전이 없으면 404 반환."
+    ),
+    response_model=SuccessResponse,
+    tags=["versions"],
+)
+def get_latest_version(
+    document_id: str,
+    request: Request,
+    actor: ActorContext = Depends(resolve_current_actor),
+) -> SuccessResponse:
+    from app.api.errors.exceptions import ApiNotFoundError
+    from app.repositories.versions_repository import versions_repository
+
+    authorization_service.authorize(
+        actor=actor,
+        action="version.read",
+        resource=ResourceRef(resource_type="version", parent_id=document_id),
+        require_authenticated=False,
+    )
+    request_id, trace_id = get_request_ids(request)
+
+    with get_db() as conn:
+        # draft 우선, 없으면 published 순으로 반환
+        version = (
+            versions_repository.get_active_draft(conn, document_id)
+            or versions_repository.get_current_published(conn, document_id)
+        )
+
+        if version is None:
+            raise ApiNotFoundError("No version found for this document")
+
+        actor_role = actor.role if hasattr(actor, "role") else None
+        detail = draft_service.get_version_detail(
+            conn, document_id, version.id,
+            actor_role=actor_role,
+            include_content=False,
+        )
+
+    return success_response(data=detail.model_dump(), request_id=request_id, trace_id=trace_id)
+
+
+# ---------------------------------------------------------------------------
 # GET /documents/{document_id}/versions/{version_id} — 버전 상세 조회
 # ---------------------------------------------------------------------------
 

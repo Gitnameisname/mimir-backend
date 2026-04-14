@@ -650,6 +650,188 @@ CREATE INDEX IF NOT EXISTS idx_idempotency_created_at
 """
 
 
+# ---------------------------------------------------------------------------
+# Phase 14: users 테이블 인증 컬럼 마이그레이션
+# ---------------------------------------------------------------------------
+_USERS_AUTH_MIGRATION_DDL = """
+ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash      VARCHAR(255);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_provider       VARCHAR(50) DEFAULT 'local';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified      BOOLEAN DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified_at   TIMESTAMPTZ;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS failed_login_count  INTEGER DEFAULT 0;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until        TIMESTAMPTZ;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url          VARCHAR(500);
+-- Phase 14-17: 아이디(username) 기반 로그인 지원
+ALTER TABLE users ADD COLUMN IF NOT EXISTS username            VARCHAR(50);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_unique
+    ON users(LOWER(username)) WHERE username IS NOT NULL;
+"""
+
+
+# ---------------------------------------------------------------------------
+# Phase 14: refresh_tokens 테이블
+# ---------------------------------------------------------------------------
+_REFRESH_TOKENS_DDL = """
+CREATE TABLE IF NOT EXISTS refresh_tokens (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_hash  VARCHAR(255) NOT NULL UNIQUE,
+    family_id   UUID NOT NULL,
+    expires_at  TIMESTAMPTZ NOT NULL,
+    revoked     BOOLEAN DEFAULT FALSE,
+    revoked_at  TIMESTAMPTZ,
+    created_at  TIMESTAMPTZ DEFAULT now(),
+    ip_address  VARCHAR(50),
+    user_agent  TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user   ON refresh_tokens(user_id);
+CREATE INDEX IF NOT EXISTS idx_refresh_tokens_family ON refresh_tokens(family_id);
+CREATE INDEX IF NOT EXISTS idx_refresh_tokens_hash   ON refresh_tokens(token_hash);
+CREATE INDEX IF NOT EXISTS idx_refresh_tokens_expires ON refresh_tokens(expires_at);
+"""
+
+
+# ---------------------------------------------------------------------------
+# Phase 14-4: oauth_accounts 테이블
+# ---------------------------------------------------------------------------
+_OAUTH_ACCOUNTS_DDL = """
+CREATE TABLE IF NOT EXISTS oauth_accounts (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id          UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    provider         VARCHAR(50) NOT NULL,
+    provider_uid     VARCHAR(255) NOT NULL,
+    provider_email   VARCHAR(255),
+    provider_name    VARCHAR(255),
+    avatar_url       VARCHAR(500),
+    access_token     TEXT,
+    refresh_token    TEXT,
+    token_expires_at TIMESTAMPTZ,
+    raw_profile      JSONB DEFAULT '{}',
+    created_at       TIMESTAMPTZ DEFAULT now(),
+    updated_at       TIMESTAMPTZ DEFAULT now(),
+    UNIQUE (provider, provider_uid)
+);
+
+CREATE INDEX IF NOT EXISTS idx_oauth_accounts_user ON oauth_accounts(user_id);
+CREATE INDEX IF NOT EXISTS idx_oauth_accounts_provider ON oauth_accounts(provider, provider_uid);
+CREATE INDEX IF NOT EXISTS idx_oauth_accounts_email ON oauth_accounts(provider, provider_email);
+"""
+
+
+# ---------------------------------------------------------------------------
+# Phase 14-11: system_settings 테이블
+# ---------------------------------------------------------------------------
+# Phase 14-13: 알림 관리 — alert_rules + alert_history
+_ALERT_RULES_DDL = """
+CREATE TABLE IF NOT EXISTS alert_rules (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name         VARCHAR(255) NOT NULL,
+    description  TEXT,
+    metric_name  VARCHAR(255) NOT NULL,
+    condition    JSONB NOT NULL,
+    severity     VARCHAR(50) NOT NULL,
+    channels     JSONB NOT NULL DEFAULT '[]'::jsonb,
+    channel_config JSONB NOT NULL DEFAULT '{}'::jsonb,
+    enabled      BOOLEAN NOT NULL DEFAULT TRUE,
+    created_by   UUID REFERENCES users(id),
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_alert_rules_enabled_metric
+    ON alert_rules(enabled, metric_name);
+"""
+
+_ALERT_HISTORY_DDL = """
+CREATE TABLE IF NOT EXISTS alert_history (
+    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    rule_id           UUID NOT NULL REFERENCES alert_rules(id) ON DELETE CASCADE,
+    triggered_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    resolved_at       TIMESTAMPTZ,
+    acknowledged_at   TIMESTAMPTZ,
+    acknowledged_by   UUID REFERENCES users(id),
+    status            VARCHAR(50) NOT NULL,
+    metric_value      NUMERIC,
+    message           TEXT,
+    notified_channels JSONB NOT NULL DEFAULT '[]'::jsonb
+);
+
+CREATE INDEX IF NOT EXISTS idx_alert_history_rule ON alert_history(rule_id);
+CREATE INDEX IF NOT EXISTS idx_alert_history_status
+    ON alert_history(status, triggered_at DESC);
+
+-- 동일 규칙의 활성(firing) 이력은 최대 1건 — 중복 발생 방지
+CREATE UNIQUE INDEX IF NOT EXISTS idx_alert_history_one_firing_per_rule
+    ON alert_history(rule_id) WHERE status = 'firing';
+"""
+
+# ---------------------------------------------------------------------------
+# Phase 14-14: 배치 작업 스케줄 — job_schedules (실행 기록은 background_jobs 재사용)
+_JOB_SCHEDULES_DDL = """
+CREATE TABLE IF NOT EXISTS job_schedules (
+    id                   VARCHAR(100) PRIMARY KEY,
+    name                 VARCHAR(255) NOT NULL,
+    description          TEXT,
+    schedule             VARCHAR(100),
+    enabled              BOOLEAN NOT NULL DEFAULT TRUE,
+    last_run_at          TIMESTAMPTZ,
+    last_run_duration_ms INTEGER,
+    last_run_result      VARCHAR(50),
+    last_run_id          UUID REFERENCES background_jobs(id) ON DELETE SET NULL,
+    next_run_at          TIMESTAMPTZ,
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_job_schedules_enabled ON job_schedules(enabled);
+"""
+
+# 표준 4 작업 시드 (멱등)
+_JOB_SCHEDULES_SEED_DDL = """
+INSERT INTO job_schedules (id, name, description, schedule) VALUES
+  ('reindex_all',    '전체 검색 인덱스 재구축',  'FTS + 벡터 인덱스를 전량 재구축합니다.', '0 2 * * *'),
+  ('vector_sync',    '벡터 동기화',              '누락된 청크에 대해 임베딩을 생성합니다.', '0 * * * *'),
+  ('audit_cleanup',  '감사 로그 정리',            '보관 기간 경과 감사 로그를 정리합니다.',   '0 4 * * 1'),
+  ('token_cleanup',  '만료 토큰 정리',            '만료된 refresh_tokens 를 제거합니다.',     '0 3 * * *')
+ON CONFLICT (id) DO NOTHING;
+"""
+
+
+_SYSTEM_SETTINGS_DDL = """
+CREATE TABLE IF NOT EXISTS system_settings (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    category    VARCHAR(100) NOT NULL,
+    key         VARCHAR(255) NOT NULL,
+    value       JSONB NOT NULL,
+    description TEXT,
+    updated_by  UUID REFERENCES users(id),
+    updated_at  TIMESTAMPTZ DEFAULT now(),
+    UNIQUE (category, key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_system_settings_category ON system_settings(category);
+"""
+
+# 초기 시드 — INSERT ON CONFLICT DO NOTHING 으로 멱등 보장
+_SYSTEM_SETTINGS_SEED_DDL = """
+INSERT INTO system_settings (category, key, value, description) VALUES
+  ('auth', 'session_timeout_minutes', '120'::jsonb, '세션 타임아웃 (분)'),
+  ('auth', 'max_login_attempts', '5'::jsonb, '최대 로그인 시도 횟수'),
+  ('auth', 'lockout_duration_minutes', '15'::jsonb, '로그인 잠금 시간 (분)'),
+  ('auth', 'password_min_length', '8'::jsonb, '최소 비밀번호 길이'),
+  ('auth', 'auto_create_gitlab_users', 'true'::jsonb, 'GitLab 최초 로그인 시 자동 계정 생성'),
+  ('system', 'platform_name', '"Mimir"'::jsonb, '플랫폼 표시 이름'),
+  ('system', 'default_user_role', '"VIEWER"'::jsonb, '신규 사용자 기본 역할'),
+  ('system', 'maintenance_mode', 'false'::jsonb, '유지보수 모드 활성화'),
+  ('notification', 'email_enabled', 'true'::jsonb, '이메일 알림 활성화'),
+  ('notification', 'webhook_enabled', 'false'::jsonb, '웹훅 알림 활성화'),
+  ('security', 'api_rate_limit_per_minute', '100'::jsonb, 'API 분당 요청 제한'),
+  ('security', 'require_email_verification', 'false'::jsonb, '이메일 인증 필수 여부')
+ON CONFLICT (category, key) DO NOTHING;
+"""
+
+
 def init_db() -> None:
     """앱 시작 시 모든 테이블을 생성하고 마이그레이션을 적용한다 (idempotent)."""
     try:
@@ -689,7 +871,21 @@ def init_db() -> None:
                 cur.execute(_DOCUMENT_CHUNKS_DDL)
                 cur.execute(_DOCUMENT_CHUNKS_VECTOR_INDEX_DDL)
                 cur.execute(_EMBEDDING_TOKEN_USAGE_DDL)
-        logger.info("DB schema initialized (Phase 10 pgvector included)")
+                # Phase 14 마이그레이션 (users 인증 컬럼 + refresh_tokens)
+                cur.execute(_USERS_AUTH_MIGRATION_DDL)
+                cur.execute(_REFRESH_TOKENS_DDL)
+                # Phase 14-4: OAuth 계정 연동 테이블
+                cur.execute(_OAUTH_ACCOUNTS_DDL)
+                # Phase 14-11: 시스템 설정 테이블 + 시드
+                cur.execute(_SYSTEM_SETTINGS_DDL)
+                cur.execute(_SYSTEM_SETTINGS_SEED_DDL)
+                # Phase 14-13: 알림 관리 테이블
+                cur.execute(_ALERT_RULES_DDL)
+                cur.execute(_ALERT_HISTORY_DDL)
+                # Phase 14-14: 배치 작업 스케줄 + 시드
+                cur.execute(_JOB_SCHEDULES_DDL)
+                cur.execute(_JOB_SCHEDULES_SEED_DDL)
+        logger.info("DB schema initialized (Phase 14-14 job_schedules included)")
     except Exception as exc:
         logger.error("DB schema initialization failed: %s", exc)
         raise

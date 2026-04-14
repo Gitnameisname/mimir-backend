@@ -28,6 +28,10 @@ uvloop==0.22.1
 watchfiles==1.1.1
 websockets==16.0
 
+# ---- Phase 14: 인증 시스템 의존성 ----
+bcrypt>=4.0.0
+cryptography>=43.0.0
+
 # ---- 개발/테스트 의존성 ----
 pytest==8.3.5
 pytest-cov==6.1.0

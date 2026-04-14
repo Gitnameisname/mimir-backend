@@ -1,20 +1,31 @@
 """
 JWT 토큰 발급 및 검증 유틸리티.
 
+Phase 14 확장:
+  - Access Token에 jti, type claim 추가
+  - Refresh Token 생성 (opaque token, SHA-256 해시 저장)
+  - 기존 create_access_token() 시그니처 하위 호환 유지
+
 발급:
   create_access_token(actor_id, role, expires_minutes) → JWT 문자열
+  create_refresh_token() → (raw_token, token_hash)
 
 검증:
   decode_access_token(token) → payload dict | None
+  verify_refresh_token_hash(raw, stored_hash) → bool
 
 알고리즘: HS256
-필수 클레임: sub (actor_id), role, exp
+필수 클레임: sub (actor_id), role, exp, type, jti
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import secrets
 from datetime import datetime, timezone, timedelta
 from typing import Optional
+from uuid import uuid4
 
 import jwt
 
@@ -51,6 +62,8 @@ def create_access_token(
         "role": role,
         "iat": now,
         "exp": now + expire_delta,
+        "jti": str(uuid4()),
+        "type": "access",
     }
     return jwt.encode(payload, settings.jwt_secret, algorithm=_ALGORITHM)
 
@@ -58,19 +71,69 @@ def create_access_token(
 def decode_access_token(token: str) -> dict | None:
     """JWT token을 검증하고 payload를 반환한다.
 
-    서명 불일치, 만료, 형식 오류 시 None 반환 (예외 전파 없음).
+    서명 불일치, 만료, 형식 오류, type 불일치 시 None 반환.
 
     Returns:
-        payload dict (sub, role, exp, ...) 또는 None (검증 실패).
+        payload dict (sub, role, exp, jti, type, ...) 또는 None (검증 실패).
     """
     if not settings.jwt_secret:
         return None
     try:
-        return jwt.decode(
+        payload = jwt.decode(
             token,
             settings.jwt_secret,
             algorithms=[_ALGORITHM],
             options={"require": ["sub", "exp"]},
         )
+        # Phase 14: type claim 검증 (하위 호환: type 없으면 허용)
+        token_type = payload.get("type")
+        if token_type is not None and token_type != "access":
+            return None
+        return payload
     except jwt.InvalidTokenError:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Phase 14: Refresh Token
+# ---------------------------------------------------------------------------
+
+def create_refresh_token() -> tuple[str, str]:
+    """Opaque Refresh Token을 생성한다.
+
+    DB에는 평문이 아닌 SHA-256 해시만 저장한다.
+    클라이언트에는 raw_token을 HttpOnly Cookie로 전달한다.
+
+    Returns:
+        (raw_token, token_hash) 튜플.
+        raw_token: 클라이언트에 전달할 64바이트 URL-safe 토큰.
+        token_hash: DB에 저장할 SHA-256 해시 (hex digest, 64자).
+    """
+    raw_token = secrets.token_urlsafe(64)
+    token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+    return raw_token, token_hash
+
+
+def verify_refresh_token_hash(raw_token: str, stored_hash: str) -> bool:
+    """클라이언트에서 받은 raw_token의 해시가 DB 저장값과 일치하는지 확인한다.
+
+    타이밍 공격 방어를 위해 hmac.compare_digest를 사용한다.
+
+    Args:
+        raw_token: 클라이언트로부터 받은 opaque 토큰.
+        stored_hash: DB에 저장된 SHA-256 해시.
+
+    Returns:
+        일치 여부.
+    """
+    computed = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+    return hmac.compare_digest(computed, stored_hash)
+
+
+def generate_family_id() -> str:
+    """새로운 RT family ID를 생성한다.
+
+    Returns:
+        UUID4 문자열.
+    """
+    return str(uuid4())

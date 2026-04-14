@@ -70,7 +70,8 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
             )
 
         # Server 헤더 제거 (서버 소프트웨어 노출 방지)
-        response.headers.pop("server", None)
-        response.headers.pop("Server", None)
+        for key in ("server", "Server"):
+            if key in response.headers:
+                del response.headers[key]
 
         return response

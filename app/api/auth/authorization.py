@@ -122,6 +122,24 @@ _PERMISSION_MATRIX: dict[str, frozenset[str]] = {
 
 
 # ---------------------------------------------------------------------------
+# Public accessor — UI 권한 매트릭스 뷰용
+# ---------------------------------------------------------------------------
+
+
+def get_permission_matrix() -> dict[str, list[str]]:
+    """현재 RBAC 매트릭스를 직렬화 가능한 형태로 반환.
+
+    UI의 '권한 매트릭스' 뷰에서 사용. frozenset은 JSON 직렬화되지 않으므로 list로 변환.
+    순서는 정렬된 역할 리스트를 보장.
+    """
+    _ORDER = ["VIEWER", "AUTHOR", "REVIEWER", "APPROVER", "ORG_ADMIN", "SUPER_ADMIN"]
+    result: dict[str, list[str]] = {}
+    for action, roles in _PERMISSION_MATRIX.items():
+        result[action] = [r for r in _ORDER if r in roles]
+    return result
+
+
+# ---------------------------------------------------------------------------
 # AuthorizationService
 # ---------------------------------------------------------------------------
 

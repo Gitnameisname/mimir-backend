@@ -33,6 +33,15 @@ def _row_to_user(row: dict[str, Any]) -> User:
         last_login_at=row.get("last_login_at"),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        # Phase 14 인증 확장 필드
+        username=row.get("username"),
+        password_hash=row.get("password_hash"),
+        auth_provider=row.get("auth_provider", "local"),
+        email_verified=row.get("email_verified", False),
+        email_verified_at=row.get("email_verified_at"),
+        failed_login_count=row.get("failed_login_count", 0),
+        locked_until=row.get("locked_until"),
+        avatar_url=row.get("avatar_url"),
     )
 
 
@@ -87,6 +96,29 @@ class UsersRepository:
             row = cur.fetchone()
         return _row_to_user(row) if row else None
 
+    def get_by_username(
+        self, conn: psycopg2.extensions.connection, username: str
+    ) -> Optional[User]:
+        """아이디(username)로 사용자를 조회한다. 대소문자 구분 없음."""
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM users WHERE LOWER(username) = LOWER(%s)",
+                (username,),
+            )
+            row = cur.fetchone()
+        return _row_to_user(row) if row else None
+
+    def get_by_identifier(
+        self, conn: psycopg2.extensions.connection, identifier: str
+    ) -> Optional[User]:
+        """이메일 또는 아이디로 사용자를 조회한다.
+
+        identifier에 '@'가 포함되어 있으면 이메일로, 그렇지 않으면 아이디로 조회한다.
+        """
+        if "@" in identifier:
+            return self.get_by_email(conn, identifier.lower().strip())
+        return self.get_by_username(conn, identifier.strip())
+
     def list(
         self,
         conn: psycopg2.extensions.connection,
@@ -134,15 +166,24 @@ class UsersRepository:
         display_name: str,
         role_name: str = "VIEWER",
         status: str = "ACTIVE",
+        password_hash: Optional[str] = None,
+        auth_provider: str = "local",
+        email_verified: bool = False,
+        avatar_url: Optional[str] = None,
+        username: Optional[str] = None,
     ) -> User:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO users (email, display_name, role_name, status)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO users (email, display_name, role_name, status,
+                                   password_hash, auth_provider, email_verified,
+                                   avatar_url, username)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING *
                 """,
-                (email, display_name, role_name, status),
+                (email, display_name, role_name, status,
+                 password_hash, auth_provider, email_verified,
+                 avatar_url, username),
             )
             row = cur.fetchone()
         return _row_to_user(row)
@@ -155,7 +196,15 @@ class UsersRepository:
         display_name: Optional[str] = None,
         role_name: Optional[str] = None,
         status: Optional[str] = None,
+        password_hash: Optional[str] = None,
+        email_verified: Optional[bool] = None,
+        failed_login_count: Optional[int] = None,
+        locked_until: Any = None,  # datetime | None, sentinel 패턴용
+        last_login_at: Any = None,
+        avatar_url: Optional[str] = None,
+        username: Optional[str] = None,
     ) -> Optional[User]:
+        _UNSET = object()
         fields: list[str] = []
         params: list[Any] = []
 
@@ -168,6 +217,27 @@ class UsersRepository:
         if status is not None:
             fields.append("status = %s")
             params.append(status)
+        if password_hash is not None:
+            fields.append("password_hash = %s")
+            params.append(password_hash)
+        if email_verified is not None:
+            fields.append("email_verified = %s")
+            params.append(email_verified)
+        if failed_login_count is not None:
+            fields.append("failed_login_count = %s")
+            params.append(failed_login_count)
+        if locked_until is not _UNSET and locked_until is not None:
+            fields.append("locked_until = %s")
+            params.append(locked_until)
+        if last_login_at is not _UNSET and last_login_at is not None:
+            fields.append("last_login_at = %s")
+            params.append(last_login_at)
+        if avatar_url is not None:
+            fields.append("avatar_url = %s")
+            params.append(avatar_url)
+        if username is not None:
+            fields.append("username = %s")
+            params.append(username)
 
         if not fields:
             return self.get_by_id(conn, user_id)
@@ -179,6 +249,45 @@ class UsersRepository:
             cur.execute(
                 f"UPDATE users SET {', '.join(fields)} WHERE id = %s RETURNING *",
                 params,
+            )
+            row = cur.fetchone()
+        return _row_to_user(row) if row else None
+
+    def record_login_success(
+        self,
+        conn: psycopg2.extensions.connection,
+        user_id: str,
+    ) -> Optional[User]:
+        """로그인 성공 시: failed_login_count 초기화, last_login_at 갱신."""
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE users
+                SET failed_login_count = 0, locked_until = NULL,
+                    last_login_at = NOW(), updated_at = NOW()
+                WHERE id = %s
+                RETURNING *
+                """,
+                (user_id,),
+            )
+            row = cur.fetchone()
+        return _row_to_user(row) if row else None
+
+    def record_login_failure(
+        self,
+        conn: psycopg2.extensions.connection,
+        user_id: str,
+    ) -> Optional[User]:
+        """로그인 실패 시: failed_login_count 증가."""
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE users
+                SET failed_login_count = failed_login_count + 1, updated_at = NOW()
+                WHERE id = %s
+                RETURNING *
+                """,
+                (user_id,),
             )
             row = cur.fetchone()
         return _row_to_user(row) if row else None

@@ -23,6 +23,8 @@ from app.api.v1 import workflow
 from app.api.v1 import diff
 from app.api.v1 import vectorization
 from app.api.v1 import rag
+from app.api.v1 import auth_router as auth
+from app.api.v1 import account_router as account
 
 v1_router = APIRouter()
 
@@ -58,6 +60,12 @@ v1_router.include_router(vectorization.router, prefix="/vectorization", tags=["v
 
 # Phase 11: RAG 질의응답 API
 v1_router.include_router(rag.router, prefix="/rag", tags=["rag"])
+
+# Phase 14: 인증 API
+v1_router.include_router(auth.router, prefix="/auth", tags=["auth"])
+
+# Phase 14-7: 계정 관리 API
+v1_router.include_router(account.router, prefix="/account", tags=["account"])
 
 # 확장 예정 — placeholder 수준
 v1_router.include_router(admin.router, prefix="/admin", tags=["admin"])

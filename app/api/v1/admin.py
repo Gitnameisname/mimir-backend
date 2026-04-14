@@ -34,16 +34,18 @@ Admin router — /api/v1/admin
   - DELETE /admin/document-types/{type_code}
 """
 
+import hashlib
 import logging
 import re
+import secrets as _secrets
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 
-from app.api.auth import ResourceRef, authorization_service, resolve_current_actor
+from app.api.auth import ResourceRef, authorization_service, get_permission_matrix, resolve_current_actor
 from app.api.auth.models import ActorContext
 from app.api.responses import list_response, success_response
 from app.db import get_db
@@ -248,6 +250,7 @@ def list_users(
     limit: int = Query(default=20, ge=1, le=100),
     search: Optional[str] = Query(default=None),
     status: Optional[str] = Query(default=None),
+    role: Optional[str] = Query(default=None),
     _=Depends(require_admin_access),
 ):
     offset = (page - 1) * limit
@@ -260,6 +263,9 @@ def list_users(
     if status:
         conditions.append("status = %s")
         params.append(status)
+    if role:
+        conditions.append("role_name = %s")
+        params.append(role)
 
     where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
 
@@ -490,6 +496,33 @@ def list_roles(_=Depends(require_admin_access)):
         for r in rows
     ]
     return success_response(data={"items": items})
+
+
+@router.get("/roles/permissions/matrix", summary="역할-권한 매트릭스")
+def get_role_permission_matrix(_=Depends(require_admin_access)):
+    """모든 action에 대한 역할별 허용 여부 매트릭스를 반환한다.
+
+    UI의 '권한 매트릭스' 뷰에서 사용하며,
+    `_PERMISSION_MATRIX`(authorization.py)를 JSON-safe하게 직렬화한다.
+    """
+    matrix = get_permission_matrix()
+    roles = ["VIEWER", "AUTHOR", "REVIEWER", "APPROVER", "ORG_ADMIN", "SUPER_ADMIN"]
+    # action별로 그룹화 (예: "document.read" → group="document", action="read")
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for action, allowed in sorted(matrix.items()):
+        if "." in action:
+            group, verb = action.split(".", 1)
+        else:
+            group, verb = "other", action
+        grouped.setdefault(group, []).append({
+            "action": action,
+            "verb": verb,
+            "allowed_roles": allowed,
+        })
+    return success_response(data={
+        "roles": roles,
+        "groups": [{"name": g, "items": items} for g, items in grouped.items()],
+    })
 
 
 @router.get("/roles/{role_id}", summary="역할 상세")
@@ -1667,3 +1700,1315 @@ def get_metadata_schema(type_code: str, _=Depends(require_admin_access)):
         "schema": plugin.metadata_schema_plugin().get_schema(),
         "ui_schema": plugin.metadata_schema_plugin().get_ui_schema(),
     })
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Phase 14-11: 시스템 설정 관리 API
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ---- 카테고리 한글 라벨 (UI 응답에 포함) ----
+_SETTINGS_CATEGORY_LABELS = {
+    "auth": "인증",
+    "system": "시스템",
+    "notification": "알림",
+    "security": "보안",
+}
+
+# ---- 캐시 키 / TTL ----
+_SETTINGS_CACHE_KEY_ALL = "system_settings:all:v1"
+_SETTINGS_CACHE_TTL = 300  # 5 minutes
+
+
+def _invalidate_settings_cache() -> None:
+    """system_settings 캐시를 무효화한다 (변경 시 호출)."""
+    try:
+        from app.cache import get_valkey
+        get_valkey().delete(_SETTINGS_CACHE_KEY_ALL)
+    except Exception as exc:
+        logger.debug("settings 캐시 무효화 실패 (무시): %s", exc)
+
+
+def _setting_to_response(setting: dict[str, Any]) -> dict[str, Any]:
+    """단건 응답 형식으로 변환 (id/category 제외, key/value/description/updated_at 포함)."""
+    updated_at = setting.get("updated_at")
+    return {
+        "key": setting["key"],
+        "value": setting["value"],
+        "description": setting.get("description"),
+        "updated_at": updated_at.isoformat() if updated_at else None,
+    }
+
+
+@router.get("/settings", summary="시스템 설정 전체 조회 (카테고리별 그룹)")
+def get_all_settings(_=Depends(require_admin_access)):
+    """시스템 설정을 카테고리별 그룹으로 반환한다.
+
+    Valkey 캐시 5분 TTL 적용 (관리자 화면 새로고침 시 DB 부하 완화).
+    """
+    import json as json_lib
+
+    # 캐시 조회
+    try:
+        from app.cache import get_valkey
+        cached = get_valkey().get(_SETTINGS_CACHE_KEY_ALL)
+        if cached:
+            return success_response(data=json_lib.loads(cached))
+    except Exception as exc:
+        logger.debug("settings 캐시 조회 실패 (DB로 폴백): %s", exc)
+
+    from app.repositories.settings_repository import settings_repository
+
+    with get_db() as conn:
+        rows = settings_repository.list_all(conn)
+
+    # 카테고리별 그룹화
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(row["category"], []).append(_setting_to_response(row))
+
+    # 응답 구조: { categories: [{name, label, items: [...]}] }
+    categories = []
+    for cat in sorted(grouped.keys(), key=lambda c: list(_SETTINGS_CATEGORY_LABELS.keys()).index(c) if c in _SETTINGS_CATEGORY_LABELS else 999):
+        categories.append({
+            "name": cat,
+            "label": _SETTINGS_CATEGORY_LABELS.get(cat, cat),
+            "items": grouped[cat],
+        })
+
+    payload = {"categories": categories}
+
+    # 캐시 저장
+    try:
+        from app.cache import get_valkey
+        get_valkey().setex(
+            _SETTINGS_CACHE_KEY_ALL,
+            _SETTINGS_CACHE_TTL,
+            json_lib.dumps(payload, default=str),
+        )
+    except Exception as exc:
+        logger.debug("settings 캐시 저장 실패 (무시): %s", exc)
+
+    return success_response(data=payload)
+
+
+@router.get("/settings/{category}", summary="카테고리별 설정 조회")
+def get_settings_by_category(category: str, _=Depends(require_admin_access)):
+    """단일 카테고리의 설정 항목을 반환한다."""
+    from app.repositories.settings_repository import settings_repository
+
+    # 카테고리 형식 검증 (영문 소문자/숫자/언더스코어만)
+    if not re.match(r"^[a-z][a-z0-9_]{0,99}$", category):
+        raise HTTPException(status_code=422, detail="유효하지 않은 카테고리 형식입니다.")
+
+    with get_db() as conn:
+        rows = settings_repository.list_by_category(conn, category)
+
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"카테고리 '{category}'를 찾을 수 없습니다.")
+
+    return success_response(data={
+        "category": category,
+        "label": _SETTINGS_CATEGORY_LABELS.get(category, category),
+        "items": [_setting_to_response(r) for r in rows],
+    })
+
+
+class UpdateSettingBody(BaseModel):
+    value: Any  # JSONB이므로 임의 타입 허용 (단, 기존 값과 동일 타입이어야 함)
+
+
+@router.patch("/settings/{category}/{key}", summary="설정 값 변경 (SUPER_ADMIN)")
+def update_setting(
+    category: str,
+    key: str,
+    body: UpdateSettingBody,
+    actor: ActorContext = Depends(resolve_current_actor),
+    _=Depends(require_admin_access),  # PATCH → admin.write → SUPER_ADMIN 전용
+):
+    """설정 값을 변경한다.
+
+    검증:
+      - 카테고리/키 존재 확인 (404)
+      - 새 값 타입이 기존 값 타입과 동일해야 함 (422)
+      - 잠재적 위험 키(maintenance_mode 등)도 동일 검증으로 처리
+
+    감사 이벤트: 이전 값 → 새 값 기록 (SETTING_CHANGED).
+    """
+    import json as json_lib
+    from app.audit.emitter import audit_emitter
+    from app.repositories.settings_repository import settings_repository
+
+    # 카테고리/키 형식 검증 (SQL injection 방어 보강 — 파라미터 바인딩과 이중 안전망)
+    if not re.match(r"^[a-z][a-z0-9_]{0,99}$", category):
+        raise HTTPException(status_code=422, detail="유효하지 않은 카테고리 형식입니다.")
+    if not re.match(r"^[a-z][a-z0-9_]{0,254}$", key):
+        raise HTTPException(status_code=422, detail="유효하지 않은 키 형식입니다.")
+
+    with get_db() as conn:
+        existing = settings_repository.get_one(conn, category, key)
+        if existing is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"설정 '{category}.{key}'를 찾을 수 없습니다.",
+            )
+
+        old_value = existing["value"]
+        new_value = body.value
+
+        # 타입 일치 검증 (bool은 int의 서브클래스이므로 별도 처리)
+        def _type_signature(v: Any) -> str:
+            if isinstance(v, bool):
+                return "bool"
+            if isinstance(v, int):
+                return "int"
+            if isinstance(v, float):
+                return "float"
+            if isinstance(v, str):
+                return "str"
+            if isinstance(v, list):
+                return "list"
+            if isinstance(v, dict):
+                return "dict"
+            if v is None:
+                return "null"
+            return type(v).__name__
+
+        old_type = _type_signature(old_value)
+        new_type = _type_signature(new_value)
+        if old_type != new_type:
+            raise HTTPException(
+                status_code=422,
+                detail=f"값 타입이 일치하지 않습니다 (기존: {old_type}, 신규: {new_type}).",
+            )
+
+        # 변경 없음
+        if old_value == new_value:
+            return success_response(data=_setting_to_response(existing))
+
+        # 업데이트
+        updated = settings_repository.update_value(
+            conn, category, key, new_value, actor.actor_id
+        )
+        if updated is None:
+            # 동시성 — 타 트랜잭션이 삭제 (시드만 있는 환경에서는 발생 어려움)
+            raise HTTPException(status_code=404, detail="업데이트 대상이 사라졌습니다.")
+
+    # 캐시 무효화
+    _invalidate_settings_cache()
+
+    # 감사 이벤트 (실패해도 응답은 정상)
+    try:
+        audit_emitter.emit(
+            event_type="SETTING_CHANGED",
+            action="admin.write",
+            actor_id=actor.actor_id,
+            actor_role=actor.role,
+            resource_type="system_setting",
+            resource_id=updated["id"],
+            result="success",
+            metadata={
+                "category": category,
+                "key": key,
+                "old_value": old_value,
+                "new_value": new_value,
+            },
+            previous_state=json_lib.dumps(old_value, default=str)[:500],
+            new_state=json_lib.dumps(new_value, default=str)[:500],
+        )
+    except Exception as exc:
+        logger.warning("설정 변경 감사 이벤트 기록 실패: %s", exc)
+
+    return success_response(data=_setting_to_response(updated))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Phase 14-12: 모니터링 메트릭 API
+# ═══════════════════════════════════════════════════════════════════════════
+
+# 지원 period → (interval_seconds, bucket_count)
+_MONITORING_PERIODS = {
+    "1h": (60, 60),       # 1분 버킷 × 60
+    "6h": (600, 36),      # 10분 버킷 × 36
+    "24h": (3600, 24),    # 1시간 버킷 × 24
+    "7d": (21600, 28),    # 6시간 버킷 × 28
+}
+
+
+def _validate_period(period: str) -> tuple[int, int]:
+    if period not in _MONITORING_PERIODS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"지원하지 않는 period입니다. (허용: {', '.join(_MONITORING_PERIODS.keys())})",
+        )
+    return _MONITORING_PERIODS[period]
+
+
+@router.get("/monitoring/response-times", summary="API 응답 시간 추이 (P50/P95/P99)")
+def get_response_time_trend(
+    period: str = Query(default="24h"),
+    _=Depends(require_admin_access),
+):
+    """background_jobs의 실행 시간(ms)을 버킷별 P50/P95/P99로 집계한다.
+
+    완료된 (ended_at IS NOT NULL) 작업만 대상으로 한다.
+    """
+    interval_seconds, bucket_count = _validate_period(period)
+    total_seconds = interval_seconds * bucket_count
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            # 시간 버킷 시리즈 생성 + LATERAL JOIN으로 percentile 계산
+            cur.execute(
+                """
+                WITH series AS (
+                  SELECT generate_series(
+                    date_trunc('minute', NOW()) - make_interval(secs => %s),
+                    date_trunc('minute', NOW()),
+                    make_interval(secs => %s)
+                  ) AS bucket_start
+                ),
+                samples AS (
+                  SELECT
+                    to_timestamp(
+                      floor(extract(epoch FROM ended_at) / %s) * %s
+                    ) AT TIME ZONE 'UTC' AS bucket,
+                    EXTRACT(EPOCH FROM (ended_at - started_at)) * 1000 AS duration_ms
+                  FROM background_jobs
+                  WHERE ended_at IS NOT NULL
+                    AND started_at IS NOT NULL
+                    AND ended_at > NOW() - make_interval(secs => %s)
+                ),
+                aggregated AS (
+                  SELECT
+                    bucket,
+                    percentile_cont(0.5) WITHIN GROUP (ORDER BY duration_ms) AS p50,
+                    percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms) AS p95,
+                    percentile_cont(0.99) WITHIN GROUP (ORDER BY duration_ms) AS p99,
+                    COUNT(*) AS sample_count
+                  FROM samples
+                  GROUP BY bucket
+                )
+                SELECT
+                  s.bucket_start AS timestamp,
+                  COALESCE(a.p50, 0)::int AS p50,
+                  COALESCE(a.p95, 0)::int AS p95,
+                  COALESCE(a.p99, 0)::int AS p99,
+                  COALESCE(a.sample_count, 0)::int AS sample_count
+                FROM series s
+                LEFT JOIN aggregated a
+                  ON date_trunc('second', s.bucket_start) = date_trunc('second', a.bucket)
+                ORDER BY s.bucket_start
+                """,
+                (
+                    total_seconds, interval_seconds,
+                    interval_seconds, interval_seconds,
+                    total_seconds,
+                ),
+            )
+            rows = cur.fetchall()
+
+    data = [
+        {
+            "timestamp": r["timestamp"].isoformat() if r["timestamp"] else None,
+            "p50": int(r["p50"] or 0),
+            "p95": int(r["p95"] or 0),
+            "p99": int(r["p99"] or 0),
+            "sample_count": int(r["sample_count"] or 0),
+        }
+        for r in rows
+    ]
+
+    return success_response(data={
+        "period": period,
+        "interval_seconds": interval_seconds,
+        "data": data,
+    })
+
+
+@router.get("/monitoring/error-trends", summary="에러 추이 (4xx/5xx 분류)")
+def get_error_trend(
+    period: str = Query(default="24h"),
+    _=Depends(require_admin_access),
+):
+    """audit_events.action_result + background_jobs.status='FAILED'를 시간대별로 집계한다.
+
+    분류:
+      - 4xx (client_error): action_result IN ('denied', 'conflict')
+      - 5xx (server_error): action_result = 'failure' OR jobs.status = 'FAILED'
+    """
+    interval_seconds, bucket_count = _validate_period(period)
+    total_seconds = interval_seconds * bucket_count
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH series AS (
+                  SELECT generate_series(
+                    date_trunc('minute', NOW()) - make_interval(secs => %s),
+                    date_trunc('minute', NOW()),
+                    make_interval(secs => %s)
+                  ) AS bucket_start
+                ),
+                events AS (
+                  SELECT
+                    to_timestamp(floor(extract(epoch FROM occurred_at) / %s) * %s) AT TIME ZONE 'UTC' AS bucket,
+                    SUM(CASE WHEN action_result IN ('denied','conflict') THEN 1 ELSE 0 END) AS c4xx,
+                    SUM(CASE WHEN action_result = 'failure' THEN 1 ELSE 0 END) AS c5xx
+                  FROM audit_events
+                  WHERE occurred_at > NOW() - make_interval(secs => %s)
+                  GROUP BY bucket
+                ),
+                jobs AS (
+                  SELECT
+                    to_timestamp(floor(extract(epoch FROM created_at) / %s) * %s) AT TIME ZONE 'UTC' AS bucket,
+                    COUNT(*) AS jobs_failed
+                  FROM background_jobs
+                  WHERE status = 'FAILED'
+                    AND created_at > NOW() - make_interval(secs => %s)
+                  GROUP BY bucket
+                )
+                SELECT
+                  s.bucket_start AS timestamp,
+                  COALESCE(e.c4xx, 0)::int AS client_errors,
+                  (COALESCE(e.c5xx, 0) + COALESCE(j.jobs_failed, 0))::int AS server_errors
+                FROM series s
+                LEFT JOIN events e ON date_trunc('second', s.bucket_start) = date_trunc('second', e.bucket)
+                LEFT JOIN jobs j   ON date_trunc('second', s.bucket_start) = date_trunc('second', j.bucket)
+                ORDER BY s.bucket_start
+                """,
+                (
+                    total_seconds, interval_seconds,
+                    interval_seconds, interval_seconds, total_seconds,
+                    interval_seconds, interval_seconds, total_seconds,
+                ),
+            )
+            rows = cur.fetchall()
+
+    data = [
+        {
+            "timestamp": r["timestamp"].isoformat() if r["timestamp"] else None,
+            "client_errors": int(r["client_errors"] or 0),
+            "server_errors": int(r["server_errors"] or 0),
+        }
+        for r in rows
+    ]
+
+    return success_response(data={
+        "period": period,
+        "interval_seconds": interval_seconds,
+        "data": data,
+    })
+
+
+@router.get("/monitoring/components", summary="시스템 구성 요소 상세 상태")
+def get_component_status(_=Depends(require_admin_access)):
+    """DB / Valkey / Vector DB / Job Runner 상태와 응답 시간을 반환한다."""
+    import time
+
+    components = []
+
+    # 1. PostgreSQL
+    db_status, db_latency_ms = "DOWN", None
+    db_meta: dict[str, Any] = {}
+    try:
+        t0 = time.perf_counter()
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 AS ok")
+                cur.fetchone()
+                # 활성 연결 수
+                cur.execute("SELECT count(*)::int AS c FROM pg_stat_activity WHERE state = 'active'")
+                db_meta["active_connections"] = (cur.fetchone() or {}).get("c", 0)
+        db_latency_ms = round((time.perf_counter() - t0) * 1000, 1)
+        db_status = "HEALTHY"
+    except Exception as exc:
+        db_meta["error"] = str(exc)[:200]
+    components.append({
+        "name": "PostgreSQL",
+        "status": db_status,
+        "latency_ms": db_latency_ms,
+        "metadata": db_meta,
+    })
+
+    # 2. Valkey
+    valkey_status, valkey_latency_ms = "DOWN", None
+    valkey_meta: dict[str, Any] = {}
+    try:
+        from app.cache import get_valkey
+        t0 = time.perf_counter()
+        client = get_valkey()
+        if client.ping():
+            valkey_latency_ms = round((time.perf_counter() - t0) * 1000, 1)
+            valkey_status = "HEALTHY"
+            try:
+                info = client.info("memory")
+                valkey_meta["used_memory_human"] = info.get("used_memory_human")
+            except Exception:
+                pass
+    except Exception as exc:
+        valkey_meta["error"] = str(exc)[:200]
+    components.append({
+        "name": "Valkey",
+        "status": valkey_status,
+        "latency_ms": valkey_latency_ms,
+        "metadata": valkey_meta,
+    })
+
+    # 3. Vector DB (pgvector — DB와 동일 인스턴스, 인덱스 행 수만 보고)
+    vec_status, vec_latency_ms = "UNKNOWN", None
+    vec_meta: dict[str, Any] = {}
+    try:
+        t0 = time.perf_counter()
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                        COUNT(*) FILTER (WHERE is_current = TRUE AND embedding IS NOT NULL)::int AS embedded_count
+                    FROM document_chunks
+                """)
+                row = cur.fetchone()
+                vec_meta["embedded_chunks"] = row["embedded_count"] if row else 0
+        vec_latency_ms = round((time.perf_counter() - t0) * 1000, 1)
+        vec_status = "HEALTHY"
+    except Exception as exc:
+        vec_meta["error"] = str(exc)[:200]
+    components.append({
+        "name": "Vector DB (pgvector)",
+        "status": vec_status,
+        "latency_ms": vec_latency_ms,
+        "metadata": vec_meta,
+    })
+
+    # 4. Job Runner (background_jobs PENDING/RUNNING 카운트)
+    job_status, job_latency_ms = "DOWN", None
+    job_meta: dict[str, Any] = {}
+    try:
+        t0 = time.perf_counter()
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                        COUNT(*) FILTER (WHERE status IN ('PENDING','RUNNING'))::int AS pending,
+                        COUNT(*) FILTER (WHERE status = 'FAILED' AND created_at > NOW() - INTERVAL '24 hours')::int AS failed_24h
+                    FROM background_jobs
+                """)
+                row = cur.fetchone()
+                if row:
+                    job_meta["pending"] = row["pending"]
+                    job_meta["failed_24h"] = row["failed_24h"]
+        job_latency_ms = round((time.perf_counter() - t0) * 1000, 1)
+        job_status = "HEALTHY"
+    except Exception as exc:
+        job_meta["error"] = str(exc)[:200]
+    components.append({
+        "name": "Job Runner",
+        "status": job_status,
+        "latency_ms": job_latency_ms,
+        "metadata": job_meta,
+    })
+
+    return success_response(data={"components": components})
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Phase 14-13: 알림 관리 API
+# ═══════════════════════════════════════════════════════════════════════════
+
+_ALERT_SEVERITIES = {"info", "warning", "critical"}
+_ALERT_CHANNELS = {"email", "webhook"}
+_ALERT_STATUSES = {"firing", "resolved"}
+_ALERT_OPERATORS = {"gt", "gte", "lt", "lte", "eq", "ne"}
+
+
+class AlertConditionBody(BaseModel):
+    operator: str
+    threshold: float
+    duration_seconds: Optional[int] = None
+
+
+class CreateAlertRuleBody(BaseModel):
+    name: str = Field(..., min_length=1, max_length=255)
+    description: Optional[str] = Field(None, max_length=2000)
+    metric_name: str = Field(..., min_length=1, max_length=255)
+    condition: AlertConditionBody
+    severity: str
+    channels: list[str] = Field(default_factory=list)
+    channel_config: dict[str, Any] = Field(default_factory=dict)
+    enabled: bool = True
+
+
+class UpdateAlertRuleBody(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=255)
+    description: Optional[str] = Field(None, max_length=2000)
+    metric_name: Optional[str] = Field(None, min_length=1, max_length=255)
+    condition: Optional[AlertConditionBody] = None
+    severity: Optional[str] = None
+    channels: Optional[list[str]] = None
+    channel_config: Optional[dict[str, Any]] = None
+    enabled: Optional[bool] = None
+
+
+def _validate_rule_payload(
+    *,
+    metric_name: Optional[str],
+    condition: Optional[AlertConditionBody],
+    severity: Optional[str],
+    channels: Optional[list[str]],
+) -> None:
+    """규칙 필드 화이트리스트 검증 (400/422)."""
+    from app.services.alert_evaluator import _METRIC_LABELS  # 내부 화이트리스트
+
+    if metric_name is not None and metric_name not in _METRIC_LABELS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"지원하지 않는 메트릭입니다: {metric_name}",
+        )
+    if condition is not None:
+        if condition.operator not in _ALERT_OPERATORS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"지원하지 않는 연산자입니다: {condition.operator}",
+            )
+        try:
+            float(condition.threshold)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422, detail="threshold 는 숫자여야 합니다.")
+    if severity is not None and severity not in _ALERT_SEVERITIES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"지원하지 않는 심각도입니다. (허용: {', '.join(sorted(_ALERT_SEVERITIES))})",
+        )
+    if channels is not None:
+        for ch in channels:
+            if ch not in _ALERT_CHANNELS:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"지원하지 않는 채널입니다: {ch}",
+                )
+
+
+@router.get("/alerts/metrics", summary="지원되는 메트릭 목록")
+def list_alert_metrics(_=Depends(require_admin_access)):
+    from app.services.alert_evaluator import list_supported_metrics
+    return success_response(data={"metrics": list_supported_metrics()})
+
+
+@router.get("/alerts/rules", summary="알림 규칙 목록")
+def list_alert_rules(
+    enabled_only: bool = Query(default=False),
+    _=Depends(require_admin_access),
+):
+    from app.repositories.alert_repository import alert_repository
+    with get_db() as conn:
+        rules = alert_repository.list_rules(conn, enabled_only=enabled_only)
+    return success_response(data=rules)
+
+
+@router.post("/alerts/rules", summary="알림 규칙 생성")
+def create_alert_rule(
+    body: CreateAlertRuleBody,
+    actor: ActorContext = Depends(resolve_current_actor),
+    _=Depends(require_admin_access),
+):
+    from app.audit.emitter import audit_emitter
+    from app.repositories.alert_repository import alert_repository
+
+    _validate_rule_payload(
+        metric_name=body.metric_name,
+        condition=body.condition,
+        severity=body.severity,
+        channels=body.channels,
+    )
+
+    with get_db() as conn:
+        rule = alert_repository.create_rule(
+            conn,
+            name=body.name,
+            description=body.description,
+            metric_name=body.metric_name,
+            condition=body.condition.model_dump(),
+            severity=body.severity,
+            channels=body.channels,
+            channel_config=body.channel_config,
+            enabled=body.enabled,
+            created_by=actor.actor_id,
+        )
+        conn.commit()
+
+    try:
+        audit_emitter.emit(
+            event_type="ALERT_RULE_CREATED",
+            action="admin.write",
+            actor_id=actor.actor_id,
+            actor_role=actor.role,
+            resource_type="alert_rule",
+            resource_id=rule["id"],
+            result="success",
+            metadata={"name": rule["name"], "severity": rule["severity"]},
+        )
+    except Exception:
+        pass
+
+    return success_response(data=rule)
+
+
+@router.get("/alerts/rules/{rule_id}", summary="알림 규칙 상세")
+def get_alert_rule(
+    rule_id: str,
+    _=Depends(require_admin_access),
+):
+    from app.repositories.alert_repository import alert_repository
+    # UUID 형식 검증 (SQL injection 2중 방어)
+    if not re.match(r"^[0-9a-f\-]{36}$", rule_id, re.IGNORECASE):
+        raise HTTPException(status_code=422, detail="유효하지 않은 rule_id 형식입니다.")
+    with get_db() as conn:
+        rule = alert_repository.get_rule(conn, rule_id)
+    if rule is None:
+        raise HTTPException(status_code=404, detail="알림 규칙을 찾을 수 없습니다.")
+    return success_response(data=rule)
+
+
+@router.patch("/alerts/rules/{rule_id}", summary="알림 규칙 수정")
+def update_alert_rule(
+    rule_id: str,
+    body: UpdateAlertRuleBody,
+    actor: ActorContext = Depends(resolve_current_actor),
+    _=Depends(require_admin_access),
+):
+    from app.audit.emitter import audit_emitter
+    from app.repositories.alert_repository import alert_repository
+
+    if not re.match(r"^[0-9a-f\-]{36}$", rule_id, re.IGNORECASE):
+        raise HTTPException(status_code=422, detail="유효하지 않은 rule_id 형식입니다.")
+
+    _validate_rule_payload(
+        metric_name=body.metric_name,
+        condition=body.condition,
+        severity=body.severity,
+        channels=body.channels,
+    )
+
+    fields: dict[str, Any] = {}
+    for k in ("name", "description", "metric_name", "severity",
+              "channels", "channel_config", "enabled"):
+        v = getattr(body, k)
+        if v is not None:
+            fields[k] = v
+    if body.condition is not None:
+        fields["condition"] = body.condition.model_dump()
+
+    with get_db() as conn:
+        existing = alert_repository.get_rule(conn, rule_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="알림 규칙을 찾을 수 없습니다.")
+        updated = alert_repository.update_rule(conn, rule_id, fields)
+        conn.commit()
+
+    try:
+        audit_emitter.emit(
+            event_type="ALERT_RULE_UPDATED",
+            action="admin.write",
+            actor_id=actor.actor_id,
+            actor_role=actor.role,
+            resource_type="alert_rule",
+            resource_id=rule_id,
+            result="success",
+            metadata={"changed_fields": list(fields.keys())},
+        )
+    except Exception:
+        pass
+
+    return success_response(data=updated)
+
+
+@router.delete("/alerts/rules/{rule_id}", summary="알림 규칙 삭제")
+def delete_alert_rule(
+    rule_id: str,
+    actor: ActorContext = Depends(resolve_current_actor),
+    _=Depends(require_admin_access),
+):
+    from app.audit.emitter import audit_emitter
+    from app.repositories.alert_repository import alert_repository
+
+    if not re.match(r"^[0-9a-f\-]{36}$", rule_id, re.IGNORECASE):
+        raise HTTPException(status_code=422, detail="유효하지 않은 rule_id 형식입니다.")
+
+    with get_db() as conn:
+        deleted = alert_repository.delete_rule(conn, rule_id)
+        conn.commit()
+    if not deleted:
+        raise HTTPException(status_code=404, detail="알림 규칙을 찾을 수 없습니다.")
+
+    try:
+        audit_emitter.emit(
+            event_type="ALERT_RULE_DELETED",
+            action="admin.write",
+            actor_id=actor.actor_id,
+            actor_role=actor.role,
+            resource_type="alert_rule",
+            resource_id=rule_id,
+            result="success",
+        )
+    except Exception:
+        pass
+
+    return success_response(data={"deleted": True})
+
+
+@router.get("/alerts/history", summary="알림 이력 조회")
+def list_alert_history(
+    status: Optional[str] = Query(default=None),
+    severity: Optional[str] = Query(default=None),
+    from_ts: Optional[str] = Query(default=None, alias="from"),
+    to_ts: Optional[str] = Query(default=None, alias="to"),
+    page: int = Query(default=1, ge=1, le=10000),
+    page_size: int = Query(default=50, ge=1, le=500),
+    _=Depends(require_admin_access),
+):
+    from app.repositories.alert_repository import alert_repository
+
+    if status is not None and status not in _ALERT_STATUSES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"지원하지 않는 상태입니다. (허용: {', '.join(sorted(_ALERT_STATUSES))})",
+        )
+    if severity is not None and severity not in _ALERT_SEVERITIES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"지원하지 않는 심각도입니다. (허용: {', '.join(sorted(_ALERT_SEVERITIES))})",
+        )
+
+    offset = (page - 1) * page_size
+    with get_db() as conn:
+        items, total = alert_repository.list_history(
+            conn,
+            status=status,
+            severity=severity,
+            from_ts=from_ts,
+            to_ts=to_ts,
+            limit=page_size,
+            offset=offset,
+        )
+    return success_response(data={
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    })
+
+
+@router.post("/alerts/history/{history_id}/acknowledge", summary="알림 확인")
+def acknowledge_alert(
+    history_id: str,
+    actor: ActorContext = Depends(resolve_current_actor),
+    _=Depends(require_admin_access),
+):
+    from app.audit.emitter import audit_emitter
+    from app.repositories.alert_repository import alert_repository
+
+    if not re.match(r"^[0-9a-f\-]{36}$", history_id, re.IGNORECASE):
+        raise HTTPException(status_code=422, detail="유효하지 않은 history_id 형식입니다.")
+
+    with get_db() as conn:
+        acked = alert_repository.acknowledge(conn, history_id, actor.actor_id)
+        conn.commit()
+    if acked is None:
+        raise HTTPException(status_code=404, detail="알림 이력을 찾을 수 없거나 이미 확인되었습니다.")
+
+    try:
+        audit_emitter.emit(
+            event_type="ALERT_ACKNOWLEDGED",
+            action="admin.write",
+            actor_id=actor.actor_id,
+            actor_role=actor.role,
+            resource_type="alert_history",
+            resource_id=history_id,
+            result="success",
+        )
+    except Exception:
+        pass
+
+    return success_response(data=acked)
+
+
+@router.post("/alerts/evaluate", summary="알림 규칙 즉시 평가 (수동)")
+def evaluate_alerts_now(_=Depends(require_admin_access)):
+    from app.services.alert_evaluator import alert_evaluator
+    stats = alert_evaluator.evaluate_all()
+    return success_response(data=stats)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Phase 14-14: 배치 작업 스케줄 관리 API
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# 스케줄 정의(=job_schedules)는 ID 기반 (e.g. 'reindex_all'), 실행 기록은
+# 기존 background_jobs 를 재사용한다 (job_type = schedule.id).
+# 경로는 `/jobs/schedules/*` 네임스페이스로 분리 — 기존 `/jobs/{uuid}` 와 충돌 방지.
+
+_SCHEDULE_ID_RE = re.compile(r"^[a-z0-9_]{1,100}$")
+
+
+class UpdateJobScheduleBody(BaseModel):
+    schedule: Optional[str] = Field(None, min_length=1, max_length=120)
+    enabled: Optional[bool] = None
+
+
+def _validate_schedule_id(schedule_id: str) -> None:
+    if not _SCHEDULE_ID_RE.match(schedule_id):
+        raise HTTPException(status_code=422, detail="유효하지 않은 스케줄 ID 형식입니다.")
+
+
+def _schedule_with_runs(
+    conn,
+    schedule: dict[str, Any],
+    *,
+    include_runs: bool = True,
+) -> dict[str, Any]:
+    """스케줄 dict 에 cron 설명 및 최근 실행 이력(옵션)을 덧붙인다."""
+    from app.services.cron_util import describe_ko, next_run
+    from app.repositories.job_schedule_repository import job_schedule_repository
+
+    result = dict(schedule)
+    cron = schedule.get("schedule")
+    if cron:
+        try:
+            result["schedule_description"] = describe_ko(cron)
+        except Exception:
+            result["schedule_description"] = None
+        if schedule.get("enabled") and not schedule.get("next_run_at"):
+            try:
+                result["next_run_at"] = next_run(cron)
+            except Exception:
+                pass
+    else:
+        result["schedule_description"] = None
+
+    # 현재 상태 ('idle'/'running'/'failed')
+    running = job_schedule_repository.get_running_run(conn, schedule["id"])
+    if running:
+        result["status"] = "running"
+        result["current_run_id"] = running["id"]
+    elif schedule.get("last_run_result") == "failed":
+        result["status"] = "failed"
+    else:
+        result["status"] = "idle"
+
+    if include_runs:
+        result["recent_runs"] = job_schedule_repository.list_recent_runs(
+            conn, schedule["id"], limit=10
+        )
+    return result
+
+
+@router.get("/jobs/schedules", summary="배치 작업 스케줄 목록")
+def list_job_schedules(_=Depends(require_admin_access)):
+    from app.repositories.job_schedule_repository import job_schedule_repository
+    with get_db() as conn:
+        schedules = job_schedule_repository.list_schedules(conn)
+        items = [_schedule_with_runs(conn, s, include_runs=False) for s in schedules]
+    return success_response(data=items)
+
+
+@router.get("/jobs/schedules/{job_id}", summary="배치 작업 스케줄 상세")
+def get_job_schedule(job_id: str, _=Depends(require_admin_access)):
+    from app.repositories.job_schedule_repository import job_schedule_repository
+    _validate_schedule_id(job_id)
+    with get_db() as conn:
+        sched = job_schedule_repository.get_schedule(conn, job_id)
+        if sched is None:
+            raise HTTPException(status_code=404, detail="스케줄을 찾을 수 없습니다.")
+        result = _schedule_with_runs(conn, sched, include_runs=True)
+    return success_response(data=result)
+
+
+@router.post("/jobs/schedules/{job_id}/run", summary="배치 작업 수동 실행", status_code=202)
+def run_job_schedule(
+    job_id: str,
+    actor: ActorContext = Depends(resolve_current_actor),
+    _=Depends(require_admin_access),
+):
+    from app.audit.emitter import audit_emitter
+    from app.repositories.job_schedule_repository import job_schedule_repository
+
+    _validate_schedule_id(job_id)
+    with get_db() as conn:
+        sched = job_schedule_repository.get_schedule(conn, job_id)
+        if sched is None:
+            raise HTTPException(status_code=404, detail="스케줄을 찾을 수 없습니다.")
+        running = job_schedule_repository.get_running_run(conn, job_id)
+        if running:
+            raise HTTPException(status_code=409, detail="이미 실행 중입니다.")
+        run_id = job_schedule_repository.enqueue_manual_run(
+            conn, job_id, requester_id=actor.actor_id
+        )
+        conn.commit()
+
+    try:
+        audit_emitter.emit(
+            event_type="JOB_SCHEDULE_RUN",
+            action="admin.write",
+            actor_id=actor.actor_id,
+            actor_role=actor.role,
+            resource_type="job_schedule",
+            resource_id=job_id,
+            result="success",
+            metadata={"run_id": run_id},
+        )
+    except Exception:
+        pass
+
+    return success_response(data={"message": "작업이 시작되었습니다", "run_id": run_id})
+
+
+@router.patch("/jobs/schedules/{job_id}", summary="배치 작업 스케줄 수정")
+def update_job_schedule(
+    job_id: str,
+    body: UpdateJobScheduleBody,
+    actor: ActorContext = Depends(resolve_current_actor),
+    _=Depends(require_admin_access),
+):
+    from app.audit.emitter import audit_emitter
+    from app.repositories.job_schedule_repository import job_schedule_repository
+    from app.services.cron_util import validate as cron_validate, next_run as cron_next
+
+    _validate_schedule_id(job_id)
+
+    fields: dict[str, Any] = {}
+    if body.schedule is not None:
+        try:
+            cron_validate(body.schedule)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=f"유효하지 않은 cron: {e}")
+        fields["schedule"] = body.schedule
+        try:
+            fields["next_run_at"] = cron_next(body.schedule)
+        except Exception:
+            fields["next_run_at"] = None
+    if body.enabled is not None:
+        fields["enabled"] = body.enabled
+
+    with get_db() as conn:
+        existing = job_schedule_repository.get_schedule(conn, job_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="스케줄을 찾을 수 없습니다.")
+        updated = job_schedule_repository.update_schedule(conn, job_id, fields)
+        conn.commit()
+
+    try:
+        audit_emitter.emit(
+            event_type="JOB_SCHEDULE_UPDATED",
+            action="admin.write",
+            actor_id=actor.actor_id,
+            actor_role=actor.role,
+            resource_type="job_schedule",
+            resource_id=job_id,
+            result="success",
+            metadata={"changed_fields": list(fields.keys())},
+        )
+    except Exception:
+        pass
+
+    return success_response(data=updated)
+
+
+@router.post("/jobs/schedules/{job_id}/cancel", summary="배치 작업 취소")
+def cancel_job_schedule(
+    job_id: str,
+    actor: ActorContext = Depends(resolve_current_actor),
+    _=Depends(require_admin_access),
+):
+    from app.audit.emitter import audit_emitter
+    from app.repositories.job_schedule_repository import job_schedule_repository
+
+    _validate_schedule_id(job_id)
+    with get_db() as conn:
+        sched = job_schedule_repository.get_schedule(conn, job_id)
+        if sched is None:
+            raise HTTPException(status_code=404, detail="스케줄을 찾을 수 없습니다.")
+        cancelled_id = job_schedule_repository.mark_cancel_requested(conn, job_id)
+        if cancelled_id is None:
+            raise HTTPException(status_code=400, detail="실행 중인 작업이 없습니다.")
+        conn.commit()
+
+    try:
+        audit_emitter.emit(
+            event_type="JOB_SCHEDULE_CANCELLED",
+            action="admin.write",
+            actor_id=actor.actor_id,
+            actor_role=actor.role,
+            resource_type="job_schedule",
+            resource_id=job_id,
+            result="success",
+            metadata={"cancelled_run_id": cancelled_id},
+        )
+    except Exception:
+        pass
+
+    return success_response(data={"message": "작업 취소가 요청되었습니다", "run_id": cancelled_id})
+
+
+@router.post("/jobs/schedules/cron/preview", summary="Cron 표현식 미리보기")
+def preview_cron(body: dict[str, Any], _=Depends(require_admin_access)):
+    """사용자 입력 cron 을 검증하고 한국어 설명 + 다음 실행 3회를 반환."""
+    from app.services.cron_util import validate as cron_validate, describe_ko, next_run
+
+    expr = body.get("schedule") if isinstance(body, dict) else None
+    if not isinstance(expr, str):
+        raise HTTPException(status_code=422, detail="schedule 필드가 필요합니다.")
+    try:
+        cron_validate(expr)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    description = describe_ko(expr)
+    nexts: list[str] = []
+    from datetime import datetime as _dt, timezone as _tz
+    # Python 3.12+에서 datetime.utcnow() 는 deprecated — aware datetime 사용
+    cursor = _dt.now(_tz.utc).replace(tzinfo=None)
+    for _ in range(3):
+        nxt = next_run(expr, cursor)
+        if nxt is None:
+            break
+        nexts.append(nxt.isoformat() + "Z")
+        cursor = nxt
+    return success_response(data={"description": description, "next_runs": nexts})
+
+
+# ===========================================================================
+# Phase 14-15: API 키 CRUD 및 감사 로그 필터 메타데이터
+# ===========================================================================
+#
+# 설계 원칙:
+#   - API 키 전체 문자열은 생성 응답에서 단 한 번만 반환 (DB 에는 SHA-256 해시만 저장)
+#   - 폐기는 soft-revoke: status = 'REVOKED' 로 표시 (과거 감사 흔적 보존)
+#   - 감사 이벤트 (API_KEY_ISSUED / API_KEY_REVOKED) 발행
+#   - 감사 로그 필터 드롭다운을 위한 이벤트 유형 카탈로그 엔드포인트 제공
+# ===========================================================================
+
+_API_KEY_BYTES = 32            # 256bit → base64url 기본 ~43자, `mk_` prefix 포함 46자
+_API_KEY_NAME_MAX = 100
+_API_KEY_DESC_MAX = 500
+_VALID_API_KEY_SCOPES = {"READ_ONLY", "READ_WRITE", "admin.read", "admin.write"}
+_VALID_API_KEY_EXPIRY_DAYS = {30, 90, 180, 365, 0}  # 0 == 무기한
+
+_API_KEY_NAME_RE = re.compile(r"^[\w\- .]{1,100}$", re.UNICODE)
+
+
+class CreateApiKeyBody(BaseModel):
+    name: str = Field(..., min_length=1, max_length=_API_KEY_NAME_MAX)
+    description: Optional[str] = Field(default=None, max_length=_API_KEY_DESC_MAX)
+    scope: str = Field(default="READ_ONLY")
+    expires_in_days: int = Field(default=90, ge=0, le=3650)
+
+
+class RevokeApiKeyBody(BaseModel):
+    reason: Optional[str] = Field(default=None, max_length=500)
+
+
+def _generate_api_key() -> tuple[str, str, str]:
+    """(full_key, prefix, hash) 생성. full_key 는 UI 에 단 한 번만 반환."""
+    raw = _secrets.token_urlsafe(_API_KEY_BYTES)
+    # `mk_` 접두어 + url-safe base64 본체 (영/숫자/`-`/`_`)
+    full = f"mk_{raw}"
+    prefix = full[:8]
+    digest = hashlib.sha256(full.encode("utf-8")).hexdigest()
+    return full, prefix, digest
+
+
+def _validate_api_key_name(name: str) -> str:
+    name = name.strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="이름을 입력하세요.")
+    if not _API_KEY_NAME_RE.match(name):
+        raise HTTPException(status_code=422, detail="이름에 허용되지 않은 문자가 포함되어 있습니다.")
+    return name
+
+
+def _validate_api_key_scope(scope: str) -> str:
+    if scope not in _VALID_API_KEY_SCOPES:
+        raise HTTPException(status_code=422, detail=f"지원되지 않는 scope: {scope}")
+    return scope
+
+
+@router.post("/api-keys", summary="API 키 생성", status_code=201)
+def create_api_key(
+    body: CreateApiKeyBody,
+    actor: ActorContext = Depends(resolve_current_actor),
+    _=Depends(require_admin_access),
+):
+    """API 키를 생성한다. 응답에 포함된 full_key 는 **한 번만** 반환된다.
+
+    - SHA-256 해시만 저장 (원본 복구 불가)
+    - expires_in_days == 0 → 무기한
+    - 감사 이벤트 API_KEY_ISSUED 발행
+    """
+    from app.audit.emitter import audit_emitter
+
+    name = _validate_api_key_name(body.name)
+    scope = _validate_api_key_scope(body.scope)
+    description = (body.description or "").strip() or None
+
+    full_key, prefix, digest = _generate_api_key()
+    issuer_id = str(actor.actor_id) if actor.actor_id else None
+    issuer_name = getattr(actor, "actor_name", None) if actor else None
+
+    expires_at_sql = "NULL" if body.expires_in_days == 0 else "NOW() + (%s || ' days')::interval"
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            if body.expires_in_days == 0:
+                cur.execute(
+                    """
+                    INSERT INTO api_keys (name, description, key_prefix, key_hash,
+                                          scope, status, issuer_id, issuer_name)
+                    VALUES (%s, %s, %s, %s, %s, 'ACTIVE', %s, %s)
+                    RETURNING id, name, description, key_prefix, scope, status,
+                              issuer_name, last_used_at, last_used_ip, use_count,
+                              expires_at, created_at
+                    """,
+                    (name, description, prefix, digest, scope, issuer_id, issuer_name),
+                )
+            else:
+                cur.execute(
+                    f"""
+                    INSERT INTO api_keys (name, description, key_prefix, key_hash,
+                                          scope, status, issuer_id, issuer_name, expires_at)
+                    VALUES (%s, %s, %s, %s, %s, 'ACTIVE', %s, %s, {expires_at_sql})
+                    RETURNING id, name, description, key_prefix, scope, status,
+                              issuer_name, last_used_at, last_used_ip, use_count,
+                              expires_at, created_at
+                    """,
+                    (name, description, prefix, digest, scope, issuer_id, issuer_name, str(body.expires_in_days)),
+                )
+            row = cur.fetchone()
+
+    # 감사 이벤트 (실패 무시)
+    try:
+        audit_emitter.emit(
+            event_type="API_KEY_ISSUED",
+            action="api_key.create",
+            actor_id=issuer_id,
+            actor_role=getattr(actor, "role", None),
+            resource_type="api_key",
+            resource_id=str(row["id"]),
+            result="success",
+            metadata={"name": name, "scope": scope, "expires_in_days": body.expires_in_days},
+        )
+    except Exception:  # pragma: no cover
+        logger.exception("API_KEY_ISSUED 감사 이벤트 발행 실패")
+
+    return success_response(
+        data={
+            "id": str(row["id"]),
+            "name": row["name"],
+            "description": row["description"],
+            "key_prefix": row["key_prefix"],
+            "scope": row["scope"],
+            "status": row["status"],
+            "issuer_name": row["issuer_name"],
+            "last_used_at": row["last_used_at"].isoformat() if row["last_used_at"] else None,
+            "last_used_ip": row["last_used_ip"],
+            "use_count": row["use_count"],
+            "expires_at": row["expires_at"].isoformat() if row["expires_at"] else None,
+            "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+            # ⚠️ full_key 는 한 번만 반환 (UI 도 저장하지 않음)
+            "full_key": full_key,
+        }
+    )
+
+
+@router.post("/api-keys/{key_id}/revoke", summary="API 키 폐기")
+def revoke_api_key(
+    key_id: str,
+    body: RevokeApiKeyBody = Body(default_factory=RevokeApiKeyBody),
+    actor: ActorContext = Depends(resolve_current_actor),
+    _=Depends(require_admin_access),
+):
+    from app.audit.emitter import audit_emitter
+
+    # UUID 형식 검증
+    try:
+        import uuid as _uuid
+        _uuid.UUID(key_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=422, detail="잘못된 key_id 형식")
+
+    reason = (body.reason or "").strip() or None
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE api_keys
+                SET status = 'REVOKED', revoked_reason = %s
+                WHERE id = %s AND status = 'ACTIVE'
+                RETURNING id, name, key_prefix
+                """,
+                (reason, key_id),
+            )
+            row = cur.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="키를 찾을 수 없거나 이미 폐기됨")
+
+    try:
+        audit_emitter.emit(
+            event_type="API_KEY_REVOKED",
+            action="api_key.revoke",
+            actor_id=str(actor.actor_id) if actor.actor_id else None,
+            actor_role=getattr(actor, "role", None),
+            resource_type="api_key",
+            resource_id=str(row["id"]),
+            result="success",
+            metadata={"name": row["name"], "key_prefix": row["key_prefix"], "reason": reason},
+        )
+    except Exception:  # pragma: no cover
+        logger.exception("API_KEY_REVOKED 감사 이벤트 발행 실패")
+
+    return success_response(data={"id": str(row["id"]), "name": row["name"], "status": "REVOKED"})
+
+
+# --- 감사 로그 메타데이터 ---
+
+# 필터 드롭다운에 노출할 감사 이벤트 유형 카탈로그 (라벨은 한국어)
+_AUDIT_EVENT_TYPES: list[tuple[str, str]] = [
+    ("USER_LOGIN",                  "사용자 로그인"),
+    ("USER_LOGIN_FAILED",           "로그인 실패"),
+    ("USER_CREATED",                "사용자 생성"),
+    ("USER_DEACTIVATED",            "사용자 비활성화"),
+    ("USER_ROLE_CHANGED",           "사용자 역할 변경"),
+    ("ROLE_CHANGED",                "역할 변경"),
+    ("PERMISSION_CHANGED",          "권한 변경"),
+    ("DOCUMENT_CREATED",            "문서 생성"),
+    ("DOCUMENT_UPDATED",            "문서 수정"),
+    ("DOCUMENT_PUBLISHED",          "문서 게시"),
+    ("DOCUMENT_DELETED",            "문서 삭제"),
+    ("DOCUMENT_FORCE_DELETED",      "문서 강제 삭제"),
+    ("DOCUMENT_TYPE_CREATED",       "문서 유형 생성"),
+    ("DOCUMENT_TYPE_DEACTIVATED",   "문서 유형 비활성화"),
+    ("API_KEY_ISSUED",              "API 키 발급"),
+    ("API_KEY_REVOKED",             "API 키 폐기"),
+    ("JOB_SCHEDULE_RUN",            "배치 수동 실행"),
+    ("JOB_SCHEDULE_UPDATED",        "배치 스케줄 변경"),
+    ("JOB_SCHEDULE_CANCELLED",      "배치 취소"),
+    ("JOB_FORCE_STOPPED",           "작업 강제 중지"),
+    ("ALERT_RULE_CREATED",          "알림 규칙 생성"),
+    ("ALERT_RULE_UPDATED",          "알림 규칙 수정"),
+    ("ALERT_RULE_DELETED",          "알림 규칙 삭제"),
+    ("SETTINGS_UPDATED",            "설정 변경"),
+    ("ADMIN_ACCOUNT_MODIFIED",      "관리자 계정 변경"),
+]
+
+
+@router.get("/audit-logs/event-types", summary="감사 이벤트 유형 카탈로그")
+def list_audit_event_types(_=Depends(require_admin_access)):
+    """감사 로그 필터 드롭다운용 이벤트 유형 목록 (정적 카탈로그).
+
+    실제 발생한 이벤트 유형만 노출하지 않고 전체 카탈로그를 반환 —
+    운영 중 새로 나타날 유형에 대비.
+    """
+    return success_response(
+        data={"items": [{"value": v, "label": label} for v, label in _AUDIT_EVENT_TYPES]}
+    )
