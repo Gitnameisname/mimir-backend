@@ -88,8 +88,10 @@ async def rag_answer(
     )
 
     actor_role = getattr(actor, "role", None)
-    # S2 원칙: actor_type 기록 (사용자 또는 AI 에이전트)
-    actor_type = getattr(actor, "actor_type", "user") or "user"
+    # S2 원칙 ⑤: actor_type 기록 — request body 값 우선, 없으면 auth 컨텍스트에서 결정
+    _auth_actor_type = getattr(actor.actor_type, "value", str(actor.actor_type)).lower()
+    _auth_actor_type_str = "agent" if _auth_actor_type in ("service", "agent") else "user"
+    actor_type = body.actor_type or _auth_actor_type_str
     # IDOR 방지: conversation_id 소유권 검증에 사용할 actor_id
     actor_id = getattr(actor, "actor_id", None)
 
@@ -123,6 +125,23 @@ async def rag_answer(
             )
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc))
+
+    from app.audit.emitter import audit_emitter
+    audit_emitter.emit(
+        event_type="rag.answer",
+        action="rag.answer",
+        actor_id=str(actor_id) if actor_id else None,
+        actor_type=actor_type,
+        resource_type="conversation",
+        resource_id=str(body.conversation_id) if body.conversation_id else None,
+        result="success",
+        request_id=getattr(request.state.context, "request_id", None),
+        metadata={
+            "turn_number": result.turn_number,
+            "turn_id": result.turn_id,
+            "rewritten_query": result.rewritten_query,
+        },
+    )
 
     from app.api.responses import success_response
     return success_response(data=result.model_dump())

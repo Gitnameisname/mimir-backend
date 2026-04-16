@@ -156,6 +156,7 @@ class RAGRequest(BaseModel):
 
     S1 하위호환: conversation_id 없으면 단발 쿼리 모드.
     S2 확장: conversation_id 있으면 멀티턴 모드 (QueryRewriter, Citation 캐시 활성화).
+    S2 원칙 ⑤: actor_type 명시 지원 (user 또는 agent).
     """
     query: str = Field(..., min_length=1, max_length=2000, description="사용자 질의")
     top_k: int = Field(10, ge=1, le=50, description="검색 결과 수")
@@ -163,6 +164,11 @@ class RAGRequest(BaseModel):
     conversation_id: Optional[UUID] = Field(
         None,
         description="멀티턴 대화 ID — 제공 시 멀티턴 모드 활성화",
+    )
+    actor_type: Optional[str] = Field(
+        None,
+        description="요청 주체 유형 (user | agent). 미지정 시 auth 컨텍스트에서 결정.",
+        pattern="^(user|agent)$",
     )
 
 
@@ -177,6 +183,7 @@ class RAGResponse(BaseModel):
     """RAG 질의 응답 — S2 멀티턴 필드 포함.
 
     S1 하위호환: rewritten_query, context_compressed, turn_number는 S1 클라이언트가 무시.
+    S2 확장: turn_id — 멀티턴 모드에서 conversations/turns 도메인에 저장된 Turn UUID.
     """
     answer: str
     citations: List[RAGCitationInfo] = Field(default_factory=list)
@@ -186,3 +193,7 @@ class RAGResponse(BaseModel):
     )
     context_compressed: bool = Field(False, description="대화 요약 사용 여부")
     turn_number: int = Field(1, description="현재 대화 턴 번호")
+    turn_id: Optional[str] = Field(
+        None,
+        description="멀티턴 모드에서 저장된 Turn UUID (conversations/turns 도메인)",
+    )

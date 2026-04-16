@@ -25,6 +25,8 @@ from app.services.retrieval.citation_cache import (
 )
 from app.services.retrieval.conversation_compressor import ConversationCompressor
 from app.services.retrieval.query_rewriter import QueryRewriter
+from app.repositories.conversation_repository import ConversationRepository, TurnRepository
+from app.audit.emitter import audit_emitter
 
 logger = logging.getLogger(__name__)
 
@@ -143,16 +145,28 @@ class MultiturnRAGService:
             actor_role=actor_role,
         )
 
-        # 4. 대화 이력에 이번 턴 저장
+        # 4. 대화 이력에 이번 턴 저장 (CitationCache)
         raw_citations = [ci.citation for ci in citation_infos]
-        turn = ConversationTurn(
+        cache_turn = ConversationTurn(
             turn_number=turn_number,
             query=query,
             rewritten_query=rewritten_query if rewritten_query != query else None,
             citations=raw_citations,
             answer=answer_text,
         )
-        self._cache.add_turn(conversation_id, turn, actor_id=actor_id)
+        self._cache.add_turn(conversation_id, cache_turn, actor_id=actor_id)
+
+        # 5. Phase 3 S2: conversations/turns 도메인에 Turn 영구 저장 (non-blocking)
+        db_turn_id: Optional[str] = None
+        db_turn_id = self._save_turn_to_domain(
+            conversation_id=conversation_id,
+            turn_number=turn_number,
+            query=query,
+            answer_text=answer_text,
+            rewritten_query=rewritten_query if rewritten_query != query else None,
+            citation_infos=citation_infos,
+            actor_type=actor_type,
+        )
 
         return RAGResponse(
             answer=answer_text,
@@ -160,7 +174,80 @@ class MultiturnRAGService:
             rewritten_query=rewritten_query if rewritten_query != query else None,
             context_compressed=context_compressed,
             turn_number=turn_number,
+            turn_id=db_turn_id,
         )
+
+    def _save_turn_to_domain(
+        self,
+        *,
+        conversation_id: UUID,
+        turn_number: int,
+        query: str,
+        answer_text: str,
+        rewritten_query: Optional[str],
+        citation_infos: list,
+        actor_type: str,
+    ) -> Optional[str]:
+        """Phase 3 conversations/turns 도메인에 Turn 을 저장한다.
+
+        conversations 테이블에 해당 conversation_id가 존재할 때만 저장한다.
+        존재하지 않으면 (RAG 전용 CitationCache 세션이면) 저장 생략.
+        저장 실패 시 로그만 남기고 None 반환 (non-blocking).
+
+        Returns:
+            저장된 Turn UUID 문자열, 또는 None.
+        """
+        try:
+            conv_id_str = str(conversation_id)
+            conv_repo = ConversationRepository(self._conn)
+            conv = conv_repo.get_by_id(conv_id_str)
+            if conv is None:
+                # 이 conversation_id는 conversations 테이블에 없음 — CitationCache 전용 세션
+                return None
+
+            turn_repo = TurnRepository(self._conn)
+            retrieval_meta = {
+                "rewritten_query": rewritten_query,
+                "citations": [
+                    {
+                        "index": ci.index,
+                        "snippet": ci.snippet,
+                        "document_id": str(ci.citation.document_id),
+                        "content_hash": ci.citation.content_hash,
+                    }
+                    for ci in citation_infos
+                ],
+            }
+            db_turn = turn_repo.create(
+                conversation_id=conv_id_str,
+                turn_number=turn_number,
+                user_message=query,
+                assistant_response=answer_text,
+                retrieval_metadata=retrieval_meta,
+            )
+            self._conn.commit()
+
+            audit_emitter.emit(
+                event_type="turn.created",
+                action="rag.answer",
+                actor_id=None,
+                actor_type=actor_type,
+                resource_type="turn",
+                resource_id=db_turn.id,
+                result="success",
+                metadata={"conversation_id": conv_id_str},
+            )
+            logger.info(
+                "MultiturnRAGService: turn saved turn_id=%s conversation_id=%s",
+                db_turn.id, conv_id_str,
+            )
+            return db_turn.id
+
+        except Exception as exc:
+            logger.warning(
+                "MultiturnRAGService._save_turn_to_domain failed (non-blocking): %s", exc
+            )
+            return None
 
     async def _single_turn_answer(
         self,
@@ -232,9 +319,19 @@ class MultiturnRAGService:
 
     @staticmethod
     def _convert_s1_citations(s1_citations, chunks) -> List[RAGCitationInfo]:
-        """S1 Citation 리스트를 S2 RAGCitationInfo 리스트로 변환한다."""
+        """S1 Citation 리스트를 S2 RAGCitationInfo 리스트로 변환한다.
+
+        chunks(RetrievedChunk 목록)에서 chunk_id → version_id 맵을 구성하여
+        각 S1 Citation의 실제 version_id를 사용한다. 맵에 없으면 nil UUID 폴백.
+        """
         from app.services.retrieval.citation_builder import CitationBuilder
         import uuid
+
+        # S1 RetrievedChunk에는 version_id가 있음. chunk_id 기준으로 역참조한다.
+        chunk_version_map: dict[str, str] = {
+            str(getattr(c, "chunk_id", "") or ""): str(getattr(c, "version_id", "") or "")
+            for c in (chunks or [])
+        }
 
         result = []
         for s1_cit in s1_citations:
@@ -242,17 +339,22 @@ class MultiturnRAGService:
             doc_id_str = getattr(s1_cit, "document_id", None) or ""
             node_id_str = getattr(s1_cit, "node_id", None) or ""
             source_text = getattr(s1_cit, "source_text", "")
+            chunk_id_str = str(getattr(s1_cit, "chunk_id", "") or "")
+
+            version_id_str = chunk_version_map.get(chunk_id_str, "")
 
             try:
                 doc_id = uuid.UUID(doc_id_str) if doc_id_str else uuid.UUID(int=0)
                 node_id = uuid.UUID(node_id_str) if node_id_str else None
+                version_id = uuid.UUID(version_id_str) if version_id_str else uuid.UUID(int=0)
             except (ValueError, AttributeError):
                 doc_id = uuid.UUID(int=0)
                 node_id = None
+                version_id = uuid.UUID(int=0)
 
             citation_5tuple = CitationBuilder.build(
                 document_id=doc_id,
-                version_id=uuid.UUID(int=0),  # S1에는 version_id 없음 — nil UUID
+                version_id=version_id,
                 node_id=node_id,
                 source_text=source_text,
             )

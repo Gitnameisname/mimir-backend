@@ -838,6 +838,138 @@ ALTER TABLE document_types
         '{"default_retriever":"fts","retriever_params":{},"default_reranker":null,"reranker_params":{}}'::jsonb;
 """
 
+
+# ---------------------------------------------------------------------------
+# Phase 3 (S2): Conversation 도메인 — conversations / turns / messages
+# ---------------------------------------------------------------------------
+
+_CONVERSATIONS_DDL = """
+CREATE TABLE IF NOT EXISTS conversations (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    owner_id        UUID NOT NULL,
+    organization_id UUID NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    title           VARCHAR(256) NOT NULL,
+    status          VARCHAR(32) NOT NULL DEFAULT 'active',
+    metadata        JSONB NOT NULL DEFAULT '{}',
+    retention_days  INTEGER NOT NULL DEFAULT 90,
+    expires_at      TIMESTAMPTZ,
+    deleted_at      TIMESTAMPTZ,
+    access_level    VARCHAR(32) NOT NULL DEFAULT 'private',
+    CONSTRAINT check_conversation_status
+        CHECK (status IN ('active', 'archived', 'expired', 'deleted')),
+    CONSTRAINT check_conversation_access_level
+        CHECK (access_level IN ('private', 'organization', 'public'))
+);
+
+CREATE INDEX IF NOT EXISTS ix_conversations_owner_created
+    ON conversations(owner_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS ix_conversations_organization_status
+    ON conversations(organization_id, status);
+CREATE INDEX IF NOT EXISTS ix_conversations_expires_at
+    ON conversations(expires_at)
+    WHERE expires_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS ix_conversations_deleted_at
+    ON conversations(deleted_at)
+    WHERE deleted_at IS NULL;
+"""
+
+_TURNS_DDL = """
+CREATE TABLE IF NOT EXISTS turns (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    conversation_id     UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    turn_number         INTEGER NOT NULL,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    user_message        TEXT NOT NULL,
+    assistant_response  TEXT NOT NULL,
+    retrieval_metadata  JSONB NOT NULL DEFAULT '{}',
+    CONSTRAINT uq_turns_conversation_turn_number
+        UNIQUE (conversation_id, turn_number)
+);
+
+CREATE INDEX IF NOT EXISTS ix_turns_conversation_id
+    ON turns(conversation_id);
+CREATE INDEX IF NOT EXISTS ix_turns_created_at
+    ON turns(created_at DESC);
+"""
+
+_MESSAGES_DDL = """
+CREATE TABLE IF NOT EXISTS messages (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    turn_id     UUID NOT NULL REFERENCES turns(id) ON DELETE CASCADE,
+    role        VARCHAR(32) NOT NULL,
+    content     TEXT NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    metadata    JSONB NOT NULL DEFAULT '{}',
+    CONSTRAINT check_message_role
+        CHECK (role IN ('user', 'assistant', 'system'))
+);
+
+CREATE INDEX IF NOT EXISTS ix_messages_turn_id
+    ON messages(turn_id);
+"""
+
+# FTS 트리거 — conversations.title 을 search_vector 로 색인
+_CONVERSATIONS_FTS_DDL = """
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS search_vector tsvector;
+
+UPDATE conversations
+SET search_vector = to_tsvector('simple', COALESCE(title, ''))
+WHERE search_vector IS NULL;
+
+CREATE INDEX IF NOT EXISTS ix_conversations_search_vector
+    ON conversations USING GIN(search_vector);
+
+CREATE OR REPLACE FUNCTION update_conversation_search_vector()
+RETURNS trigger AS $$
+BEGIN
+    NEW.search_vector := to_tsvector('simple', COALESCE(NEW.title, ''));
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_conversation_search_vector ON conversations;
+CREATE TRIGGER trg_conversation_search_vector
+    BEFORE INSERT OR UPDATE OF title ON conversations
+    FOR EACH ROW EXECUTE FUNCTION update_conversation_search_vector();
+"""
+
+# ---------------------------------------------------------------------------
+# Phase 3 (S2): audit_events 에 actor_type 컬럼 추가
+#   S2 원칙 ⑥: 감사 로그에 actor_type (user|agent) 필드 필수
+# ---------------------------------------------------------------------------
+
+_AUDIT_EVENTS_ACTOR_TYPE_MIGRATION_DDL = """
+ALTER TABLE audit_events
+    ADD COLUMN IF NOT EXISTS actor_type VARCHAR(32);
+"""
+
+# ---------------------------------------------------------------------------
+# Phase 3 (S2): retention_policies — 조직별 보존 정책
+# ---------------------------------------------------------------------------
+
+_RETENTION_POLICIES_DDL = """
+CREATE TABLE IF NOT EXISTS retention_policies (
+    id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id         UUID NOT NULL UNIQUE,
+    default_retention_days  INTEGER NOT NULL DEFAULT 90,
+    max_retention_days      INTEGER NOT NULL DEFAULT 365,
+    auto_expire_enabled     BOOLEAN NOT NULL DEFAULT TRUE,
+    batch_schedule          VARCHAR(32) NOT NULL DEFAULT '0 0 * * *',
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT check_retention_days_positive
+        CHECK (default_retention_days >= 1 AND max_retention_days >= 1),
+    CONSTRAINT check_retention_days_order
+        CHECK (default_retention_days <= max_retention_days)
+);
+
+CREATE INDEX IF NOT EXISTS ix_retention_policies_organization_id
+    ON retention_policies(organization_id);
+"""
+
+
 def init_db() -> None:
     """앱 시작 시 모든 테이블을 생성하고 마이그레이션을 적용한다 (idempotent)."""
     try:
@@ -909,7 +1041,16 @@ def init_db() -> None:
                 cur.execute(_JOB_SCHEDULES_SEED_DDL)
                 # Phase 2 (S2): retrieval_config 컬럼 추가 (멱등)
                 cur.execute(_DOCUMENT_TYPES_RETRIEVAL_CONFIG_MIGRATION_DDL)
-        logger.info("DB schema initialized (Phase 2 S2 retrieval_config included)")
+                # Phase 3 (S2): Conversation 도메인 테이블 생성 (멱등)
+                cur.execute(_CONVERSATIONS_DDL)
+                cur.execute(_TURNS_DDL)
+                cur.execute(_MESSAGES_DDL)
+                cur.execute(_CONVERSATIONS_FTS_DDL)
+                # Phase 3 (S2): audit_events actor_type 컬럼 추가 (멱등)
+                cur.execute(_AUDIT_EVENTS_ACTOR_TYPE_MIGRATION_DDL)
+                # Phase 3 (S2): retention_policies 테이블 생성 (멱등)
+                cur.execute(_RETENTION_POLICIES_DDL)
+        logger.info("DB schema initialized (Phase 3 S2 Conversation domain included)")
     except Exception as exc:
         logger.error("DB schema initialization failed: %s", exc)
         raise

@@ -26,6 +26,7 @@ from app.api.v1 import rag
 from app.api.v1 import auth_router as auth
 from app.api.v1 import account_router as account
 from app.api.v1 import citations  # Phase 2: Citation 역참조 API
+from app.api.v1 import conversations  # Phase 3: Conversation Domain API
 
 v1_router = APIRouter()
 
@@ -76,3 +77,6 @@ v1_router.include_router(retrieval.router, prefix="/retrieval", tags=["retrieval
 
 # Phase 2: Citation 역참조 API
 v1_router.include_router(citations.router, tags=["citations"])
+
+# Phase 3: Conversation Domain API
+v1_router.include_router(conversations.router, prefix="/conversations", tags=["conversations"])

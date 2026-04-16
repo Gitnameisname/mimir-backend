@@ -99,6 +99,21 @@ def create_app() -> FastAPI:
         except Exception as exc:
             logger.warning("DocumentType 플러그인 등록 실패: %s", exc)
 
+        # Phase 3 (S2): 대화 자동 만료 배치 스케줄러 시작
+        try:
+            from app.scheduler import start_scheduler
+            start_scheduler()
+        except Exception as exc:
+            logger.warning("BatchScheduler 시작 실패 (서비스 계속): %s", exc)
+
+    @app.on_event("shutdown")
+    def on_shutdown() -> None:
+        try:
+            from app.scheduler import stop_scheduler
+            stop_scheduler()
+        except Exception as exc:
+            logger.warning("BatchScheduler 종료 실패: %s", exc)
+
     return app
 
 

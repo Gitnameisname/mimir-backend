@@ -51,6 +51,8 @@ class AuditEmitter:
         metadata: Optional[dict[str, Any]] = None,
         # 확장 파라미터 (Phase 4 감사 이벤트용)
         actor_role: Optional[str] = None,
+        # S2 원칙 ⑥: actor_type 필수 — 사람(user)과 에이전트(agent) 구분
+        actor_type: Optional[str] = None,
         target_version_id: Optional[str] = None,
         previous_state: Optional[str] = None,
         new_state: Optional[str] = None,
@@ -61,7 +63,7 @@ class AuditEmitter:
             event_type        : 이벤트 식별자 (예: document.created, draft.updated)
             action            : 수행된 action (예: document.create)
             actor_id          : 수행 주체 actor_id (None = anonymous)
-            resource_type     : 대상 리소스 타입 (document / version / node)
+            resource_type     : 대상 리소스 타입 (document / version / node / conversation)
             resource_id       : 대상 리소스 UUID
             result            : 결과 분류 (success / failure / denied / conflict / replayed)
             request_id        : 상관관계 추적
@@ -69,6 +71,7 @@ class AuditEmitter:
             tenant_id         : 테넌트 scope (로그 전용)
             metadata          : 추가 컨텍스트 — document_id / version_number 등 포함 가능
             actor_role        : 수행 주체 역할 (viewer/editor/publisher/admin)
+            actor_type        : 수행 주체 종류 — user | agent (S2 원칙 ⑥)
             target_version_id : 복원 대상 버전 UUID 등 보조 버전 참조
             previous_state    : 상태 전이 전 값 (예: draft)
             new_state         : 상태 전이 후 값 (예: published)
@@ -92,6 +95,8 @@ class AuditEmitter:
             log_event["tenant_id"] = tenant_id
         if metadata:
             log_event["metadata"] = metadata
+        if actor_type:
+            log_event["actor_type"] = actor_type
 
         _audit_logger.info("AUDIT %s", log_event)
 
@@ -100,6 +105,7 @@ class AuditEmitter:
             event_type=event_type,
             actor_id=actor_id,
             actor_role=actor_role,
+            actor_type=actor_type,
             resource_type=resource_type,
             resource_id=resource_id,
             result=result,
@@ -116,6 +122,7 @@ class AuditEmitter:
         event_type: str,
         actor_id: Optional[str],
         actor_role: Optional[str],
+        actor_type: Optional[str],
         resource_type: str,
         resource_id: Optional[str],
         result: str,
@@ -146,12 +153,12 @@ class AuditEmitter:
 
         sql = """
             INSERT INTO audit_events (
-                event_type, actor_user_id, actor_role,
+                event_type, actor_user_id, actor_role, actor_type,
                 document_id, version_id, target_version_id,
                 previous_state, new_state,
                 action_result, request_id
             ) VALUES (
-                %s, %s, %s,
+                %s, %s, %s, %s,
                 %s, %s, %s,
                 %s, %s,
                 %s, %s
@@ -161,6 +168,7 @@ class AuditEmitter:
             event_type,
             actor_id,
             actor_role,
+            actor_type,
             document_id,
             version_id,
             target_version_id,
@@ -210,11 +218,21 @@ class AuditEmitter:
 
         패턴을 단순화한다.
         """
+        # S2 원칙 ⑥: ActorType.SERVICE → "agent", ActorType.USER → "user"
+        raw_actor_type = getattr(actor, "actor_type", None)
+        if raw_actor_type is not None:
+            # Enum 이면 .value 추출, 아니면 문자열 변환
+            raw_value = getattr(raw_actor_type, "value", str(raw_actor_type)).lower()
+            actor_type_str = "agent" if raw_value in ("service", "agent") else "user"
+        else:
+            actor_type_str = None
+
         self.emit(
             event_type=event_type,
             action=action,
             actor_id=getattr(actor, "actor_id", None) if getattr(actor, "is_authenticated", False) else None,
             actor_role=getattr(actor, "role", None),
+            actor_type=actor_type_str,
             resource_type=resource_type,
             resource_id=resource_id,
             result="success",
