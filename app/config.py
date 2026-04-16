@@ -67,7 +67,9 @@ class Settings(BaseSettings):
 
     # LLM (Phase 11 RAG)
     llm_provider: str = "openai"           # "openai" | "anthropic"
-    llm_model: str = "gpt-4o"             # OpenAI: gpt-4o, Anthropic: claude-sonnet-4-6
+    # OpenAI: gpt-4o-mini (모든 프로젝트 기본 허용) / gpt-4o (별도 권한 필요)
+    # Anthropic: claude-sonnet-4-6
+    llm_model: str = "gpt-4o-mini"
     anthropic_api_key: str = ""
     rag_top_k: int = 20                    # Retriever Top-K
     rag_top_n: int = 5                     # Reranker Top-N (최종 컨텍스트 청크 수)

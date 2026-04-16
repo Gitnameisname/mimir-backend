@@ -663,8 +663,26 @@ class RAGService:
 
         except Exception as exc:
             logger.error("RAG stream_answer 오류: %s", exc, exc_info=True)
-            # RAG-001: 내부 오류 상세를 클라이언트에게 노출하지 않는다
-            yield _sse_data({"event": "error", "data": {"message": "응답 생성 중 오류가 발생했습니다."}})
+            # RAG-001: 내부 오류 상세는 비노출이 원칙이지만, 운영자가 해결 가능한
+            # 설정성 오류(모델 접근 권한 / API 키 누락)는 사용자에게 간결한 힌트만
+            # 제공한다. 민감 토큰/경로/스택트레이스는 절대 포함하지 않는다.
+            message = "응답 생성 중 오류가 발생했습니다."
+            try:
+                from openai import (
+                    AuthenticationError as _OAIAuthErr,
+                    PermissionDeniedError as _OAIPermErr,
+                    NotFoundError as _OAINotFoundErr,
+                )
+                if isinstance(exc, _OAIPermErr) or isinstance(exc, _OAINotFoundErr):
+                    message = (
+                        "LLM 모델에 접근할 수 없습니다. "
+                        "관리자에게 LLM_MODEL 설정 확인을 요청하세요."
+                    )
+                elif isinstance(exc, _OAIAuthErr):
+                    message = "LLM API 키가 올바르지 않습니다. 관리자에게 문의하세요."
+            except Exception:
+                pass
+            yield _sse_data({"event": "error", "data": {"message": message}})
 
     # ------------------------------------------------------------------
     # 비스트리밍 단건 질의

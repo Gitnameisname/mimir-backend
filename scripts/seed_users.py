@@ -33,7 +33,7 @@ if _BACKEND_ROOT not in sys.path:
     sys.path.insert(0, _BACKEND_ROOT)
 
 from app.api.auth.password import hash_password  # noqa: E402
-from app.db.connection import get_db  # noqa: E402
+from app.db.connection import get_db, init_db  # noqa: E402
 from app.repositories.users_repository import UsersRepository  # noqa: E402
 
 logging.basicConfig(
@@ -124,6 +124,15 @@ def _upsert(repo: UsersRepository, conn, account: SeedAccount) -> str:
 def main() -> int:
     accounts = _build_seed_accounts()
     repo = UsersRepository()
+
+    # 1) 스키마 초기화(멱등) — users 테이블이 아직 없으면 여기서 생성된다.
+    #    앱(uvicorn)이 한 번도 기동되지 않은 상태에서 시드 스크립트만 단독으로
+    #    실행하는 경우를 위해 명시적으로 호출한다.
+    try:
+        init_db()
+    except Exception as e:
+        logger.exception("init_db failed: %s", e)
+        return 1
 
     results: list[tuple[SeedAccount, str]] = []
     try:

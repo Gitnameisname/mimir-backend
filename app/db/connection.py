@@ -866,10 +866,26 @@ def init_db() -> None:
                 # Phase 8 FTS 마이그레이션
                 cur.execute(_FTS_MIGRATION_DDL)
                 cur.execute(_SEARCH_INDEX_STATS_DDL)
-                # Phase 10 pgvector 확장 및 문서 청크 테이블
-                cur.execute(_PGVECTOR_EXTENSION_DDL)
-                cur.execute(_DOCUMENT_CHUNKS_DDL)
-                cur.execute(_DOCUMENT_CHUNKS_VECTOR_INDEX_DDL)
+                # Phase 10 pgvector 확장 및 문서 청크 테이블.
+                # pgvector 가 서버에 설치되지 않은 개발 환경(로컬 등)에서는
+                # SAVEPOINT 로 격리해 인증·관리 기능을 위한 나머지 DDL 만이라도
+                # 진행되도록 한다. RAG / 벡터 검색 기능은 pgvector 설치 전까지
+                # 비활성 상태가 된다.
+                cur.execute("SAVEPOINT sp_pgvector")
+                try:
+                    cur.execute(_PGVECTOR_EXTENSION_DDL)
+                    cur.execute(_DOCUMENT_CHUNKS_DDL)
+                    cur.execute(_DOCUMENT_CHUNKS_VECTOR_INDEX_DDL)
+                    cur.execute("RELEASE SAVEPOINT sp_pgvector")
+                except psycopg2.Error as vec_err:
+                    cur.execute("ROLLBACK TO SAVEPOINT sp_pgvector")
+                    cur.execute("RELEASE SAVEPOINT sp_pgvector")
+                    logger.warning(
+                        "pgvector DDL skipped (extension not available): %s. "
+                        "벡터 검색/RAG 기능이 비활성됩니다. 사용하려면 Postgres 에 "
+                        "pgvector 확장을 설치 후 앱을 재기동하세요.",
+                        vec_err,
+                    )
                 cur.execute(_EMBEDDING_TOKEN_USAGE_DDL)
                 # Phase 14 마이그레이션 (users 인증 컬럼 + refresh_tokens)
                 cur.execute(_USERS_AUTH_MIGRATION_DDL)
