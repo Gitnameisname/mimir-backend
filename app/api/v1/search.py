@@ -16,7 +16,7 @@ Phase 8 검색 API:
 """
 
 import re
-from typing import Optional
+from typing import Optional, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
@@ -168,6 +168,10 @@ def unified_search(
         "- `from_date`, `to_date`: 생성일 범위 (YYYY-MM-DD)\n"
         "- `sort`: `relevance` | `created_at` | `updated_at`\n"
         "- `mode`: `fts` (기본, Full-Text Search) | `hybrid` (FTS + 벡터 RRF 통합)\n"
+        "- `retriever`: S2 플러그인 Retriever 오버라이드 (`fts` | `vector` | `hybrid`). "
+        "지정 시 DocumentType 기본값을 덮어씀.\n"
+        "- `reranker`: S2 플러그인 Reranker 오버라이드 (`cross_encoder` | `rule_based` | `null`). "
+        "지정 시 DocumentType 기본값을 덮어씀.\n"
         "- `page`, `limit`: 페이지네이션\n\n"
         "**응답**: 각 결과에 `snippets` (키워드 하이라이팅 포함) 포함."
     ),
@@ -175,7 +179,7 @@ def unified_search(
     tags=["search"],
 )
 @limiter.limit(_ANON_LIMIT)
-def search_documents(
+async def search_documents(
     request: Request,
     q: str,
     type: Optional[str] = None,
@@ -184,6 +188,8 @@ def search_documents(
     to_date: Optional[str] = None,
     sort: str = "relevance",
     mode: str = "fts",
+    retriever: Optional[Literal["fts", "vector", "hybrid"]] = None,
+    reranker: Optional[Literal["cross_encoder", "rule_based", "null"]] = None,
     page: int = 1,
     limit: int = 20,
     actor: ActorContext = Depends(resolve_current_actor),
@@ -202,6 +208,36 @@ def search_documents(
 
     if mode not in ("fts", "hybrid"):
         raise HTTPException(status_code=400, detail=f"지원하지 않는 mode입니다: '{mode}'. 허용 값: fts, hybrid")
+
+    # S2: retriever/reranker 플러그인 오버라이드가 있으면 플러그인 경로로 처리
+    if retriever is not None or reranker is not None:
+        with get_db() as conn:
+            plugin_results = await search_service.search_with_plugins(
+                conn,
+                query=q,
+                document_type=type or "",
+                top_k=min(100, max(1, limit)),
+                filters={"actor_role": actor_role, "status": status},
+                retriever_override=retriever,
+                reranker_override=reranker,
+            )
+        data = {
+            "query": q,
+            "results": [
+                {
+                    "document_id": str(r.document_id),
+                    "node_id": str(r.node_id),
+                    "content": r.content,
+                    "score": r.score,
+                    "citation": r.citation.model_dump() if r.citation else None,
+                    "metadata": r.metadata,
+                }
+                for r in plugin_results
+            ],
+            "retriever": retriever,
+            "reranker": reranker,
+        }
+        return success_response(data=data, request_id=request_id, trace_id=trace_id)
 
     with get_db() as conn:
         if mode == "hybrid":

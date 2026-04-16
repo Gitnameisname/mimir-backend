@@ -2,19 +2,28 @@
 System router — /api/v1/system
 
 운영성 endpoint를 제공한다.
-  - GET /api/v1/system/health        : 헬스체크 (공개)
+  - GET /api/v1/system/health        : 헬스체크 (공개, Tier 1)
   - GET /api/v1/system/info         : 서비스 메타 정보 (공개)
+  - GET /api/v1/system/capabilities : 기능 가용성 조회 (인증 필요, Tier 2 — Task 0-8 3-tier 분리)
   - GET /api/v1/system/metrics      : Prometheus 메트릭 (Phase 13-3)
   - GET /api/v1/system/error-test   : 공통 오류 처리 검증용 stub (Task I-3)
 
-이 router는 인증을 요구하지 않는 공개 endpoint만 포함한다.
-향후 내부 전용 운영 endpoint가 필요하면 /admin 하위로 분리한다.
+보안 분리 (Task 0-8 패치):
+  - Tier 1 (health): 인증 불필요. status + version만 노출
+  - Tier 2 (capabilities): 인증 필요. rag_available, chunking_enabled만 노출
+    → pgvector_enabled, supported_providers 등 내부 구성 정보는 Tier 3 (admin)으로 분리
+  - Tier 3 (admin capabilities): Admin 전용. admin.py에서 제공
 """
 import logging
+import os
+import threading
+from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Depends, Query, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
 
+from app.api.auth import ResourceRef, authorization_service, resolve_current_actor
+from app.api.auth.models import ActorContext
 from app.api.errors import (
     ApiAuthenticationError,
     ApiConflictError,
@@ -29,6 +38,65 @@ from app.observability.metrics import generate_metrics_text
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# ---------------------------------------------------------------------------
+# capabilities 캐시 (5분 TTL, thread-safe)
+# ---------------------------------------------------------------------------
+
+_CAP_CACHE_TTL = timedelta(minutes=5)
+_cap_cache: dict = {"data": None, "expires": datetime.min.replace(tzinfo=timezone.utc)}
+_cap_lock = threading.Lock()
+
+
+def _detect_pgvector() -> bool:
+    """pgvector 확장 설치 여부를 감지한다.
+
+    우선순위:
+      1. PGVECTOR_ENABLED 환경변수 (명시적 override — 테스트 환경 포함)
+      2. DB pg_extension 직접 조회 (런타임 자동 감지)
+      3. 기본값 False (DB 연결 불가 시 안전한 폴백)
+    """
+    env_val = os.environ.get("PGVECTOR_ENABLED", "").strip().lower()
+    if env_val in ("true", "1", "yes"):
+        return True
+    if env_val in ("false", "0", "no"):
+        return False
+    # 환경변수 미설정 → DB 직접 확인
+    try:
+        from app.db.connection import get_db
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname='vector')"
+                )
+                return bool(cur.fetchone()[0])
+    except Exception as exc:
+        logger.debug("pgvector DB 감지 실패 (기본값 False): %s", exc)
+        return False
+
+
+def _build_capabilities() -> dict:
+    """capabilities 응답 dict를 빌드한다."""
+    pgvector = _detect_pgvector()
+    has_llm_key = bool(settings.openai_api_key or settings.anthropic_api_key)
+
+    providers: list[str] = []
+    if settings.openai_api_key:
+        providers.append("openai")
+    if settings.anthropic_api_key:
+        providers.append("anthropic")
+
+    return {
+        "version": settings.api_version,
+        "pgvector_enabled": pgvector,
+        # RAG = pgvector + LLM provider 둘 다 필요
+        "rag_available": pgvector and has_llm_key,
+        # chunking 은 pgvector 파이프라인과 연동 (pgvector 없으면 비활성)
+        "chunking_enabled": pgvector,
+        "supported_providers": providers,
+        # MCP 스펙: Phase 4 구현 예정
+        "mcp_spec_version": None,
+    }
 
 
 @router.get(
@@ -55,6 +123,52 @@ def service_info() -> SuccessResponse:
             "environment": settings.environment,
         }
     )
+
+
+def _get_full_capabilities() -> dict:
+    """캐시를 경유하여 전체 capabilities dict를 반환한다.
+
+    Tier 2, Tier 3 모두 이 함수를 거쳐 캐시된 데이터를 사용한다.
+    """
+    now = datetime.now(timezone.utc)
+    with _cap_lock:
+        if _cap_cache["data"] is None or now >= _cap_cache["expires"]:
+            _cap_cache["data"] = _build_capabilities()
+            _cap_cache["expires"] = now + _CAP_CACHE_TTL
+        return _cap_cache["data"]
+
+
+# Tier 2 응답에 포함할 필드 (내부 구성 정보 제외)
+_TIER2_FIELDS = {"version", "rag_available", "chunking_enabled", "mcp_spec_version"}
+
+
+@router.get(
+    "/capabilities",
+    summary="기능 가용성 조회 (인증 필요, Tier 2)",
+    description=(
+        "현재 플랫폼의 기능 가용성을 반환한다.\n\n"
+        "**인증 필요** — 로그인된 사용자(VIEWER 이상) 접근 가능.\n\n"
+        "내부 구성 정보(pgvector_enabled, supported_providers 등)는 "
+        "Admin 전용 엔드포인트(`/api/v1/admin/system/capabilities`)에서만 노출된다.\n\n"
+        "응답은 **5분간 캐시**된다(`Cache-Control: private, max-age=300`)."
+    ),
+    response_model=SuccessResponse,
+    tags=["system"],
+)
+def get_capabilities(
+    response: Response,
+    actor: ActorContext = Depends(resolve_current_actor),
+) -> SuccessResponse:
+    authorization_service.authorize(
+        actor, "system.read", ResourceRef(resource_type="system"),
+    )
+
+    full_data = _get_full_capabilities()
+    # Tier 2: 내부 구성 정보를 제외한 필드만 반환
+    tier2_data = {k: v for k, v in full_data.items() if k in _TIER2_FIELDS}
+
+    response.headers["Cache-Control"] = "private, max-age=300"
+    return success_response(data=tier2_data)
 
 
 @router.get(

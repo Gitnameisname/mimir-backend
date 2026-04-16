@@ -42,7 +42,7 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, EmailStr, Field
 
 from app.api.auth import ResourceRef, authorization_service, get_permission_matrix, resolve_current_actor
@@ -1324,6 +1324,7 @@ class UpdateDocumentTypeBody(BaseModel):
     status: Optional[str] = None
     schema_fields: Optional[list[dict[str, Any]]] = None
     plugin_config: Optional[dict[str, Any]] = None
+    retrieval_config: Optional[dict[str, Any]] = None  # S2 FG2.2: Retriever/Reranker 설정
 
 
 @router.post("/document-types", summary="DocumentType 생성", status_code=201)
@@ -1391,6 +1392,14 @@ def update_document_type(
     if body.plugin_config is not None:
         fields.append("plugin_config = %s::jsonb")
         params.append(json.dumps(body.plugin_config))
+    if body.retrieval_config is not None:
+        from app.schemas.retrieval_config import RetrievalConfig
+        try:
+            validated = RetrievalConfig.model_validate(body.retrieval_config)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"retrieval_config가 유효하지 않습니다: {exc}")
+        fields.append("retrieval_config = %s::jsonb")
+        params.append(json.dumps(validated.model_dump()))
 
     if not fields:
         raise HTTPException(status_code=422, detail="수정할 필드가 없습니다.")
@@ -1416,6 +1425,7 @@ def update_document_type(
         "status": row["status"],
         "schema_fields": row["schema_fields"],
         "plugin_config": row["plugin_config"],
+        "retrieval_config": row["retrieval_config"],
         "updated_at": row["updated_at"].isoformat(),
     })
 
@@ -3012,3 +3022,36 @@ def list_audit_event_types(_=Depends(require_admin_access)):
     return success_response(
         data={"items": [{"value": v, "label": label} for v, label in _AUDIT_EVENT_TYPES]}
     )
+
+
+# ---------------------------------------------------------------------------
+# 시스템 정보 — Tier 3 Admin Capabilities (Task 0-8 3-tier 분리)
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/system/capabilities",
+    summary="전체 시스템 정보 조회 (Admin 전용, Tier 3)",
+    description=(
+        "내부 구성 정보를 포함한 전체 플랫폼 기능 가용성을 반환한다.\n\n"
+        "**Admin 권한 필요** (ORG_ADMIN, SUPER_ADMIN).\n\n"
+        "보안 근거: pgvector_enabled, supported_providers, deployment_type 등\n"
+        "내부 구성 정보는 공격 표면 분석에 악용될 수 있으므로 Admin으로 제한한다.\n\n"
+        "응답은 **5분간 캐시**된다(`Cache-Control: private, max-age=300`)."
+    ),
+    tags=["admin"],
+)
+def get_admin_capabilities(
+    response: Response,
+    _=Depends(require_admin_access),
+):
+    """Tier 3 — Admin 전용 전체 시스템 정보.
+
+    system.py의 _get_full_capabilities()를 그대로 반환한다.
+    Tier 2와 달리 pgvector_enabled, supported_providers, deployment_type,
+    closed_network 등 내부 구성 필드를 모두 포함한다.
+    """
+    from app.api.v1.system import _get_full_capabilities
+
+    data = _get_full_capabilities()
+    response.headers["Cache-Control"] = "private, max-age=300"
+    return success_response(data=data)

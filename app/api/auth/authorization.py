@@ -115,6 +115,10 @@ _PERMISSION_MATRIX: dict[str, frozenset[str]] = {
     "rag.conversation.write":  frozenset({"VIEWER", "AUTHOR", "REVIEWER", "APPROVER", "ORG_ADMIN", "SUPER_ADMIN"}),
     "rag.conversation.delete": frozenset({"VIEWER", "AUTHOR", "REVIEWER", "APPROVER", "ORG_ADMIN", "SUPER_ADMIN"}),
 
+    # --- 시스템 정보 (Task 0-8: 3-tier 분리) ---
+    # Tier 2: 인증된 모든 사용자가 기능 가용성 조회 가능
+    "system.read": frozenset({"VIEWER", "AUTHOR", "REVIEWER", "APPROVER", "ORG_ADMIN", "SUPER_ADMIN"}),
+
     # --- 관리자 ---
     "admin.read":  frozenset({"ORG_ADMIN", "SUPER_ADMIN"}),
     "admin.write": frozenset({"SUPER_ADMIN"}),

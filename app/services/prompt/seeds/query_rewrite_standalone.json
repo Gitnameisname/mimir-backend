@@ -1,0 +1,8 @@
+{
+  "key": "query_rewrite_standalone",
+  "version": "1.0",
+  "description": "멀티턴 대화 컨텍스트 기반 쿼리 재작성 프롬프트",
+  "template": "당신은 검색 질의 재작성 전문가입니다.\n\n원본 질의: {original_query}\n이전 대화 맥락:\n{conversation_history}\n\n위 맥락을 고려하여, 원본 질의를 더 자립적이고 명확한 단발 검색 쿼리로 다시 작성하세요.\n검색 엔진이 이해할 수 있도록 주요 키워드를 포함하세요.\n재작성된 쿼리만 출력하세요 (설명 없이).",
+  "variables": ["original_query", "conversation_history"],
+  "tags": ["retrieval", "query_rewrite", "multiturn"]
+}

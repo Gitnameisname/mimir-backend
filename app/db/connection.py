@@ -832,6 +832,12 @@ ON CONFLICT (category, key) DO NOTHING;
 """
 
 
+_DOCUMENT_TYPES_RETRIEVAL_CONFIG_MIGRATION_DDL = """
+ALTER TABLE document_types
+    ADD COLUMN IF NOT EXISTS retrieval_config JSONB NOT NULL DEFAULT
+        '{"default_retriever":"fts","retriever_params":{},"default_reranker":null,"reranker_params":{}}'::jsonb;
+"""
+
 def init_db() -> None:
     """앱 시작 시 모든 테이블을 생성하고 마이그레이션을 적용한다 (idempotent)."""
     try:
@@ -901,7 +907,9 @@ def init_db() -> None:
                 # Phase 14-14: 배치 작업 스케줄 + 시드
                 cur.execute(_JOB_SCHEDULES_DDL)
                 cur.execute(_JOB_SCHEDULES_SEED_DDL)
-        logger.info("DB schema initialized (Phase 14-14 job_schedules included)")
+                # Phase 2 (S2): retrieval_config 컬럼 추가 (멱등)
+                cur.execute(_DOCUMENT_TYPES_RETRIEVAL_CONFIG_MIGRATION_DDL)
+        logger.info("DB schema initialized (Phase 2 S2 retrieval_config included)")
     except Exception as exc:
         logger.error("DB schema initialization failed: %s", exc)
         raise

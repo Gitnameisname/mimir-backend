@@ -16,6 +16,7 @@ addopts = [
 markers = [
     "unit: 단위 테스트 (DB/외부 의존성 없음)",
     "integration: 통합 테스트 (실제 DB 필요)",
+    "smoke: Fresh-boot 스모크 테스트 (실행 중인 앱 + 실제 DB 필요)",
     "e2e: 엔드-투-엔드 테스트",
     "slow: 느린 테스트 (부하 테스트 등)",
 ]

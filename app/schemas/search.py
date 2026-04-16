@@ -14,6 +14,9 @@ from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
+# S2 Phase 2: Citation 5-tuple (Optional import — S1 클라이언트는 무시)
+from app.schemas.citation import Citation as Citation5Tuple  # noqa: F401
+
 
 # ---------------------------------------------------------------------------
 # Request schemas
@@ -76,6 +79,11 @@ class DocumentSearchResult(BaseModel):
     rank: float = Field(default=0.0, description="FTS 관련도 점수 (ts_rank)")
     snippets: list[DocumentSnippet] = Field(
         default_factory=list, description="하이라이팅된 스니펫 목록"
+    )
+    # S2 Phase 2: Citation 5-tuple (S1 클라이언트는 None으로 무시 가능)
+    citation: Optional[Citation5Tuple] = Field(
+        None,
+        description="S2 Citation 5-tuple (document_id, version_id, node_id, span_offset, content_hash)",
     )
 
 

@@ -754,4 +754,93 @@ class SearchService:
         return all_statuses
 
 
+    # ---------------------------------------------------------------------------
+    # Phase 2 S2: Retriever/Reranker 플러그인 통합 검색
+    # ---------------------------------------------------------------------------
+
+    async def search_with_plugins(
+        self,
+        conn: psycopg2.extensions.connection,
+        query: str,
+        document_type: str,
+        top_k: int = 10,
+        filters: Optional[dict] = None,
+        retriever_override: Optional[str] = None,
+        reranker_override: Optional[str] = None,
+    ):
+        """Retriever/Reranker 플러그인을 사용한 검색.
+
+        Args:
+            conn: DB 연결
+            query: 검색 쿼리
+            document_type: DocumentType 이름 (빈 문자열이면 전체)
+            top_k: 최종 반환 결과 수
+            filters: ACL 포함 필터 (actor_role 필수)
+            retriever_override: API 파라미터 오버라이드 ("fts"|"vector"|"hybrid")
+            reranker_override: API 파라미터 오버라이드 ("cross_encoder"|"rule_based"|"null")
+
+        Returns:
+            RetrievalResult 리스트 (Reranker 적용 후 top_k개)
+        """
+        from app.schemas.retrieval_config import RetrievalConfig
+        from app.services.retrieval.retriever_factory import RetrieverFactory
+        from app.services.retrieval.reranker_factory import RerankerFactory
+
+        # DocumentType 설정 조회
+        config = self._get_retrieval_config(conn, document_type)
+
+        # Retriever/Reranker 결정: API 파라미터 > DocumentType 설정
+        retriever_name = retriever_override or config.default_retriever
+        reranker_name = reranker_override or config.default_reranker
+
+        retriever = RetrieverFactory.create(
+            retriever_name,
+            conn,
+            config.retriever_params.model_dump(),
+        )
+        reranker = RerankerFactory.create(
+            reranker_name,
+            config.reranker_params.model_dump(),
+        )
+
+        # Retriever: 후보군 넉넉히 (Reranker 입력용, 최대 100개)
+        candidates = await retriever.retrieve(
+            query=query,
+            document_type=document_type,
+            top_k=min(top_k * 5, 100),
+            filters=filters,
+        )
+
+        # Reranker: 최종 top_k로 압축
+        return await reranker.rerank(query, candidates, top_k=top_k)
+
+    def _get_retrieval_config(
+        self,
+        conn: psycopg2.extensions.connection,
+        document_type: str,
+    ):
+        """document_types 테이블에서 retrieval_config를 조회한다."""
+        from app.schemas.retrieval_config import RetrievalConfig
+
+        if not document_type:
+            return RetrievalConfig()
+
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT retrieval_config FROM document_types WHERE type_code = %s",
+                    (document_type,),
+                )
+                row = cur.fetchone()
+            if row and row.get("retrieval_config"):
+                return RetrievalConfig.model_validate(row["retrieval_config"])
+        except Exception as exc:
+            logger.warning(
+                "Failed to load retrieval_config for document_type=%s: %s — using defaults",
+                document_type,
+                exc,
+            )
+        return RetrievalConfig()
+
+
 search_service = SearchService()

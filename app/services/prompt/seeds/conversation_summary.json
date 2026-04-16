@@ -1,0 +1,8 @@
+{
+  "key": "conversation_summary",
+  "version": "1.0",
+  "description": "멀티턴 대화 요약 프롬프트",
+  "template": "다음 대화를 300자 이내로 핵심 내용만 요약하세요.\n검색에 유용한 주요 키워드와 주제를 반드시 포함하세요.\n\n대화:\n{conversation_text}\n\n요약:",
+  "variables": ["conversation_text"],
+  "tags": ["retrieval", "compression", "multiturn"]
+}

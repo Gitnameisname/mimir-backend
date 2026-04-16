@@ -140,3 +140,49 @@ class SSEEvent(BaseModel):
     """SSE 스트리밍 이벤트."""
     event: str      # "start" | "delta" | "citation" | "done" | "error"
     data: dict
+
+
+# ---------------------------------------------------------------------------
+# S2 Phase 2: 멀티턴 RAG 스키마 (S1 하위호환)
+# ---------------------------------------------------------------------------
+
+from typing import List
+from uuid import UUID
+from app.schemas.citation import Citation as Citation5Tuple
+
+
+class RAGRequest(BaseModel):
+    """RAG 질의 요청 — S2 멀티턴 지원.
+
+    S1 하위호환: conversation_id 없으면 단발 쿼리 모드.
+    S2 확장: conversation_id 있으면 멀티턴 모드 (QueryRewriter, Citation 캐시 활성화).
+    """
+    query: str = Field(..., min_length=1, max_length=2000, description="사용자 질의")
+    top_k: int = Field(10, ge=1, le=50, description="검색 결과 수")
+    document_type: Optional[str] = Field(None, description="검색 대상 DocumentType")
+    conversation_id: Optional[UUID] = Field(
+        None,
+        description="멀티턴 대화 ID — 제공 시 멀티턴 모드 활성화",
+    )
+
+
+class RAGCitationInfo(BaseModel):
+    """응답 내 단일 Citation 정보 (S2 Citation 5-tuple 포함)."""
+    index: int
+    citation: Citation5Tuple
+    snippet: str
+
+
+class RAGResponse(BaseModel):
+    """RAG 질의 응답 — S2 멀티턴 필드 포함.
+
+    S1 하위호환: rewritten_query, context_compressed, turn_number는 S1 클라이언트가 무시.
+    """
+    answer: str
+    citations: List[RAGCitationInfo] = Field(default_factory=list)
+    rewritten_query: Optional[str] = Field(
+        None,
+        description="재작성된 쿼리 (멀티턴 모드에서만 제공, 투명성)",
+    )
+    context_compressed: bool = Field(False, description="대화 요약 사용 여부")
+    turn_number: int = Field(1, description="현재 대화 턴 번호")

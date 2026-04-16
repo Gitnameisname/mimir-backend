@@ -25,6 +25,7 @@ from app.api.v1 import vectorization
 from app.api.v1 import rag
 from app.api.v1 import auth_router as auth
 from app.api.v1 import account_router as account
+from app.api.v1 import citations  # Phase 2: Citation 역참조 API
 
 v1_router = APIRouter()
 
@@ -72,3 +73,6 @@ v1_router.include_router(admin.router, prefix="/admin", tags=["admin"])
 v1_router.include_router(operations.router, prefix="/operations", tags=["operations"])
 v1_router.include_router(webhooks.router, prefix="/webhooks", tags=["webhooks"])
 v1_router.include_router(retrieval.router, prefix="/retrieval", tags=["retrieval"])
+
+# Phase 2: Citation 역참조 API
+v1_router.include_router(citations.router, tags=["citations"])

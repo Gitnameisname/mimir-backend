@@ -43,6 +43,8 @@ from app.schemas.rag import (
     MessageResponse,
     Citation,
     RetrievedChunk,
+    RAGRequest,
+    RAGResponse,
 )
 from app.services.rag_service import rag_service
 from app.config import settings
@@ -51,6 +53,79 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 _RAG_LIMIT = "30/minute"   # LLM 호출 비용 고려
+
+
+# ---------------------------------------------------------------------------
+# POST /rag/answer — S2 멀티턴 RAG (conversation_id 지원)
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/answer",
+    summary="S2 멀티턴 RAG 질의응답",
+    description=(
+        "문서 기반 질의응답. S2 멀티턴 지원.\n\n"
+        "- `conversation_id` 없으면 단발 쿼리 모드 (S1 하위호환)\n"
+        "- `conversation_id` 있으면 멀티턴 모드 — QueryRewriter + Citation 캐시 활성화\n\n"
+        "응답에 `rewritten_query` (재작성된 쿼리), `turn_number` 포함."
+    ),
+    tags=["rag"],
+)
+@limiter.limit(_RAG_LIMIT)
+async def rag_answer(
+    request: Request,
+    body: RAGRequest,
+    actor: ActorContext = Depends(resolve_current_actor),
+):
+    """S2 멀티턴 RAG 질의응답 — POST /rag/answer."""
+    from app.services.multiturn_rag_service import MultiturnRAGService
+    from app.services.retrieval.citation_cache import get_citation_cache
+    from app.services.retrieval.query_rewriter import QueryRewriter
+    from app.services.retrieval.conversation_compressor import ConversationCompressor
+    from app.services.rag_service import get_llm_provider
+
+    authorization_service.authorize(
+        actor, "rag.query", ResourceRef(resource_type="rag"),
+    )
+
+    actor_role = getattr(actor, "role", None)
+    # S2 원칙: actor_type 기록 (사용자 또는 AI 에이전트)
+    actor_type = getattr(actor, "actor_type", "user") or "user"
+    # IDOR 방지: conversation_id 소유권 검증에 사용할 actor_id
+    actor_id = getattr(actor, "actor_id", None)
+
+    llm = get_llm_provider()
+    rewriter = QueryRewriter(llm)
+    compressor = ConversationCompressor(llm=llm)
+    cache = get_citation_cache()
+
+    # RAG-002 패턴: DB 연결은 컨텍스트 준비 단계에서만 사용하고 LLM 호출 전에 해제
+    # MultiturnRAGService.answer()가 내부적으로 prepare_context → close conn → LLM 완료.
+    # 단순화를 위해 현재는 conn을 전달만 하고 서비스 내에서 LLM 호출을 분리한다.
+    try:
+        with get_db() as conn:
+            svc = MultiturnRAGService(
+                conn=conn,
+                query_rewriter=rewriter,
+                compressor=compressor,
+                citation_cache=cache,
+            )
+            # NOTE: DB 컨텍스트 종료 전에 prepare_context를 완료한다.
+            # LLM 비동기 스트리밍은 _single_turn_answer/_generate_answer 내에서
+            # conn 없이 처리된다 (prepare_context 완료 후 LLM 호출).
+            result = await svc.answer(
+                query=body.query,
+                top_k=body.top_k,
+                document_type=body.document_type,
+                conversation_id=body.conversation_id,
+                actor_role=actor_role,
+                actor_type=actor_type,
+                actor_id=actor_id,
+            )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+
+    from app.api.responses import success_response
+    return success_response(data=result.model_dump())
 
 
 # ---------------------------------------------------------------------------
