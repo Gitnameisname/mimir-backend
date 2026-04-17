@@ -1,20 +1,26 @@
 """
 Scope Profile CRUD API + Agent 관리 API + Kill Switch API — Phase 4 (S2).
+FG5.3: 에이전트 감사 조회 API + 통계 API + Rate Limit 조회 API 추가.
 
 S2 원칙 ⑤: 접근 범위(scope)는 관리자 설정으로 동적 관리.
 모든 엔드포인트는 admin 역할 필수.
 
 라우터 경로:
-  /admin/scope-profiles     — ScopeProfile CRUD
-  /admin/agents             — Agent CRUD
-  /admin/agents/{id}/kill-switch — Kill Switch
+  /admin/scope-profiles              — ScopeProfile CRUD
+  /admin/agents                      — Agent CRUD
+  /admin/agents/{id}/kill-switch     — Kill Switch
+  /admin/agents/{id}/audit           — 에이전트 감사 이력 조회
+  /admin/agents/{id}/statistics      — 에이전트 통계
+  /admin/agents/{id}/rate-limit      — 에이전트 Rate Limit 현황
 """
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel
 
 from app.api.auth.dependencies import resolve_current_actor
 from app.api.auth.models import ActorContext
@@ -499,3 +505,248 @@ def deactivate_kill_switch(
         disabled_reason=None,
         message="킬스위치가 해제되었습니다. 에이전트 요청이 정상 처리됩니다.",
     )
+
+
+# ===========================================================================
+# FG5.3: 에이전트 감사 조회 / 통계 / Rate Limit 현황
+# ===========================================================================
+
+class AgentAuditItem(BaseModel):
+    id: str
+    event_type: str
+    occurred_at: str
+    actor_id: Optional[str]
+    actor_type: Optional[str]
+    acting_on_behalf_of: Optional[str]
+    resource_type: Optional[str]
+    resource_id: Optional[str]
+    previous_state: Optional[str]
+    new_state: Optional[str]
+    action_result: str
+    reason: Optional[str]
+
+
+class AgentAuditListResponse(BaseModel):
+    items: List[AgentAuditItem]
+    total: int
+    page: int
+    page_size: int
+
+
+class RejectionReasonItem(BaseModel):
+    reason: Optional[str]
+    count: int
+
+
+class AgentStatisticsResponse(BaseModel):
+    agent_id: str
+    agent_name: Optional[str]
+    total_proposals: int
+    approved_count: int
+    rejected_count: int
+    withdrawn_count: int
+    approval_rate: float
+    average_review_time_minutes: Optional[float]
+    last_activity: Optional[str]
+    rejection_reasons: List[RejectionReasonItem]
+
+
+class AgentRateLimitResponse(BaseModel):
+    agent_id: str
+    endpoints: List[dict]
+
+
+@router.get(
+    "/agents/{agent_id}/audit",
+    response_model=AgentAuditListResponse,
+    summary="에이전트 감사 이력 조회 (FG5.3)",
+)
+def get_agent_audit(
+    agent_id: str,
+    start_date: Optional[str] = Query(None, description="시작 날짜 (ISO8601)"),
+    end_date: Optional[str] = Query(None, description="종료 날짜 (ISO8601)"),
+    action_type: Optional[str] = Query(None, description="이벤트 타입 필터"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    actor: ActorContext = Depends(resolve_current_actor),
+):
+    """에이전트의 감사 이벤트 이력을 조회한다."""
+    _require_admin(actor)
+
+    conditions = [
+        "actor_user_id = %s",
+        "actor_type = 'agent'",
+    ]
+    params: list[Any] = [agent_id]
+
+    if action_type:
+        conditions.append("event_type = %s")
+        params.append(action_type)
+    if start_date:
+        conditions.append("occurred_at >= %s")
+        params.append(start_date)
+    if end_date:
+        conditions.append("occurred_at <= %s")
+        params.append(end_date)
+
+    where = " AND ".join(conditions)
+    offset = (page - 1) * page_size
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) FROM audit_events WHERE {where}", params)
+            total = cur.fetchone()["count"]
+
+            cur.execute(
+                f"""
+                SELECT id, event_type, occurred_at, actor_user_id,
+                       actor_type, acting_on_behalf_of,
+                       CASE WHEN document_id IS NOT NULL THEN 'document'
+                            WHEN version_id IS NOT NULL THEN 'version'
+                            ELSE NULL END AS resource_type,
+                       COALESCE(CAST(document_id AS TEXT), CAST(version_id AS TEXT)) AS resource_id,
+                       previous_state, new_state, action_result, reason
+                FROM audit_events
+                WHERE {where}
+                ORDER BY occurred_at DESC
+                LIMIT %s OFFSET %s
+                """,
+                [*params, page_size, offset],
+            )
+            rows = cur.fetchall()
+
+    items = [
+        AgentAuditItem(
+            id=str(r["id"]),
+            event_type=r["event_type"],
+            occurred_at=r["occurred_at"].isoformat() if hasattr(r["occurred_at"], "isoformat") else str(r["occurred_at"]),
+            actor_id=r["actor_user_id"],
+            actor_type=r["actor_type"],
+            acting_on_behalf_of=r.get("acting_on_behalf_of"),
+            resource_type=r.get("resource_type"),
+            resource_id=r.get("resource_id"),
+            previous_state=r.get("previous_state"),
+            new_state=r.get("new_state"),
+            action_result=r["action_result"],
+            reason=r.get("reason"),
+        )
+        for r in rows
+    ]
+    return AgentAuditListResponse(items=items, total=total, page=page, page_size=page_size)
+
+
+@router.get(
+    "/agents/{agent_id}/statistics",
+    response_model=AgentStatisticsResponse,
+    summary="에이전트 통계 조회 (FG5.3)",
+)
+def get_agent_statistics(
+    agent_id: str,
+    actor: ActorContext = Depends(resolve_current_actor),
+):
+    """에이전트의 제안 통계를 조회한다 (승인율, 평균 검토 시간, 반려 사유 분석)."""
+    _require_admin(actor)
+
+    with get_db() as conn:
+        # 에이전트 이름 조회
+        repo = AgentRepository(conn)
+        agent = repo.get(agent_id)
+        agent_name = agent.name if agent else None
+
+        with conn.cursor() as cur:
+            # 제안 카운트 집계
+            cur.execute(
+                """
+                SELECT
+                    COUNT(*) AS total,
+                    COUNT(*) FILTER (WHERE status = 'approved') AS approved_count,
+                    COUNT(*) FILTER (WHERE status = 'rejected') AS rejected_count,
+                    COUNT(*) FILTER (WHERE status = 'withdrawn') AS withdrawn_count,
+                    AVG(
+                        EXTRACT(EPOCH FROM (review_timestamp - created_at)) / 60
+                    ) FILTER (WHERE review_timestamp IS NOT NULL AND status IN ('approved', 'rejected'))
+                        AS avg_review_minutes,
+                    MAX(updated_at) AS last_activity
+                FROM agent_proposals
+                WHERE agent_id = %s
+                """,
+                (agent_id,),
+            )
+            row = cur.fetchone()
+
+            total = row["total"] or 0
+            approved_count = row["approved_count"] or 0
+            rejected_count = row["rejected_count"] or 0
+            withdrawn_count = row["withdrawn_count"] or 0
+            avg_review_minutes = float(row["avg_review_minutes"]) if row["avg_review_minutes"] is not None else None
+            last_activity = row["last_activity"]
+
+            approval_rate = round(approved_count / total, 4) if total > 0 else 0.0
+
+            # 반려 사유 분석
+            cur.execute(
+                """
+                SELECT review_notes AS reason, COUNT(*) AS count
+                FROM agent_proposals
+                WHERE agent_id = %s AND status = 'rejected'
+                GROUP BY review_notes
+                ORDER BY count DESC
+                LIMIT 10
+                """,
+                (agent_id,),
+            )
+            rejection_rows = cur.fetchall()
+
+    rejection_reasons = [
+        RejectionReasonItem(reason=r["reason"], count=r["count"])
+        for r in rejection_rows
+    ]
+
+    return AgentStatisticsResponse(
+        agent_id=agent_id,
+        agent_name=agent_name,
+        total_proposals=total,
+        approved_count=approved_count,
+        rejected_count=rejected_count,
+        withdrawn_count=withdrawn_count,
+        approval_rate=approval_rate,
+        average_review_time_minutes=avg_review_minutes,
+        last_activity=last_activity.isoformat() if last_activity and hasattr(last_activity, "isoformat") else str(last_activity) if last_activity else None,
+        rejection_reasons=rejection_reasons,
+    )
+
+
+@router.get(
+    "/agents/{agent_id}/rate-limit",
+    response_model=AgentRateLimitResponse,
+    summary="에이전트 Rate Limit 현황 조회 (FG5.3)",
+)
+def get_agent_rate_limit(
+    agent_id: str,
+    actor: ActorContext = Depends(resolve_current_actor),
+):
+    """에이전트의 현재 Rate Limit 카운터 현황을 조회한다."""
+    _require_admin(actor)
+
+    endpoints_info: list[dict] = []
+
+    try:
+        from app.cache.valkey import get_valkey
+        r = get_valkey()
+        # FG5.3: 에이전트별 rate limit 키 패턴: agent:{agent_id}:rate:{endpoint}
+        pattern = f"agent:{agent_id}:rate:*"
+        keys = r.keys(pattern)
+        for key in keys:
+            endpoint_name = key.replace(f"agent:{agent_id}:rate:", "")
+            current = r.get(key)
+            ttl = r.ttl(key)
+            endpoints_info.append({
+                "endpoint": endpoint_name,
+                "current_count": int(current) if current else 0,
+                "ttl_seconds": ttl,
+            })
+    except Exception as exc:
+        logger.warning("Rate limit Valkey 조회 실패: %s", exc)
+        endpoints_info = []
+
+    return AgentRateLimitResponse(agent_id=agent_id, endpoints=endpoints_info)

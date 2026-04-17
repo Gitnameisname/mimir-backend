@@ -51,33 +51,87 @@ from app.schemas.mcp import (
     VerifyCitationRequest,
 )
 from app.config import settings
+from app.security.prompt_injection import (
+    InjectionDetectionResult,
+    content_directive_separator,
+    prompt_injection_detector,
+)
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# REC-4.1: MCP 도구별 속도 제한
+# REC-4.1: MCP 도구별 속도 제한 (IP 기반, 전역)
 _MCP_TOOL_LIMIT = "20/minute"       # 도구 호출 (JSON)
 _MCP_STREAM_LIMIT = "10/minute"     # 도구 호출 (SSE)
 _MCP_READ_LIMIT = "60/minute"       # 리소스/프롬프트 조회
 _MCP_INIT_LIMIT = "30/minute"       # 핸드셰이크
 
-_SERVER_VERSION = "2.0.0-s2-phase4"
+# REC-4.1 (FG5.3 이월): 에이전트별 Rate Limit — Valkey 카운터 기반
+_AGENT_RATE_LIMITS: dict[str, int] = {
+    "tool_call": 20,    # /mcp/tools/call — 분당 최대
+    "stream": 10,       # /mcp/tools/call/stream
+    "read": 60,         # /mcp/resources, /mcp/prompts
+    "init": 30,         # /mcp/initialize
+}
+_AGENT_RATE_WINDOW = 60  # seconds
+
+
+def _check_agent_rate_limit(agent_id: str, endpoint: str) -> bool:
+    """에이전트별 Valkey 기반 Rate Limit 검사.
+
+    반환: True = 통과, False = 한도 초과.
+    Valkey 연결 실패 시 True(통과) — 서비스 degradation 방지 (S2 원칙 ⑦).
+    """
+    limit = _AGENT_RATE_LIMITS.get(endpoint, 60)
+    key = f"agent:{agent_id}:rate:{endpoint}"
+    try:
+        from app.cache.valkey import get_valkey
+        r = get_valkey()
+        pipe = r.pipeline()
+        pipe.incr(key)
+        pipe.expire(key, _AGENT_RATE_WINDOW)
+        results = pipe.execute()
+        count = results[0]
+        return count <= limit
+    except Exception as exc:
+        logger.warning("Agent rate limit Valkey check failed for %s: %s", agent_id, exc)
+        return True  # fail-open
+
+_SERVER_VERSION = "2.0.0-s2-phase5"
 _CURATED_TOOLS = {s["name"] for s in TOOL_SCHEMAS}
 
 
-def _make_metadata(actor: ActorContext, start: float) -> MCPMetadata:
+def _make_metadata(
+    actor: ActorContext,
+    start: float,
+    injection: Optional[InjectionDetectionResult] = None,
+) -> MCPMetadata:
     return MCPMetadata(
         request_id=str(uuid.uuid4()),
         timestamp=datetime.now(timezone.utc).isoformat(),
         agent_id=actor.agent_id,
         execution_time_ms=int((time.monotonic() - start) * 1000),
         trusted=False,
+        injection_risk=injection.injection_risk if injection else False,
+        injection_patterns_detected=(
+            injection.injection_patterns_detected if injection else []
+        ),
+        source_data_untrusted=True,
     )
 
 
-def _ok(data: Any, actor: ActorContext, start: float) -> MCPResponse:
-    return MCPResponse(success=True, data=data, metadata=_make_metadata(actor, start))
+def _ok(
+    data: Any,
+    actor: ActorContext,
+    start: float,
+    injection: Optional[InjectionDetectionResult] = None,
+) -> MCPResponse:
+    return MCPResponse(
+        success=True,
+        data=data,
+        metadata=_make_metadata(actor, start, injection),
+    )
 
 
 def _err(code: str, message: str, actor: ActorContext, start: float) -> MCPResponse:
@@ -86,6 +140,28 @@ def _err(code: str, message: str, actor: ActorContext, start: float) -> MCPRespo
         error=MCPErrorDetail(code=code, message=message),
         metadata=_make_metadata(actor, start),
     )
+
+
+def _run_injection_detection(data: Any) -> InjectionDetectionResult:
+    """도구 결과에서 검색 텍스트를 추출하여 인젝션 탐지를 실행한다."""
+    texts: list[str] = []
+    if isinstance(data, dict):
+        # search_documents: results 목록
+        for item in data.get("results", []):
+            if isinstance(item, dict):
+                texts.append(item.get("content") or item.get("snippet") or "")
+        # fetch_node: content 직접
+        if "content" in data:
+            texts.append(str(data["content"]))
+    elif hasattr(data, "model_dump"):
+        return _run_injection_detection(data.model_dump())
+
+    if not texts:
+        from app.security.prompt_injection import InjectionDetectionResult
+        return InjectionDetectionResult(injection_risk=False, injection_patterns_detected=[])
+
+    results = prompt_injection_detector.detect_batch(texts)
+    return prompt_injection_detector.merge_results(results)
 
 
 # ---------------------------------------------------------------------------
@@ -153,13 +229,23 @@ def mcp_tool_call(
     if not actor.is_authenticated:
         return _err("UNAUTHORIZED", "인증이 필요합니다.", actor, start)
 
+    # FG5.3 REC-4.1: 에이전트별 Rate Limit 검사
+    if actor.agent_id and not _check_agent_rate_limit(actor.agent_id, "tool_call"):
+        return _err("RATE_LIMIT", f"에이전트 {actor.agent_id}의 도구 호출 한도를 초과했습니다.", actor, start)
+
     if tool_name not in _CURATED_TOOLS:
         return _err("INVALID_REQUEST", f"지원하지 않는 도구: {tool_name!r}", actor, start)
 
     try:
         with get_db() as conn:
             data = _dispatch_tool(tool_name, body.params, actor, conn)
-        return _ok(data.model_dump() if hasattr(data, "model_dump") else data, actor, start)
+        raw = data.model_dump() if hasattr(data, "model_dump") else data
+        # FG5.2: 검색 결과에 인젝션 탐지 수행 (search_documents, fetch_node)
+        injection = _run_injection_detection(raw) if tool_name in ("search_documents", "fetch_node") else None
+        # 검색 결과에 untrusted 어노테이션 추가
+        if isinstance(raw, dict) and "results" in raw:
+            raw["results"] = content_directive_separator.annotate_results(raw["results"])
+        return _ok(raw, actor, start, injection)
     except MCPError as exc:
         return _err(exc.code.value, exc.message, actor, start)
     except Exception as exc:
@@ -202,6 +288,12 @@ async def mcp_tool_call_stream(
             yield _sse_chunk({"success": False, "error": {"code": "UNAUTHORIZED", "message": "인증이 필요합니다."}})
         return StreamingResponse(_denied(), media_type="text/event-stream")
 
+    # FG5.3 REC-4.1: 에이전트별 Rate Limit 검사
+    if actor.agent_id and not _check_agent_rate_limit(actor.agent_id, "stream"):
+        async def _rate_limited():
+            yield _sse_chunk({"success": False, "error": {"code": "RATE_LIMIT", "message": f"에이전트 {actor.agent_id}의 스트리밍 한도를 초과했습니다."}})
+        return StreamingResponse(_rate_limited(), media_type="text/event-stream")
+
     import json
 
     async def generate():
@@ -209,10 +301,12 @@ async def mcp_tool_call_stream(
             with get_db() as conn:
                 data = _dispatch_tool(tool_name, body.params, actor, conn)
             result = data.model_dump() if hasattr(data, "model_dump") else data
+            injection = _run_injection_detection(result) if tool_name in ("search_documents", "fetch_node") else None
             items = result.get("results", [result])
             for item in items:
-                yield _sse_chunk({"success": True, "data": item})
-            meta = _make_metadata(actor, start).model_dump()
+                annotated = content_directive_separator.annotate_result(item) if isinstance(item, dict) else item
+                yield _sse_chunk({"success": True, "data": annotated})
+            meta = _make_metadata(actor, start, injection).model_dump()
             yield f"event: done\ndata: {json.dumps({'metadata': meta})}\n\n"
         except MCPError as exc:
             yield _sse_chunk({"success": False, "error": {"code": exc.code.value, "message": exc.message}})

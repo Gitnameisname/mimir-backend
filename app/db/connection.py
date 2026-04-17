@@ -1037,6 +1037,109 @@ CREATE INDEX IF NOT EXISTS idx_api_keys_agent_id
     ON api_keys(agent_id) WHERE agent_id IS NOT NULL;
 """
 
+# ---------------------------------------------------------------------------
+# S2 Phase 5 (FG5.1): 에이전트 제안 — 상태 확장 + 신규 테이블
+# ---------------------------------------------------------------------------
+
+# audit_events 에 acting_on_behalf_of 컬럼 추가 (S2 원칙 ⑥)
+_AUDIT_EVENTS_AGENT_MIGRATION_DDL = """
+ALTER TABLE audit_events
+    ADD COLUMN IF NOT EXISTS acting_on_behalf_of VARCHAR(255);
+"""
+
+# transition_proposals 테이블 — 에이전트의 워크플로 전이 제안
+_TRANSITION_PROPOSALS_DDL = """
+CREATE TABLE IF NOT EXISTS transition_proposals (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    agent_id        UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    document_id     UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    version_id      UUID NOT NULL REFERENCES versions(id) ON DELETE CASCADE,
+    current_state   VARCHAR(50) NOT NULL,
+    proposed_state  VARCHAR(50) NOT NULL,
+    status          VARCHAR(50) NOT NULL DEFAULT 'pending_approval',
+    reason          TEXT,
+    approver_notes  TEXT,
+    reviewed_by     VARCHAR(255),
+    review_notes    TEXT,
+    review_timestamp TIMESTAMPTZ,
+    mcp_task_id     VARCHAR(255),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_transition_proposals_agent_id
+    ON transition_proposals(agent_id);
+CREATE INDEX IF NOT EXISTS idx_transition_proposals_document_id
+    ON transition_proposals(document_id);
+CREATE INDEX IF NOT EXISTS idx_transition_proposals_status
+    ON transition_proposals(status);
+CREATE INDEX IF NOT EXISTS idx_transition_proposals_created_at
+    ON transition_proposals(created_at DESC);
+"""
+
+# agent_proposals 테이블 — 에이전트 제안 통합 큐 (FG5.2)
+# Draft 제안(proposal_type=draft)과 전이 제안(proposal_type=transition)을 단일 큐로 관리
+_AGENT_PROPOSALS_DDL = """
+CREATE TABLE IF NOT EXISTS agent_proposals (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    agent_id         UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    proposal_type    VARCHAR(50) NOT NULL,
+    reference_id     UUID NOT NULL,
+    status           VARCHAR(50) NOT NULL DEFAULT 'pending',
+    reviewed_by      VARCHAR(255),
+    review_notes     TEXT,
+    review_timestamp TIMESTAMPTZ,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT check_proposal_type
+        CHECK (proposal_type IN ('draft', 'transition')),
+    CONSTRAINT check_proposal_status
+        CHECK (status IN ('pending', 'approved', 'rejected', 'withdrawn'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_proposals_agent_id
+    ON agent_proposals(agent_id);
+CREATE INDEX IF NOT EXISTS idx_agent_proposals_status
+    ON agent_proposals(status);
+CREATE INDEX IF NOT EXISTS idx_agent_proposals_proposal_type
+    ON agent_proposals(proposal_type);
+CREATE INDEX IF NOT EXISTS idx_agent_proposals_created_at
+    ON agent_proposals(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_proposals_reference_id
+    ON agent_proposals(reference_id);
+"""
+
+# mcp_tasks 테이블 — MCP Tasks 비동기 승인 플로우 (experimental)
+# MCP Tasks 스펙이 unstable하므로 자체 DB 기반 fallback 구현
+_MCP_TASKS_DDL = """
+CREATE TABLE IF NOT EXISTS mcp_tasks (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    title           VARCHAR(500) NOT NULL,
+    description     TEXT,
+    task_type       VARCHAR(100) NOT NULL DEFAULT 'agent_proposal_review',
+    state           VARCHAR(50) NOT NULL DEFAULT 'input_required',
+    progress        INTEGER NOT NULL DEFAULT 0,
+    reference_type  VARCHAR(50),
+    reference_id    UUID,
+    agent_id        UUID REFERENCES agents(id) ON DELETE SET NULL,
+    assignee_id     VARCHAR(255),
+    result_payload  JSONB NOT NULL DEFAULT '{}',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_mcp_tasks_state
+    ON mcp_tasks(state);
+CREATE INDEX IF NOT EXISTS idx_mcp_tasks_reference
+    ON mcp_tasks(reference_type, reference_id)
+    WHERE reference_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_mcp_tasks_agent_id
+    ON mcp_tasks(agent_id)
+    WHERE agent_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_mcp_tasks_created_at
+    ON mcp_tasks(created_at DESC);
+"""
+
 
 def init_db() -> None:
     """앱 시작 시 모든 테이블을 생성하고 마이그레이션을 적용한다 (idempotent)."""
@@ -1123,7 +1226,13 @@ def init_db() -> None:
                 cur.execute(_SCOPE_DEFINITIONS_DDL)
                 cur.execute(_AGENTS_DDL)
                 cur.execute(_API_KEYS_AGENT_MIGRATION_DDL)
-        logger.info("DB schema initialized (Phase 4 S2 Agent/ScopeProfile domain included)")
+                # S2 Phase 5 (FG5.1): 에이전트 제안 도메인 테이블 생성 (멱등)
+                cur.execute(_AUDIT_EVENTS_AGENT_MIGRATION_DDL)
+                cur.execute(_TRANSITION_PROPOSALS_DDL)
+                cur.execute(_MCP_TASKS_DDL)
+                # S2 Phase 5 (FG5.2): 통합 제안 큐 테이블 생성 (멱등)
+                cur.execute(_AGENT_PROPOSALS_DDL)
+        logger.info("DB schema initialized (S2 Phase 5 FG5.1 Agent Proposal domain included)")
     except Exception as exc:
         logger.error("DB schema initialization failed: %s", exc)
         raise

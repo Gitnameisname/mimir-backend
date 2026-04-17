@@ -29,6 +29,8 @@ from app.api.v1 import citations  # Phase 2: Citation 역참조 API
 from app.api.v1 import conversations  # Phase 3: Conversation Domain API
 from app.api.v1 import mcp_router  # Phase 4: MCP 2025-11-25 Server
 from app.api.v1 import scope_profiles  # Phase 4: Scope Profile + Agent CRUD
+from app.api.v1 import agent_proposals  # S2 Phase 5 (FG5.1): 에이전트 Draft 제안
+from app.api.v1 import proposal_queue  # S2 Phase 5 (FG5.2): 제안 큐 Admin/User API
 
 v1_router = APIRouter()
 
@@ -88,3 +90,9 @@ v1_router.include_router(mcp_router.router, prefix="/mcp", tags=["mcp"])
 
 # Phase 4: Scope Profile CRUD + Agent 관리 + Kill Switch (admin 하위)
 v1_router.include_router(scope_profiles.router, prefix="/admin", tags=["admin", "agents"])
+
+# S2 Phase 5 (FG5.1): 에이전트 Draft 제안 / 워크플로 전이 제안 / 승인·반려
+v1_router.include_router(agent_proposals.router, tags=["agent-proposals"])
+
+# S2 Phase 5 (FG5.2): 제안 큐 Admin/User API
+v1_router.include_router(proposal_queue.router, tags=["proposals"])

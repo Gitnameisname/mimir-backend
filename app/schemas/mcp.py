@@ -31,6 +31,10 @@ class MCPMetadata(BaseModel):
     agent_id: Optional[str] = None
     execution_time_ms: int = 0
     trusted: bool = False
+    # FG5.2: 프롬프트 인젝션 방어 메타플래그
+    injection_risk: bool = False
+    injection_patterns_detected: list[str] = Field(default_factory=list)
+    source_data_untrusted: bool = True
 
 
 class MCPResponse(BaseModel):

@@ -10,6 +10,14 @@ Phase 5 핵심 열거형:
   - 상태(Status)와 액션(Action)은 분리한다. 액션이 상태를 결정한다.
   - 소문자 값으로 DB에 저장 (기존 Phase 4 status 컨벤션 유지).
   - WorkflowRole은 Phase 2 ACL 역할 체계와 향후 연결 예정.
+
+S2 Phase 5 (FG5.1) 확장:
+  - PROPOSED  : 에이전트가 생성한 Draft의 초기 상태 (인간 검토 대기)
+  - WITHDRAWN : 에이전트가 제안을 스스로 회수한 최종 상태
+  전이 경로(에이전트):
+    PROPOSED → APPROVED (인간 승인) → PUBLISHED
+    PROPOSED → REJECTED (인간 반려)
+    PROPOSED → WITHDRAWN (에이전트 회수)
 """
 
 from enum import Enum
@@ -18,9 +26,14 @@ from enum import Enum
 class WorkflowStatus(str, Enum):
     """버전 워크플로 상태.
 
-    전이 경로:
+    인간 생성 경로:
       DRAFT → IN_REVIEW → APPROVED → PUBLISHED → ARCHIVED
                        ↘ REJECTED → DRAFT
+
+    에이전트 생성 경로 (FG5.1):
+      PROPOSED → APPROVED → PUBLISHED
+      PROPOSED → REJECTED
+      PROPOSED → WITHDRAWN
     """
 
     DRAFT = "draft"
@@ -29,6 +42,10 @@ class WorkflowStatus(str, Enum):
     PUBLISHED = "published"
     REJECTED = "rejected"
     ARCHIVED = "archived"
+
+    # S2 Phase 5 (FG5.1): 에이전트 전용 상태
+    PROPOSED = "proposed"
+    WITHDRAWN = "withdrawn"
 
     # Phase 4 호환 내부 상태 (워크플로 전이 대상 아님)
     SUPERSEDED = "superseded"
