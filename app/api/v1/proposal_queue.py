@@ -21,17 +21,22 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
 
+from fastapi import Body
+
 from app.api.auth.dependencies import resolve_current_actor
 from app.api.auth.models import ActorContext
 from app.api.errors.exceptions import ApiPermissionDeniedError
 from app.api.responses import SuccessResponse, success_response
 from app.db.connection import get_db
+from app.services.agent_proposal_service import agent_proposal_service
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
 _ADMIN_ROLES = frozenset({"ORG_ADMIN", "SUPER_ADMIN"})
+_ALLOWED_STATUS = frozenset({"pending", "approved", "rejected", "withdrawn"})
+_ALLOWED_PROPOSAL_TYPE = frozenset({"draft", "transition"})
 
 
 def _require_admin(actor: ActorContext) -> None:
@@ -69,12 +74,18 @@ def list_proposals(
     params: list = []
 
     if status:
+        if status not in _ALLOWED_STATUS:
+            from app.api.errors.exceptions import ApiValidationError
+            raise ApiValidationError(f"허용되지 않은 status 값: {status}")
         filters.append("ap.status = %s")
         params.append(status)
     if agent_id:
         filters.append("ap.agent_id = %s::uuid")
         params.append(agent_id)
     if proposal_type:
+        if proposal_type not in _ALLOWED_PROPOSAL_TYPE:
+            from app.api.errors.exceptions import ApiValidationError
+            raise ApiValidationError(f"허용되지 않은 proposal_type 값: {proposal_type}")
         filters.append("ap.proposal_type = %s")
         params.append(proposal_type)
 
@@ -203,10 +214,15 @@ def get_proposal(
 ) -> SuccessResponse:
     _require_admin(actor)
 
+    # S2 ⑥ + VULN-P7-003: SUPER_ADMIN은 전체, ORG_ADMIN은 자신의 조직 범위만 조회
+    is_super = actor.role == "SUPER_ADMIN"
+    org_filter = "AND (TRUE)" if is_super else "AND a.organization_id = %s::uuid"
+    org_params: list = [] if is_super else [actor.organization_id or ""]
+
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT
                     ap.id, ap.agent_id, a.name AS agent_name,
                     ap.proposal_type, ap.reference_id, ap.status,
@@ -220,14 +236,15 @@ def get_proposal(
                 LEFT JOIN versions v ON v.id = ap.reference_id AND ap.proposal_type = 'draft'
                 LEFT JOIN documents d ON d.id = v.document_id
                 WHERE ap.id = %s::uuid
+                {org_filter}
                 """,
-                (proposal_id,),
+                [proposal_id] + org_params,
             )
             row = cur.fetchone()
 
     if not row:
         from app.api.errors.exceptions import ApiNotFoundError
-        raise ApiNotFoundError(f"제안 {proposal_id}을 찾을 수 없습니다.")
+        raise ApiNotFoundError(f"제안 {proposal_id}을 찾을 수 없거나 접근 권한이 없습니다.")
 
     return success_response(_row_to_proposal(row, include_content=True))
 
@@ -307,6 +324,120 @@ def my_proposals(
         "page": page,
         "page_size": page_size,
     })
+
+
+# ---------------------------------------------------------------------------
+# POST /admin/proposals/batch-approve
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/admin/proposals/batch-approve",
+    response_model=SuccessResponse,
+    summary="에이전트 제안 일괄 승인 (Admin)",
+)
+def batch_approve_proposals(
+    request: Request,
+    ids: list[str] = Body(..., embed=True),
+    feedback: Optional[str] = Body(None, embed=True),
+    actor: ActorContext = Depends(resolve_current_actor),
+) -> SuccessResponse:
+    _require_admin(actor)
+
+    if len(ids) > 200:
+        from app.api.errors.exceptions import ApiConflictError
+        raise ApiConflictError("한 번에 최대 200개까지 일괄 처리 가능합니다.")
+
+    approved = 0
+    failed_ids: list[str] = []
+    with get_db() as conn:
+        for pid in ids:
+            try:
+                agent_proposal_service.approve_draft(
+                    conn,
+                    draft_id=pid,
+                    reviewer_id=actor.resolved_id,
+                    reviewer_role=actor.role,
+                    notes=feedback,
+                )
+                approved += 1
+            except Exception as exc:
+                logger.warning("batch_approve skip %s: %s", pid, exc)
+                failed_ids.append(pid)
+        conn.commit()
+
+    return success_response({"approved": approved, "skipped": len(failed_ids)})
+
+
+# ---------------------------------------------------------------------------
+# POST /admin/proposals/batch-reject
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/admin/proposals/batch-reject",
+    response_model=SuccessResponse,
+    summary="에이전트 제안 일괄 거절 (Admin)",
+)
+def batch_reject_proposals(
+    request: Request,
+    ids: list[str] = Body(..., embed=True),
+    feedback: Optional[str] = Body(None, embed=True),
+    actor: ActorContext = Depends(resolve_current_actor),
+) -> SuccessResponse:
+    _require_admin(actor)
+
+    if len(ids) > 200:
+        from app.api.errors.exceptions import ApiConflictError
+        raise ApiConflictError("한 번에 최대 200개까지 일괄 처리 가능합니다.")
+
+    rejected = 0
+    failed_ids: list[str] = []
+    with get_db() as conn:
+        for pid in ids:
+            try:
+                agent_proposal_service.reject_draft(
+                    conn,
+                    draft_id=pid,
+                    reviewer_id=actor.resolved_id,
+                    reviewer_role=actor.role,
+                    reason=feedback or "",
+                )
+                rejected += 1
+            except Exception as exc:
+                logger.warning("batch_reject skip %s: %s", pid, exc)
+                failed_ids.append(pid)
+        conn.commit()
+
+    return success_response({"rejected": rejected, "skipped": len(failed_ids)})
+
+
+# ---------------------------------------------------------------------------
+# POST /admin/proposals/batch-rollback
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/admin/proposals/batch-rollback",
+    response_model=SuccessResponse,
+    summary="에이전트 제안 일괄 롤백 (Undo, Admin)",
+)
+def batch_rollback_proposals(
+    request: Request,
+    ids: list[str] = Body(..., embed=True),
+    original_action: str = Body(..., embed=True),
+    actor: ActorContext = Depends(resolve_current_actor),
+) -> SuccessResponse:
+    _require_admin(actor)
+
+    with get_db() as conn:
+        result = agent_proposal_service.batch_rollback(
+            conn,
+            proposal_ids=ids,
+            original_action=original_action,
+            reviewer_id=actor.resolved_id,
+            reviewer_role=actor.role,
+        )
+        conn.commit()
+
+    return success_response(result)
 
 
 # ---------------------------------------------------------------------------

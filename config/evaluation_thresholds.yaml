@@ -1,0 +1,75 @@
+metrics:
+  faithfulness:
+    threshold: 0.80
+    description: "답변이 제공된 문서에 충실한 정도"
+    direction: "higher_is_better"
+    unit: "proportion"
+
+  answer_relevance:
+    threshold: 0.75
+    description: "답변이 사용자 질문과 관련성이 있는 정도"
+    direction: "higher_is_better"
+    unit: "proportion"
+
+  context_precision:
+    threshold: 0.75
+    description: "검색된 문맥이 정답과 관련된 정도"
+    direction: "higher_is_better"
+    unit: "proportion"
+
+  context_recall:
+    threshold: 0.75
+    description: "정답과 관련된 모든 문맥을 검색했는지 여부"
+    direction: "higher_is_better"
+    unit: "proportion"
+
+  citation_present:
+    threshold: 0.90
+    description: "답변이 인용을 포함하는 정도"
+    direction: "higher_is_better"
+    unit: "proportion"
+
+  hallucination:
+    threshold: 0.10
+    description: "환각(거짓 정보)의 비율"
+    direction: "lower_is_better"
+    unit: "proportion"
+
+environments:
+  dev:
+    override:
+      faithfulness: 0.75
+      answer_relevance: 0.70
+
+  staging:
+    override: {}
+
+  prod:
+    override: {}
+
+skip_conditions:
+  override_labels:
+    - "evaluation-override"
+    - "ci-override"
+    - "hotfix"
+
+  skip_evaluation_file_patterns:
+    - "docs/**"
+    - "README.md"
+    - ".github/**"
+    - "*.md"
+
+closed_network_mode:
+  fallback_scoring_strategy: "heuristic"
+  fallback_base_scores:
+    faithfulness: 0.82
+    answer_relevance: 0.78
+    context_precision: 0.76
+    context_recall: 0.77
+    citation_present: 0.92
+    hallucination: 0.08
+
+timeouts:
+  workflow_evaluation_timeout_minutes: 30
+  health_check_timeout_seconds: 120
+  backend_startup_wait_seconds: 60

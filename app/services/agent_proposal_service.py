@@ -532,6 +532,95 @@ class AgentProposalService:
         }
 
     # ------------------------------------------------------------------
+    # Batch 롤백 (undo approve/reject)
+    # ------------------------------------------------------------------
+
+    def batch_rollback(
+        self,
+        conn: psycopg2.extensions.connection,
+        *,
+        proposal_ids: list[str],
+        original_action: str,
+        reviewer_id: str,
+        reviewer_role: Optional[str],
+        actor_type: str = "user",
+        request_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """승인/반려된 제안을 pending 상태로 되돌린다 (Undo).
+
+        original_action: "approve" | "reject"
+        committed 상태 버전이 참조된 제안은 롤백 불가(skipped).
+        """
+        if reviewer_role not in _REVIEWER_ROLES:
+            raise ApiPermissionDeniedError("롤백은 REVIEWER/APPROVER/ADMIN 역할이 필요합니다.")
+
+        rollback_from = "approved" if original_action == "approve" else "rejected"
+        now = datetime.now(timezone.utc)
+
+        rolled_back: list[str] = []
+        skipped: list[str] = []
+
+        for pid in proposal_ids:
+            with conn.cursor() as cur:
+                # FOR UPDATE OF ap: 행 잠금으로 동시 상태 변경 방지 (VULN-P7-001)
+                cur.execute(
+                    """
+                    SELECT ap.id, ap.status, ap.reference_id, ap.proposal_type,
+                           v.workflow_status
+                    FROM agent_proposals ap
+                    LEFT JOIN versions v ON v.id = ap.reference_id AND ap.proposal_type = 'draft'
+                    WHERE ap.id = %s::uuid
+                    FOR UPDATE OF ap
+                    """,
+                    (pid,),
+                )
+                row = cur.fetchone()
+
+                if not row or row["status"] != rollback_from:
+                    skipped.append(pid)
+                    continue
+
+                if row.get("workflow_status") == "committed":
+                    skipped.append(pid)
+                    continue
+
+                cur.execute(
+                    """
+                    UPDATE agent_proposals
+                    SET status = 'pending', reviewed_by = NULL, review_notes = NULL,
+                        review_timestamp = NULL, updated_at = %s
+                    WHERE id = %s::uuid
+                    """,
+                    (now, pid),
+                )
+                if row["proposal_type"] == "draft" and row.get("reference_id"):
+                    cur.execute(
+                        "UPDATE versions SET workflow_status = 'proposed' WHERE id = %s",
+                        (str(row["reference_id"]),),
+                    )
+
+            audit_emitter.emit(
+                event_type="agent.proposal.rolled_back",
+                action="admin.batch_rollback",
+                actor_id=reviewer_id,
+                actor_type=actor_type,
+                resource_type="agent_proposal",
+                resource_id=pid,
+                result="success",
+                request_id=request_id,
+                previous_state=rollback_from,
+                new_state="pending",
+                metadata={"original_action": original_action},
+            )
+            rolled_back.append(pid)
+
+        return {
+            "rolled_back": len(rolled_back),
+            "skipped": len(skipped),
+            "skipped_ids": skipped,
+        }
+
+    # ------------------------------------------------------------------
     # MCP Task 생성 (self-hosted fallback)
     # ------------------------------------------------------------------
 

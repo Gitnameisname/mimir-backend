@@ -936,6 +936,32 @@ CREATE TRIGGER trg_conversation_search_vector
     FOR EACH ROW EXECUTE FUNCTION update_conversation_search_vector();
 """
 
+# PH3-CARRY-002: title_tsv — 제목 전용 FTS 컬럼 (task7-10)
+# search_vector 는 레거시 유지, title_tsv 는 ts_rank 기반 정밀 검색용
+_CONVERSATIONS_TITLE_TSV_DDL = """
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS title_tsv tsvector;
+
+UPDATE conversations
+SET title_tsv = to_tsvector('simple', COALESCE(title, ''))
+WHERE title_tsv IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_conv_title_fts
+    ON conversations USING GIN(title_tsv);
+
+CREATE OR REPLACE FUNCTION update_conv_title_tsv()
+RETURNS trigger AS $$
+BEGIN
+    NEW.title_tsv := to_tsvector('simple', COALESCE(NEW.title, ''));
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_conv_title_tsv ON conversations;
+CREATE TRIGGER trg_conv_title_tsv
+    BEFORE INSERT OR UPDATE OF title ON conversations
+    FOR EACH ROW EXECUTE FUNCTION update_conv_title_tsv();
+"""
+
 # ---------------------------------------------------------------------------
 # Phase 3 (S2): audit_events 에 actor_type 컬럼 추가
 #   S2 원칙 ⑥: 감사 로그에 actor_type (user|agent) 필드 필수
@@ -1237,6 +1263,146 @@ CREATE INDEX IF NOT EXISTS idx_mcp_tasks_created_at
     ON mcp_tasks(created_at DESC);
 """
 
+# ---------------------------------------------------------------------------
+# Phase 7 (S2): Golden Set 도메인 테이블 — FG7.1
+# ---------------------------------------------------------------------------
+
+_GOLDEN_SETS_DDL = """
+CREATE TABLE IF NOT EXISTS golden_sets (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    scope_id        UUID NOT NULL,
+    name            VARCHAR(200) NOT NULL,
+    description     TEXT,
+    domain          VARCHAR(50)  NOT NULL DEFAULT 'custom',
+    status          VARCHAR(20)  NOT NULL DEFAULT 'draft',
+    version         INTEGER      NOT NULL DEFAULT 1,
+    extra_metadata  JSONB        NOT NULL DEFAULT '{}',
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    created_by      VARCHAR(255) NOT NULL,
+    updated_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_by      VARCHAR(255),
+    deleted_at      TIMESTAMPTZ,
+    is_deleted      BOOLEAN      NOT NULL DEFAULT FALSE
+);
+
+CREATE INDEX IF NOT EXISTS idx_golden_sets_scope_domain
+    ON golden_sets(scope_id, domain);
+CREATE INDEX IF NOT EXISTS idx_golden_sets_scope_status
+    ON golden_sets(scope_id, status);
+CREATE INDEX IF NOT EXISTS idx_golden_sets_created_by
+    ON golden_sets(created_by);
+CREATE INDEX IF NOT EXISTS idx_golden_sets_is_deleted
+    ON golden_sets(is_deleted);
+
+CREATE TABLE IF NOT EXISTS golden_items (
+    id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    golden_set_id        UUID NOT NULL REFERENCES golden_sets(id) ON DELETE CASCADE,
+    version              INTEGER NOT NULL DEFAULT 1,
+    question             VARCHAR(2000) NOT NULL,
+    expected_answer      TEXT NOT NULL,
+    expected_source_docs JSONB NOT NULL DEFAULT '[]',
+    expected_citations   JSONB NOT NULL DEFAULT '[]',
+    notes                TEXT,
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by           VARCHAR(255) NOT NULL,
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_by           VARCHAR(255),
+    deleted_at           TIMESTAMPTZ,
+    is_deleted           BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+CREATE INDEX IF NOT EXISTS idx_golden_items_golden_set
+    ON golden_items(golden_set_id);
+CREATE INDEX IF NOT EXISTS idx_golden_items_is_deleted
+    ON golden_items(is_deleted);
+CREATE INDEX IF NOT EXISTS idx_golden_items_created_by
+    ON golden_items(created_by);
+
+CREATE TABLE IF NOT EXISTS golden_set_versions (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    golden_set_id   UUID NOT NULL REFERENCES golden_sets(id) ON DELETE CASCADE,
+    version         INTEGER NOT NULL,
+    name            VARCHAR(200) NOT NULL,
+    description     TEXT,
+    domain          VARCHAR(50) NOT NULL,
+    status          VARCHAR(20) NOT NULL,
+    extra_metadata  JSONB NOT NULL DEFAULT '{}',
+    items_snapshot  JSONB NOT NULL DEFAULT '[]',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by      VARCHAR(255) NOT NULL,
+    UNIQUE (golden_set_id, version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_gsv_golden_set
+    ON golden_set_versions(golden_set_id);
+CREATE INDEX IF NOT EXISTS idx_gsv_version
+    ON golden_set_versions(golden_set_id, version);
+"""
+
+_EVALUATION_RUNS_DDL = """
+CREATE TABLE IF NOT EXISTS evaluation_runs (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    batch_id        VARCHAR(200) NOT NULL,
+    status          VARCHAR(20)  NOT NULL DEFAULT 'queued',
+    golden_set_id   UUID,
+    scope_id        UUID NOT NULL,
+    total_items     INTEGER      NOT NULL DEFAULT 0,
+    successful_items INTEGER     NOT NULL DEFAULT 0,
+    failed_items    INTEGER      NOT NULL DEFAULT 0,
+    overall_score   FLOAT,
+    total_tokens    INTEGER      NOT NULL DEFAULT 0,
+    total_latency_ms FLOAT       NOT NULL DEFAULT 0.0,
+    total_cost      FLOAT        NOT NULL DEFAULT 0.0,
+    duration_seconds FLOAT,
+    actor_id        VARCHAR(255) NOT NULL,
+    actor_type      VARCHAR(20)  NOT NULL DEFAULT 'user',
+    metadata_json   JSONB        NOT NULL DEFAULT '{}',
+    started_at      TIMESTAMPTZ,
+    completed_at    TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS evaluation_result_records (
+    id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    run_id               UUID NOT NULL REFERENCES evaluation_runs(id) ON DELETE CASCADE,
+    item_id              VARCHAR(200) NOT NULL,
+    question             TEXT NOT NULL,
+    answer               TEXT NOT NULL,
+    contexts             JSONB NOT NULL DEFAULT '[]',
+    expected_answer      TEXT,
+    expected_sources     JSONB,
+    faithfulness         FLOAT,
+    answer_relevance     FLOAT,
+    context_precision    FLOAT,
+    context_recall       FLOAT,
+    citation_present_rate FLOAT,
+    hallucination_rate   FLOAT,
+    overall_score        FLOAT,
+    retrieval_ms         FLOAT,
+    generation_ms        FLOAT,
+    total_latency_ms     FLOAT,
+    input_tokens         INTEGER,
+    output_tokens        INTEGER,
+    total_tokens         INTEGER,
+    estimated_cost       FLOAT,
+    evaluator_version    VARCHAR(20) NOT NULL DEFAULT '1.0',
+    notes                TEXT,
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_eval_runs_scope_id
+    ON evaluation_runs(scope_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_eval_runs_status
+    ON evaluation_runs(status, scope_id);
+CREATE INDEX IF NOT EXISTS idx_eval_runs_batch_id
+    ON evaluation_runs(batch_id);
+CREATE INDEX IF NOT EXISTS idx_eval_result_run_id
+    ON evaluation_result_records(run_id);
+CREATE INDEX IF NOT EXISTS idx_eval_result_created_at
+    ON evaluation_result_records(created_at DESC);
+"""
+
 
 def init_db() -> None:
     """앱 시작 시 모든 테이블을 생성하고 마이그레이션을 적용한다 (idempotent)."""
@@ -1314,6 +1480,7 @@ def init_db() -> None:
                 cur.execute(_TURNS_DDL)
                 cur.execute(_MESSAGES_DDL)
                 cur.execute(_CONVERSATIONS_FTS_DDL)
+                cur.execute(_CONVERSATIONS_TITLE_TSV_DDL)  # PH3-CARRY-002 (task7-10)
                 # Phase 3 (S2): audit_events actor_type 컬럼 추가 (멱등)
                 cur.execute(_AUDIT_EVENTS_ACTOR_TYPE_MIGRATION_DDL)
                 # Phase 3 (S2): retention_policies 테이블 생성 (멱등)
@@ -1334,7 +1501,11 @@ def init_db() -> None:
                 # S2 Phase 6 (FG6.1): 프롬프트 버전 관리 테이블 + 샘플 시드 (멱등)
                 cur.execute(_PROMPTS_DDL)
                 cur.execute(_PROMPTS_SEED_DDL)
-        logger.info("DB schema initialized (S2 Phase 6 FG6.1 LLM Providers + Prompts included)")
+                # S2 Phase 7 (FG7.1): Golden Set 도메인 테이블 생성 (멱등)
+                cur.execute(_GOLDEN_SETS_DDL)
+                # S2 Phase 7 (FG7.2): Evaluation 도메인 테이블 생성 (멱등)
+                cur.execute(_EVALUATION_RUNS_DDL)
+        logger.info("DB schema initialized (S2 Phase 7 FG7.1+FG7.2 included)")
     except Exception as exc:
         logger.error("DB schema initialization failed: %s", exc)
         raise

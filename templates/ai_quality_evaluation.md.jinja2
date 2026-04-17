@@ -1,0 +1,180 @@
+{# AI품질평가.md — Jinja2 템플릿
+   컨텍스트 변수:
+     report         : ReportData 객체
+     previous_report: ReportData | None  (이전 평가, 선택)
+     metrics_config : Dict[str, MetricConfig]  (threshold/description/direction 속성)
+     dashboard_url  : str | None  (대시보드 링크, 선택)
+#}
+# AI품질평가 보고서
+
+**생성 일시**: {{ report.timestamp }}
+**골든셋**: {{ report.golden_set_id }}
+**프롬프트 버전**: {{ report.prompt_version }}
+**평가 모델**: {{ report.model }}
+**환경**: {{ report.environment }}
+{% if report.closed_network_mode %}
+
+> ⚠️ **폐쇄망 모드**: 이 평가는 규칙 기반 fallback 점수로 실행되었습니다.
+{% endif %}
+
+---
+
+## 요약
+
+| 메트릭 | 실제값 | 임계값 | 상태 | 변화 |
+|--------|--------|--------|------|------|
+{% for metric_name, mres in report.metrics.items() -%}
+{%- set cfg = metrics_config[metric_name] if metric_name in metrics_config else none -%}
+{%- set threshold_str = "%.4f"|format(cfg.threshold) if cfg else "-" -%}
+{%- set status = "✅ PASS" if mres.passed else "❌ FAIL" -%}
+{%- set change = "" -%}
+{%- if previous_report -%}
+  {%- set prev = previous_report.metrics[metric_name] if metric_name in previous_report.metrics else none -%}
+  {%- if prev is not none -%}
+    {%- set diff = mres.value - prev.value -%}
+    {%- if diff > 0.001 -%}{%- set change = "📈 +" + "%.4f"|format(diff) -%}
+    {%- elif diff < -0.001 -%}{%- set change = "📉 " + "%.4f"|format(diff) -%}
+    {%- else -%}{%- set change = "➡️ 유지" -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endif -%}
+| {{ metric_name }} | {{ "%.4f"|format(mres.value) }} | {{ threshold_str }} | {{ status }} | {{ change }} |
+{% endfor %}
+
+**전체 평가**: {% if report.overall_passed %}✅ **통과** ({{ report.passed_metrics }}/{{ report.total_metrics }}){% else %}❌ **미통과** ({{ report.passed_metrics }}/{{ report.total_metrics }}){% endif %}
+
+---
+
+## 상세 결과
+
+### 통과한 메트릭
+
+{% set ns = namespace(any_passed=false) %}
+{% for mn, mr in report.metrics.items() %}{% if mr.passed %}{% set ns.any_passed = true %}
+- ✅ **{{ mn }}**: {{ "%.4f"|format(mr.value) }}{% if mn in metrics_config %} (임계값: {{ "%.4f"|format(metrics_config[mn].threshold) }}){% endif %}
+  {{ metrics_config[mn].description if mn in metrics_config else "" }}
+{% endif %}{% endfor %}
+{% if not ns.any_passed %}_없음_{% endif %}
+
+### 미통과한 메트릭
+
+{% set ns2 = namespace(any_failed=false) %}
+{% for mn, mr in report.metrics.items() %}{% if not mr.passed %}{% set ns2.any_failed = true %}
+{%- set cfg = metrics_config[mn] if mn in metrics_config else none -%}
+- ❌ **{{ mn }}**: {{ "%.4f"|format(mr.value) }}{% if cfg %} (임계값: {{ "%.4f"|format(cfg.threshold) }}, 차이: {{ "%+.4f"|format(mr.value - cfg.threshold) }}){% endif %}
+  {{ cfg.description if cfg else "" }}
+{% endif %}{% endfor %}
+{% if not ns2.any_failed %}_없음_{% endif %}
+
+---
+
+## 항목별 상세 평가
+
+**총 평가 항목**: {{ report.evaluation_items | length }}
+
+{% for item in report.evaluation_items[:10] %}
+### {{ loop.index }}. {{ item.question[:80] }}{% if item.question | length > 80 %}...{% endif %}
+
+**질문**:
+```
+{{ item.question }}
+```
+
+**예상 답변**:
+```
+{{ item.expected_answer if item.expected_answer else "(미지정)" }}
+```
+
+**생성된 답변**:
+```
+{{ item.generated_answer if item.generated_answer else "(없음)" }}
+```
+
+**평가 점수**:
+
+| 메트릭 | 점수 |
+|--------|------|
+| Faithfulness | {{ "%.4f"|format(item.faithfulness) if item.faithfulness is not none else "-" }} |
+| Answer Relevance | {{ "%.4f"|format(item.answer_relevance) if item.answer_relevance is not none else "-" }} |
+| Context Precision | {{ "%.4f"|format(item.context_precision) if item.context_precision is not none else "-" }} |
+| Context Recall | {{ "%.4f"|format(item.context_recall) if item.context_recall is not none else "-" }} |
+| Citation Present | {{ "%.4f"|format(item.citation_present) if item.citation_present is not none else "-" }} |
+| Hallucination | {{ "%.4f"|format(item.hallucination) if item.hallucination is not none else "-" }} |
+
+---
+
+{% endfor %}
+{% if report.evaluation_items | length > 10 %}
+**... 그 외 {{ report.evaluation_items | length - 10 }}개 항목** (대시보드에서 전체 확인 가능)
+{% endif %}
+
+---
+
+## 분석 및 인사이트
+
+### 강점
+{% if report.insights and report.insights.strengths %}
+{% for s in report.insights.strengths %}- {{ s }}
+{% endfor %}
+{% else %}
+_분석 대기 중_
+{% endif %}
+
+### 약점
+{% if report.insights and report.insights.weaknesses %}
+{% for w in report.insights.weaknesses %}- {{ w }}
+{% endfor %}
+{% else %}
+_분석 대기 중_
+{% endif %}
+
+### 권장사항
+{% if report.insights and report.insights.recommendations %}
+{% for r in report.insights.recommendations %}- {{ r }}
+{% endfor %}
+{% else %}
+_권장사항 없음_
+{% endif %}
+
+---
+{% if previous_report %}
+
+## 추세 분석
+
+### 이전 평가 대비
+
+**이전 평가 일시**: {{ previous_report.timestamp }}
+
+| 메트릭 | 이전값 | 현재값 | 변화 | 상태 |
+|--------|--------|--------|------|------|
+{% for mn, mr in report.metrics.items() -%}
+{%- if mn in previous_report.metrics -%}
+{%- set prev = previous_report.metrics[mn] -%}
+{%- set diff = mr.value - prev.value -%}
+{%- set trend = "📈" if diff > 0.001 else ("📉" if diff < -0.001 else "➡️") -%}
+| {{ mn }} | {{ "%.4f"|format(prev.value) }} | {{ "%.4f"|format(mr.value) }} | {{ trend }} {{ "%+.4f"|format(diff) }} | {% if mr.passed %}✅{% else %}❌{% endif %} |
+{% endif -%}
+{% endfor %}
+
+### 종합 변화
+
+- **이전**: {% if previous_report.overall_passed %}✅ 통과{% else %}❌ 미통과{% endif %} ({{ previous_report.passed_metrics }}/{{ previous_report.total_metrics }})
+- **현재**: {% if report.overall_passed %}✅ 통과{% else %}❌ 미통과{% endif %} ({{ report.passed_metrics }}/{{ report.total_metrics }})
+
+---
+{% endif %}
+
+## 추가 정보
+
+- **커밋 SHA**: {% if report.commit_sha %}`{{ report.commit_sha }}`{% else %}_미지정_{% endif %}
+- **PR 번호**: {% if report.pr_number %}#{{ report.pr_number }}{% else %}_미지정_{% endif %}
+- **폐쇄망 모드**: {% if report.closed_network_mode %}Yes{% else %}No{% endif %}
+- **백엔드 URL**: `{{ report.backend_url if report.backend_url else "(미지정)" }}`
+{% if dashboard_url %}
+
+📊 **[대시보드에서 보기]({{ dashboard_url }})**
+{% endif %}
+
+---
+
+*자동 생성됨 — Mimir AI품질평가시스템*

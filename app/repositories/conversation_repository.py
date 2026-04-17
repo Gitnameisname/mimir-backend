@@ -284,6 +284,66 @@ class ConversationRepository:
     # 만료 관리 (PII 생명주기 — Task 3-3 배치에서 호출)
     # ------------------------------------------------------------------
 
+    def search_conversations(
+        self,
+        scope_id: str,
+        search_term: str,
+        *,
+        offset: int = 0,
+        limit: int = 20,
+    ) -> tuple[list[Conversation], int]:
+        """title_tsv FTS 기반 대화 검색 (PH3-CARRY-002, task7-10).
+
+        S2 원칙 ⑥: scope_id(organization_id) ACL 필터 필수.
+        plainto_tsquery('simple', ...) 사용: 한/영 혼합 공백 토큰화.
+        ts_rank 기준 내림차순 정렬.
+
+        title_tsv IS NULL 인 극소수 레코드(트리거 이전 생성분)는
+        ILIKE 폴백으로 포함한다.
+        """
+        safe_term = search_term.strip()
+        if not safe_term:
+            return [], 0
+
+        params_fts: list[Any] = [scope_id, safe_term]
+        params_like: list[Any] = [scope_id, f"%{safe_term}%"]
+
+        fts_cond = """
+            (
+                (title_tsv IS NOT NULL AND title_tsv @@ plainto_tsquery('simple', %s))
+                OR
+                (title_tsv IS NULL AND title ILIKE %s)
+            )
+        """
+
+        count_sql = f"""
+            SELECT COUNT(*) FROM conversations
+            WHERE organization_id = %s
+              AND deleted_at IS NULL
+              AND {fts_cond}
+        """
+        list_sql = f"""
+            SELECT *,
+                   ts_rank(title_tsv, plainto_tsquery('simple', %s)) AS _rank
+            FROM conversations
+            WHERE organization_id = %s
+              AND deleted_at IS NULL
+              AND {fts_cond}
+            ORDER BY _rank DESC, created_at DESC
+            LIMIT %s OFFSET %s
+        """
+
+        count_params = [scope_id, safe_term, safe_term]
+        list_params = [safe_term, scope_id, safe_term, safe_term, limit, offset]
+
+        with self._conn.cursor() as cur:
+            cur.execute(count_sql, count_params)
+            total: int = cur.fetchone()["count"]
+            cur.execute(list_sql, list_params)
+            rows = cur.fetchall()
+
+        return [_row_to_conversation(r) for r in rows], total
+
     def list_expired(self, limit: int = 200) -> list[Conversation]:
         """expires_at 이 현재 시각 이전인 활성 대화 목록."""
         sql = """

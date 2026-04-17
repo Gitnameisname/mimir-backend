@@ -31,6 +31,8 @@ from app.api.v1 import mcp_router  # Phase 4: MCP 2025-11-25 Server
 from app.api.v1 import scope_profiles  # Phase 4: Scope Profile + Agent CRUD
 from app.api.v1 import agent_proposals  # S2 Phase 5 (FG5.1): 에이전트 Draft 제안
 from app.api.v1 import proposal_queue  # S2 Phase 5 (FG5.2): 제안 큐 Admin/User API
+from app.api.v1 import golden_sets  # S2 Phase 7 (FG7.1): Golden Set 도메인
+from app.api.v1 import evaluations  # S2 Phase 7 (FG7.2): 평가 실행 API
 
 v1_router = APIRouter()
 
@@ -96,3 +98,8 @@ v1_router.include_router(agent_proposals.router, tags=["agent-proposals"])
 
 # S2 Phase 5 (FG5.2): 제안 큐 Admin/User API
 v1_router.include_router(proposal_queue.router, tags=["proposals"])
+
+# S2 Phase 7 (FG7.1): Golden Set 도메인 (RAG 품질 평가 기준 데이터)
+v1_router.include_router(golden_sets.router, prefix="/golden-sets", tags=["golden-sets"])
+# S2 Phase 7 (FG7.2): 평가 실행 API
+v1_router.include_router(evaluations.router, prefix="/evaluations", tags=["evaluations"])
