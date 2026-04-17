@@ -826,6 +826,7 @@ INSERT INTO system_settings (category, key, value, description) VALUES
   ('system', 'maintenance_mode', 'false'::jsonb, '유지보수 모드 활성화'),
   ('notification', 'email_enabled', 'true'::jsonb, '이메일 알림 활성화'),
   ('notification', 'webhook_enabled', 'false'::jsonb, '웹훅 알림 활성화'),
+  ('auth', 'email_verification_required', 'true'::jsonb, '이메일 인증 필수 여부 (false이면 가입 후 관리자 승인 필요)'),
   ('security', 'api_rate_limit_per_minute', '100'::jsonb, 'API 분당 요청 제한'),
   ('security', 'require_email_verification', 'false'::jsonb, '이메일 인증 필수 여부')
 ON CONFLICT (category, key) DO NOTHING;
@@ -1109,6 +1110,102 @@ CREATE INDEX IF NOT EXISTS idx_agent_proposals_reference_id
     ON agent_proposals(reference_id);
 """
 
+# llm_providers 테이블 — S2 Phase 6 (FG6.1) 관리자 지정 LLM/Embedding 프로바이더
+_LLM_PROVIDERS_DDL = """
+CREATE TABLE IF NOT EXISTS llm_providers (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name             VARCHAR(255) NOT NULL,
+    type             VARCHAR(32)  NOT NULL CHECK (type IN ('llm', 'embedding')),
+    model_name       VARCHAR(255) NOT NULL,
+    api_base_url     VARCHAR(1024),
+    api_key          TEXT,
+    description      VARCHAR(500),
+    is_default       BOOLEAN NOT NULL DEFAULT FALSE,
+    status           VARCHAR(32)  NOT NULL DEFAULT 'active'
+                         CHECK (status IN ('active', 'inactive', 'error')),
+    last_tested_at   TIMESTAMPTZ,
+    last_test_result VARCHAR(32),
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_llm_providers_type ON llm_providers(type);
+CREATE INDEX IF NOT EXISTS idx_llm_providers_is_default ON llm_providers(is_default);
+"""
+
+# prompts / prompt_versions 테이블 — S2 Phase 6 (FG6.1) 관리자 프롬프트 버전 관리
+_PROMPTS_DDL = """
+CREATE TABLE IF NOT EXISTS prompts (
+    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name              VARCHAR(255) NOT NULL UNIQUE,
+    description       VARCHAR(500),
+    active_version_id UUID,
+    ab_test_config    JSONB,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS prompt_versions (
+    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    prompt_id      UUID NOT NULL REFERENCES prompts(id) ON DELETE CASCADE,
+    version_number INT  NOT NULL,
+    content        TEXT NOT NULL,
+    created_by     VARCHAR(255),
+    is_active      BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (prompt_id, version_number)
+);
+
+ALTER TABLE prompts
+    ADD COLUMN IF NOT EXISTS active_version_id UUID REFERENCES prompt_versions(id) ON DELETE SET NULL;
+
+CREATE INDEX IF NOT EXISTS idx_prompt_versions_prompt_id ON prompt_versions(prompt_id);
+"""
+
+_PROMPTS_SEED_DDL = """
+DO $$
+DECLARE
+    p_id  UUID;
+    pv_id UUID;
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM prompts WHERE name = 'rag_system_prompt') THEN
+        INSERT INTO prompts (name, description)
+        VALUES (
+            'rag_system_prompt',
+            'RAG 질의응답 시스템 기본 프롬프트. 검색된 문서 컨텍스트를 바탕으로 정확하고 출처 명시된 답변을 생성합니다.'
+        )
+        RETURNING id INTO p_id;
+
+        INSERT INTO prompt_versions (prompt_id, version_number, content, created_by, is_active)
+        VALUES (
+            p_id,
+            1,
+            $PROMPT$당신은 Mimir 지식 관리 시스템의 AI 어시스턴트입니다.
+아래에 제공된 [참고 문서]를 바탕으로 사용자의 질문에 답변하세요.
+
+## 지침
+- 반드시 제공된 참고 문서의 내용만을 근거로 답변하세요.
+- 답변에 사용한 정보의 출처(문서 제목 또는 섹션)를 명시하세요.
+- 참고 문서에서 답을 찾을 수 없는 경우 "제공된 문서에서 해당 정보를 찾을 수 없습니다"라고 솔직하게 말하세요.
+- 추측이나 외부 지식으로 답변을 보완하지 마세요.
+- 한국어로 질문하면 한국어로, 영어로 질문하면 영어로 답변하세요.
+
+## 참고 문서
+{context}
+
+## 사용자 질문
+{question}$PROMPT$,
+            'system',
+            TRUE
+        )
+        RETURNING id INTO pv_id;
+
+        UPDATE prompts SET active_version_id = pv_id WHERE id = p_id;
+    END IF;
+END;
+$$;
+"""
+
 # mcp_tasks 테이블 — MCP Tasks 비동기 승인 플로우 (experimental)
 # MCP Tasks 스펙이 unstable하므로 자체 DB 기반 fallback 구현
 _MCP_TASKS_DDL = """
@@ -1232,7 +1329,12 @@ def init_db() -> None:
                 cur.execute(_MCP_TASKS_DDL)
                 # S2 Phase 5 (FG5.2): 통합 제안 큐 테이블 생성 (멱등)
                 cur.execute(_AGENT_PROPOSALS_DDL)
-        logger.info("DB schema initialized (S2 Phase 5 FG5.1 Agent Proposal domain included)")
+                # S2 Phase 6 (FG6.1): LLM 프로바이더 테이블 생성 (멱등)
+                cur.execute(_LLM_PROVIDERS_DDL)
+                # S2 Phase 6 (FG6.1): 프롬프트 버전 관리 테이블 + 샘플 시드 (멱등)
+                cur.execute(_PROMPTS_DDL)
+                cur.execute(_PROMPTS_SEED_DDL)
+        logger.info("DB schema initialized (S2 Phase 6 FG6.1 LLM Providers + Prompts included)")
     except Exception as exc:
         logger.error("DB schema initialization failed: %s", exc)
         raise

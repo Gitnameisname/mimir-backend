@@ -43,7 +43,7 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, Response
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
 
 from app.api.auth import ResourceRef, authorization_service, get_permission_matrix, resolve_current_actor
 from app.api.auth.models import ActorContext
@@ -206,7 +206,7 @@ def get_dashboard_errors(
         }
         for r in rows
     ]
-    return success_response(data={"items": items})
+    return success_response(data=items)
 
 
 @router.get("/dashboard/recent-audit-logs", summary="최근 감사 이벤트 요약")
@@ -237,7 +237,7 @@ def get_dashboard_recent_audit_logs(
         }
         for r in rows
     ]
-    return success_response(data={"items": items})
+    return success_response(data=items)
 
 
 # ---------------------------------------------------------------------------
@@ -495,7 +495,7 @@ def list_roles(_=Depends(require_admin_access)):
         }
         for r in rows
     ]
-    return success_response(data={"items": items})
+    return list_response(data=items, total=len(items))
 
 
 @router.get("/roles/permissions/matrix", summary="역할-권한 매트릭스")
@@ -744,7 +744,7 @@ def list_document_types(
     ] + extra_items
 
     items.sort(key=lambda x: x["type_code"])
-    return success_response(data={"items": items})
+    return list_response(data=items, total=len(items))
 
 
 @router.get("/document-types/{type_code}", summary="DocumentType 상세")
@@ -1073,7 +1073,7 @@ def _format_job(r) -> dict:
 # ===========================================================================
 
 _VALID_ROLES = {"VIEWER", "AUTHOR", "REVIEWER", "APPROVER", "ORG_ADMIN", "SUPER_ADMIN"}
-_VALID_STATUSES = {"ACTIVE", "INACTIVE", "SUSPENDED"}
+_VALID_STATUSES = {"ACTIVE", "INACTIVE", "SUSPENDED", "PENDING"}
 
 
 class CreateUserBody(BaseModel):
@@ -1143,6 +1143,38 @@ def update_user(user_id: str, body: UpdateUserBody, _=Depends(require_admin_acce
         "role_name": user.role_name,
         "status": user.status,
         "updated_at": user.updated_at.isoformat(),
+    })
+
+
+@router.post("/users/{user_id}/activate", summary="대기 사용자 승인 활성화")
+def activate_user(user_id: str, request: Request, actor: ActorContext = Depends(resolve_current_actor)):
+    """PENDING 상태 사용자를 ACTIVE로 전환 (이메일 인증 비활성화 시 관리자 수동 승인)."""
+    from app.audit.emitter import audit_emitter
+    from app.api.context import get_request_ids
+    req_id, _ = get_request_ids(request)
+
+    with get_db() as conn:
+        user = users_repository.get_by_id(conn, user_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다.")
+        if user.status != "PENDING":
+            raise HTTPException(status_code=409, detail=f"대기 상태가 아닙니다. 현재 상태: {user.status}")
+        updated = users_repository.update(conn, user_id, status="ACTIVE")
+
+    audit_emitter.emit(
+        event_type="user.activated",
+        action="admin.activate_user",
+        actor_id=actor.actor_id,
+        resource_type="user",
+        resource_id=user_id,
+        result="success",
+        request_id=req_id,
+        metadata={"actor_type": actor.actor_type},
+    )
+    return success_response(data={
+        "id": updated.id,
+        "email": updated.email,
+        "status": updated.status,
     })
 
 
@@ -3055,3 +3087,478 @@ def get_admin_capabilities(
     data = _get_full_capabilities()
     response.headers["Cache-Control"] = "private, max-age=300"
     return success_response(data=data)
+
+
+# ===========================================================================
+# S2 Phase 6 (FG6.1): LLM 프로바이더 CRUD
+# ===========================================================================
+
+def _provider_row(r: dict) -> dict:
+    return {
+        "id": str(r["id"]),
+        "name": r["name"],
+        "type": r["type"],
+        "model_name": r["model_name"],
+        "api_base_url": r["api_base_url"],
+        "description": r["description"],
+        "is_default": r["is_default"],
+        "status": r["status"],
+        "last_tested_at": r["last_tested_at"].isoformat() if r["last_tested_at"] else None,
+        "last_test_result": r["last_test_result"],
+        "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+        "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
+    }
+
+
+@router.get("/providers", summary="LLM 프로바이더 목록")
+def list_providers(_=Depends(require_admin_access)):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM llm_providers ORDER BY type, is_default DESC, name"
+            )
+            rows = cur.fetchall()
+    return success_response(data=[_provider_row(r) for r in rows])
+
+
+def _validate_api_key(v: Optional[str]) -> Optional[str]:
+    if v and not v.isascii():
+        raise ValueError("API Key는 ASCII 문자만 허용됩니다")
+    return v
+
+
+class CreateProviderBody(BaseModel):
+    name: str = Field(..., min_length=1, max_length=255)
+    type: str = Field(..., pattern="^(llm|embedding)$")
+    model_name: str = Field(..., min_length=1, max_length=255)
+    api_base_url: Optional[str] = Field(None, max_length=1024)
+    api_key: Optional[str] = None
+    description: Optional[str] = Field(None, max_length=500)
+    is_default: bool = False
+
+    @field_validator("api_key")
+    @classmethod
+    def check_api_key(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_api_key(v)
+
+
+class UpdateProviderBody(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=255)
+    model_name: Optional[str] = Field(None, min_length=1, max_length=255)
+    api_base_url: Optional[str] = Field(None, max_length=1024)
+    api_key: Optional[str] = None
+    description: Optional[str] = Field(None, max_length=500)
+    status: Optional[str] = Field(None, pattern="^(active|inactive)$")
+
+    @field_validator("api_key")
+    @classmethod
+    def check_api_key(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_api_key(v)
+
+
+@router.post("/providers", summary="LLM 프로바이더 생성", status_code=201)
+def create_provider(body: CreateProviderBody, _=Depends(require_admin_access)):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            if body.is_default:
+                cur.execute(
+                    "UPDATE llm_providers SET is_default = FALSE WHERE type = %s",
+                    (body.type,),
+                )
+            cur.execute(
+                """
+                INSERT INTO llm_providers
+                    (name, type, model_name, api_base_url, api_key, description, is_default)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING *
+                """,
+                (body.name, body.type, body.model_name, body.api_base_url,
+                 body.api_key, body.description, body.is_default),
+            )
+            row = cur.fetchone()
+    return success_response(data=_provider_row(row))
+
+
+@router.patch("/providers/{provider_id}", summary="LLM 프로바이더 수정")
+def update_provider(
+    provider_id: str,
+    body: UpdateProviderBody,
+    _=Depends(require_admin_access),
+):
+    updates = {
+        k: v for k, v in body.model_dump().items()
+        if v is not None and not (k == "api_key" and v == "")
+    }
+    if not updates:
+        raise HTTPException(status_code=422, detail="변경할 항목이 없습니다.")
+
+    set_clauses = [f"{k} = %s" for k in updates] + ["updated_at = NOW()"]
+    values = list(updates.values()) + [provider_id]
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE llm_providers SET {', '.join(set_clauses)} WHERE id = %s RETURNING *",
+                values,
+            )
+            row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="프로바이더를 찾을 수 없습니다.")
+    return success_response(data=_provider_row(row))
+
+
+@router.delete("/providers/{provider_id}", summary="LLM 프로바이더 삭제", status_code=204)
+def delete_provider(provider_id: str, _=Depends(require_admin_access)):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM llm_providers WHERE id = %s RETURNING id", (provider_id,))
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="프로바이더를 찾을 수 없습니다.")
+
+
+class SetDefaultBody(BaseModel):
+    type: Optional[str] = None
+
+
+@router.post("/providers/{provider_id}/set-default", summary="기본 프로바이더 지정")
+def set_default_provider(
+    provider_id: str,
+    body: SetDefaultBody = SetDefaultBody(),
+    _=Depends(require_admin_access),
+):
+    type_: Optional[str] = body.type
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM llm_providers WHERE id = %s", (provider_id,))
+            provider = cur.fetchone()
+            if not provider:
+                raise HTTPException(status_code=404, detail="프로바이더를 찾을 수 없습니다.")
+            ptype = type_ or provider["type"]
+            cur.execute(
+                "UPDATE llm_providers SET is_default = FALSE WHERE type = %s",
+                (ptype,),
+            )
+            cur.execute(
+                "UPDATE llm_providers SET is_default = TRUE, updated_at = NOW() WHERE id = %s RETURNING *",
+                (provider_id,),
+            )
+            row = cur.fetchone()
+    return success_response(data=_provider_row(row))
+
+
+@router.post("/providers/{provider_id}/test", summary="프로바이더 연결 테스트")
+def test_provider(provider_id: str, _=Depends(require_admin_access)):
+    import time
+    from datetime import timezone
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM llm_providers WHERE id = %s", (provider_id,))
+            provider = cur.fetchone()
+            if not provider:
+                raise HTTPException(status_code=404, detail="프로바이더를 찾을 수 없습니다.")
+
+    # 실제 연결 테스트 (api_base_url이 있으면 /models 엔드포인트 GET, 없으면 mock)
+    import httpx
+    start = time.monotonic()
+    success_flag = False
+    error_msg: Optional[str] = None
+    error_detail: Optional[str] = None
+    http_status: Optional[int] = None
+
+    try:
+        base_url = provider["api_base_url"]
+        if base_url:
+            headers = {}
+            if provider["api_key"]:
+                headers["Authorization"] = f"Bearer {provider['api_key']}"
+            with httpx.Client(timeout=10.0) as client:
+                resp = client.get(base_url.rstrip("/") + "/models", headers=headers)
+            http_status = resp.status_code
+            success_flag = resp.status_code < 400
+            if not success_flag:
+                _status_labels = {
+                    400: "잘못된 요청",
+                    401: "인증 실패 — API Key를 확인하세요",
+                    403: "접근 권한 없음",
+                    404: "엔드포인트를 찾을 수 없음 — API Base URL을 확인하세요",
+                    429: "요청 횟수 초과 (Rate Limit)",
+                    500: "서버 내부 오류",
+                    502: "게이트웨이 오류",
+                    503: "서비스 이용 불가",
+                }
+                error_msg = _status_labels.get(resp.status_code, f"HTTP {resp.status_code} 오류")
+                # 응답 바디에서 오류 메시지 추출
+                try:
+                    body = resp.json()
+                    if isinstance(body, dict):
+                        error_detail = (
+                            body.get("error", {}).get("message")
+                            or body.get("message")
+                            or body.get("detail")
+                            or resp.text[:500]
+                        )
+                    else:
+                        error_detail = resp.text[:500]
+                except Exception:
+                    error_detail = resp.text[:500] if resp.text else None
+        else:
+            success_flag = True  # URL 미설정 시 mock 성공 처리
+    except UnicodeEncodeError:
+        error_msg = "API Key에 사용할 수 없는 문자가 포함되어 있습니다"
+        error_detail = "HTTP 헤더는 ASCII 문자만 허용합니다. API Key를 다시 확인하세요."
+    except httpx.ConnectError as exc:
+        error_msg = "연결 실패: 서버에 접근할 수 없습니다"
+        error_detail = str(exc)
+    except httpx.TimeoutException:
+        error_msg = "연결 시간 초과 (10초)"
+        error_detail = f"URL: {provider['api_base_url']}"
+    except Exception as exc:
+        error_msg = type(exc).__name__
+        error_detail = str(exc)
+
+    latency_ms = int((time.monotonic() - start) * 1000)
+    result_str = "success" if success_flag else "error"
+    tested_at = __import__("datetime").datetime.now(timezone.utc)
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE llm_providers
+                SET last_tested_at = %s, last_test_result = %s,
+                    status = %s, updated_at = NOW()
+                WHERE id = %s
+                """,
+                (tested_at, result_str,
+                 "active" if success_flag else "error",
+                 provider_id),
+            )
+
+    return success_response(data={
+        "success": success_flag,
+        "latency_ms": latency_ms if success_flag else None,
+        "http_status": http_status,
+        "error": error_msg,
+        "error_detail": error_detail,
+        "tested_at": tested_at.isoformat(),
+    })
+
+
+# ===========================================================================
+# S2 Phase 6 (FG6.1): 프롬프트 버전 관리 CRUD
+# ===========================================================================
+
+def _prompt_version_row(r: dict) -> dict:
+    return {
+        "id": str(r["id"]),
+        "prompt_id": str(r["prompt_id"]),
+        "version_number": r["version_number"],
+        "content": r["content"],
+        "created_by": r["created_by"],
+        "created_at": r["created_at"].isoformat(),
+        "is_active": r["is_active"],
+    }
+
+
+def _prompt_row(r: dict, versions: list | None = None) -> dict:
+    row = {
+        "id": str(r["id"]),
+        "name": r["name"],
+        "description": r["description"],
+        "active_version": r.get("active_version_number"),
+        "active_version_id": str(r["active_version_id"]) if r.get("active_version_id") else None,
+        "ab_test_config": r["ab_test_config"],
+        "created_at": r["created_at"].isoformat(),
+        "updated_at": r["updated_at"].isoformat(),
+    }
+    if versions is not None:
+        row["versions"] = versions
+    return row
+
+
+@router.get("/prompts", summary="프롬프트 목록")
+def list_prompts(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    _=Depends(require_admin_access),
+):
+    offset = (page - 1) * page_size
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS total FROM prompts")
+            total = cur.fetchone()["total"]
+            cur.execute(
+                """
+                SELECT p.*, pv.version_number AS active_version_number
+                FROM prompts p
+                LEFT JOIN prompt_versions pv ON pv.id = p.active_version_id
+                ORDER BY p.updated_at DESC
+                LIMIT %s OFFSET %s
+                """,
+                (page_size, offset),
+            )
+            rows = cur.fetchall()
+    items = [_prompt_row(r) for r in rows]
+    return list_response(data=items, page=page, page_size=page_size, total=total)
+
+
+@router.get("/prompts/{prompt_id}", summary="프롬프트 상세 (버전 포함)")
+def get_prompt(prompt_id: str, _=Depends(require_admin_access)):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT p.*, pv.version_number AS active_version_number
+                FROM prompts p
+                LEFT JOIN prompt_versions pv ON pv.id = p.active_version_id
+                WHERE p.id = %s
+                """,
+                (prompt_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="프롬프트를 찾을 수 없습니다.")
+            cur.execute(
+                "SELECT * FROM prompt_versions WHERE prompt_id = %s ORDER BY version_number",
+                (prompt_id,),
+            )
+            ver_rows = cur.fetchall()
+    versions = [_prompt_version_row(v) for v in ver_rows]
+    return success_response(data=_prompt_row(row, versions=versions))
+
+
+class CreatePromptBody(BaseModel):
+    name: str = Field(..., min_length=1, max_length=255)
+    description: Optional[str] = Field(None, max_length=500)
+    content: str = Field(..., min_length=1)
+
+
+@router.post("/prompts", summary="프롬프트 생성", status_code=201)
+def create_prompt(
+    body: CreatePromptBody,
+    _=Depends(require_admin_access),
+    actor: ActorContext = Depends(resolve_current_actor),
+):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO prompts (name, description) VALUES (%s, %s) RETURNING *",
+                (body.name, body.description),
+            )
+            prompt = cur.fetchone()
+            prompt_id = prompt["id"]
+            cur.execute(
+                """
+                INSERT INTO prompt_versions (prompt_id, version_number, content, created_by, is_active)
+                VALUES (%s, 1, %s, %s, TRUE)
+                RETURNING *
+                """,
+                (prompt_id, body.content, str(actor.actor_id) if actor.actor_id else None),
+            )
+            ver = cur.fetchone()
+            cur.execute(
+                "UPDATE prompts SET active_version_id = %s, updated_at = NOW() WHERE id = %s RETURNING *",
+                (ver["id"], prompt_id),
+            )
+            prompt = cur.fetchone()
+    prompt_dict = dict(prompt)
+    prompt_dict["active_version_number"] = 1
+    return success_response(data=_prompt_row(prompt_dict, versions=[_prompt_version_row(ver)]))
+
+
+class NewVersionBody(BaseModel):
+    content: str = Field(..., min_length=1)
+
+
+@router.post("/prompts/{prompt_id}/versions", summary="새 프롬프트 버전 생성")
+def create_prompt_version(
+    prompt_id: str,
+    body: NewVersionBody,
+    _=Depends(require_admin_access),
+    actor: ActorContext = Depends(resolve_current_actor),
+):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM prompts WHERE id = %s", (prompt_id,))
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="프롬프트를 찾을 수 없습니다.")
+            cur.execute(
+                "SELECT COALESCE(MAX(version_number), 0) + 1 AS next_ver FROM prompt_versions WHERE prompt_id = %s",
+                (prompt_id,),
+            )
+            next_ver = cur.fetchone()["next_ver"]
+            cur.execute(
+                """
+                INSERT INTO prompt_versions (prompt_id, version_number, content, created_by, is_active)
+                VALUES (%s, %s, %s, %s, FALSE)
+                RETURNING *
+                """,
+                (prompt_id, next_ver, body.content, str(actor.actor_id) if actor.actor_id else None),
+            )
+            ver = cur.fetchone()
+    return success_response(data=_prompt_version_row(ver))
+
+
+@router.post("/prompts/{prompt_id}/versions/{version_id}/activate", summary="버전 활성화")
+def activate_prompt_version(
+    prompt_id: str,
+    version_id: str,
+    _=Depends(require_admin_access),
+):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM prompt_versions WHERE id = %s AND prompt_id = %s",
+                (version_id, prompt_id),
+            )
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="버전을 찾을 수 없습니다.")
+            cur.execute(
+                "UPDATE prompt_versions SET is_active = FALSE WHERE prompt_id = %s",
+                (prompt_id,),
+            )
+            cur.execute(
+                "UPDATE prompt_versions SET is_active = TRUE WHERE id = %s RETURNING version_number",
+                (version_id,),
+            )
+            active_ver = cur.fetchone()["version_number"]
+            cur.execute(
+                "UPDATE prompts SET active_version_id = %s, updated_at = NOW() WHERE id = %s RETURNING *",
+                (version_id, prompt_id),
+            )
+            prompt = cur.fetchone()
+    prompt_dict = dict(prompt)
+    prompt_dict["active_version_number"] = active_ver
+    return success_response(data=_prompt_row(prompt_dict))
+
+
+class ABTestBody(BaseModel):
+    ab_test_config: Optional[dict] = None
+
+
+@router.patch("/prompts/{prompt_id}/ab-test", summary="A/B 테스트 설정")
+def set_prompt_ab_test(
+    prompt_id: str,
+    body: ABTestBody,
+    _=Depends(require_admin_access),
+):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            import json as _json
+            cur.execute(
+                "UPDATE prompts SET ab_test_config = %s, updated_at = NOW() WHERE id = %s RETURNING *",
+                (_json.dumps(body.ab_test_config) if body.ab_test_config else None, prompt_id),
+            )
+            prompt = cur.fetchone()
+            if not prompt:
+                raise HTTPException(status_code=404, detail="프롬프트를 찾을 수 없습니다.")
+            cur.execute(
+                "SELECT version_number FROM prompt_versions WHERE id = %s",
+                (prompt["active_version_id"],) if prompt["active_version_id"] else (None,),
+            )
+            ver_row = cur.fetchone()
+    prompt_dict = dict(prompt)
+    prompt_dict["active_version_number"] = ver_row["version_number"] if ver_row else None
+    return success_response(data=_prompt_row(prompt_dict))

@@ -210,6 +210,15 @@ def register(body: RegisterRequest, request: Request):
         #    TOCTOU: 사전 존재 검사와 INSERT 사이의 레이스로 인해 UNIQUE 제약 위반이
         #    발생할 수 있으므로 409 로 변환한다. 위반된 컬럼을 pgcode/메시지로
         #    식별하기 어려우므로 이메일/아이디 둘 다 재확인하여 분기한다.
+        from app.repositories.settings_repository import settings_repository
+        email_verify_setting = settings_repository.get_one(conn, "auth", "email_verification_required")
+        email_verification_required = (
+            email_verify_setting["value"] if email_verify_setting is not None else True
+        )
+        # 이메일 인증 ON → 즉시 ACTIVE, 인증 메일 발송
+        # 이메일 인증 OFF → PENDING 상태, 관리자 승인 필요
+        initial_status = "ACTIVE" if email_verification_required else "PENDING"
+
         hashed = hash_password(body.password)
         try:
             user = users_repository.create(
@@ -217,7 +226,7 @@ def register(body: RegisterRequest, request: Request):
                 email=email_lower,
                 display_name=body.display_name.strip(),
                 role_name="VIEWER",
-                status="ACTIVE",
+                status=initial_status,
                 password_hash=hashed,
                 auth_provider="local",
                 email_verified=False,
@@ -245,17 +254,18 @@ def register(body: RegisterRequest, request: Request):
     )
     logger.info("user_registered email=%s user_id=%s", email_lower, user.id)
 
-    # Phase 14-5: 이메일 인증 메일 발송 (실패해도 가입 흐름 블로킹 안 함)
-    try:
-        verify_token = create_purpose_token(
-            user_id=user.id,
-            purpose="email_verify",
-            expire_minutes=1440,  # 24시간
-        )
-        verify_url = f"{settings.frontend_url}/verify-email?token={verify_token}"
-        email_service.send_email_verification(email_lower, verify_url)
-    except Exception:
-        logger.exception("verify_email_send_failed user_id=%s", user.id)
+    # 이메일 인증이 활성화된 경우에만 인증 메일 발송 (실패해도 가입 흐름 블로킹 안 함)
+    if email_verification_required:
+        try:
+            verify_token = create_purpose_token(
+                user_id=user.id,
+                purpose="email_verify",
+                expire_minutes=1440,  # 24시간
+            )
+            verify_url = f"{settings.frontend_url}/verify-email?token={verify_token}"
+            email_service.send_email_verification(email_lower, verify_url)
+        except Exception:
+            logger.exception("verify_email_send_failed user_id=%s", user.id)
 
     return success_response(
         data=RegisterResponse(
@@ -310,6 +320,8 @@ def login(body: LoginRequest, request: Request, response: Response):
                 result="denied", request_id=req_id,
                 metadata={"reason": "account_inactive", "status": user.status},
             )
+            if user.status == "PENDING":
+                raise HTTPException(status_code=403, detail="관리자 승인 대기 중인 계정입니다. 관리자에게 문의하세요.")
             raise HTTPException(status_code=403, detail="비활성 또는 정지된 계정입니다")
 
         # 4. DB 수준 잠금 확인

@@ -19,6 +19,7 @@ import logging
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query, Request
+from fastapi.responses import JSONResponse
 
 from app.api.auth.dependencies import resolve_current_actor
 from app.api.auth.models import ActorContext
@@ -118,12 +119,14 @@ def list_proposals(
             total = cur.fetchone()["total"]
 
     items = [_row_to_proposal(r) for r in rows]
-    return success_response({
-        "items": items,
-        "total": total,
-        "page": page,
-        "page_size": page_size,
-        "pages": (total + page_size - 1) // page_size,
+    return JSONResponse({
+        "data": items,
+        "meta": {
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": (total + page_size - 1) // page_size,
+        },
     })
 
 
