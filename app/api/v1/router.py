@@ -27,6 +27,8 @@ from app.api.v1 import auth_router as auth
 from app.api.v1 import account_router as account
 from app.api.v1 import citations  # Phase 2: Citation 역참조 API
 from app.api.v1 import conversations  # Phase 3: Conversation Domain API
+from app.api.v1 import mcp_router  # Phase 4: MCP 2025-11-25 Server
+from app.api.v1 import scope_profiles  # Phase 4: Scope Profile + Agent CRUD
 
 v1_router = APIRouter()
 
@@ -80,3 +82,9 @@ v1_router.include_router(citations.router, tags=["citations"])
 
 # Phase 3: Conversation Domain API
 v1_router.include_router(conversations.router, prefix="/conversations", tags=["conversations"])
+
+# Phase 4: MCP 2025-11-25 Server
+v1_router.include_router(mcp_router.router, prefix="/mcp", tags=["mcp"])
+
+# Phase 4: Scope Profile CRUD + Agent 관리 + Kill Switch (admin 하위)
+v1_router.include_router(scope_profiles.router, prefix="/admin", tags=["admin", "agents"])

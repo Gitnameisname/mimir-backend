@@ -230,12 +230,13 @@ def _hash_api_key(api_key: str) -> str:
 
 
 def _extract_api_key_actor(api_key: str) -> ActorContext:
-    """API key로 user actor를 반환한다.
+    """API key로 actor를 반환한다.
 
     검증 절차:
       1. key_prefix(앞 8자리)로 후보 행 조회 — DB 인덱스 활용
       2. 전달된 key의 SHA-256 hash와 DB의 key_hash를 hmac.compare_digest()로 비교
       3. 불일치 시 인증 실패 (fail-closed)
+      4. principal_type='agent'이면 AGENT ActorContext + kill-switch 확인
     """
     _FAIL = ActorContext(
         actor_type=ActorType.USER,
@@ -252,7 +253,9 @@ def _extract_api_key_actor(api_key: str) -> ActorContext:
                 prefix = api_key[:8] if len(api_key) >= 8 else api_key
                 cur.execute(
                     """
-                    SELECT ak.issuer_id, ak.key_hash, u.role_name
+                    SELECT ak.id AS api_key_id, ak.issuer_id, ak.key_hash, ak.principal_type,
+                           ak.agent_id, ak.scope_profile_id, ak.expires_at,
+                           u.role_name
                     FROM api_keys ak
                     LEFT JOIN users u ON u.id::text = ak.issuer_id
                     WHERE ak.key_prefix = %s AND ak.status = 'ACTIVE'
@@ -282,6 +285,12 @@ def _extract_api_key_actor(api_key: str) -> ActorContext:
                 except Exception:
                     pass
 
+                principal_type = (row.get("principal_type") or "user").lower()
+
+                # S2 Phase 4: agent principal 처리
+                if principal_type == "agent" and row.get("agent_id"):
+                    return _extract_agent_context(conn, row)
+
                 return ActorContext(
                     actor_type=ActorType.USER,
                     actor_id=row["issuer_id"],
@@ -294,6 +303,65 @@ def _extract_api_key_actor(api_key: str) -> ActorContext:
         logger.warning("api_key lookup failed: %s", exc)
 
     return _FAIL
+
+
+def _extract_agent_context(conn, api_key_row) -> ActorContext:
+    """API Key 행에서 AGENT ActorContext를 생성한다.
+
+    킬스위치(is_disabled=True) 확인 — 비활성 에이전트는 anonymous 반환.
+    REC-4.3: 에이전트 키는 expires_at 필수 — NULL이면 거부.
+    """
+    agent_id = str(api_key_row["agent_id"])
+    _FAIL = ActorContext(
+        actor_type=ActorType.ANONYMOUS,
+        actor_id=None,
+        is_authenticated=False,
+        auth_method=AuthMethod.API_KEY,
+        tenant_id=None,
+        role=None,
+    )
+
+    if api_key_row.get("expires_at") is None:
+        logger.warning(
+            "agent api_key rejected: expires_at is NULL (agent_id=%s). "
+            "Agent keys must have an explicit expiration.",
+            agent_id,
+        )
+        return _FAIL
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT is_disabled, organization_id, scope_profile_id FROM agents WHERE id = %s",
+                (agent_id,),
+            )
+            agent_row = cur.fetchone()
+        if not agent_row:
+            logger.warning("agent_id=%s not found in agents table", agent_id)
+            return _FAIL
+        if agent_row["is_disabled"]:
+            logger.warning("agent_id=%s is kill-switched — rejecting", agent_id)
+            return _FAIL
+
+        scope_profile_id = (
+            str(api_key_row.get("scope_profile_id"))
+            if api_key_row.get("scope_profile_id")
+            else (str(agent_row["scope_profile_id"]) if agent_row.get("scope_profile_id") else None)
+        )
+
+        return ActorContext(
+            actor_type=ActorType.AGENT,
+            actor_id=agent_id,
+            is_authenticated=True,
+            auth_method=AuthMethod.API_KEY,
+            tenant_id=str(agent_row["organization_id"]) if agent_row.get("organization_id") else None,
+            role=None,
+            agent_id=agent_id,
+            scope_profile_id=scope_profile_id,
+        )
+    except Exception as exc:
+        logger.warning("agent context extraction failed agent_id=%s: %s", agent_id, exc)
+        return _FAIL
 
 
 def _extract_session_actor(session_token: str) -> ActorContext:

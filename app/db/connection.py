@@ -969,6 +969,74 @@ CREATE INDEX IF NOT EXISTS ix_retention_policies_organization_id
     ON retention_policies(organization_id);
 """
 
+# ---------------------------------------------------------------------------
+# Phase 4 (S2): scope_profiles / scope_definitions / agents 테이블
+# ---------------------------------------------------------------------------
+
+_SCOPE_PROFILES_DDL = """
+CREATE TABLE IF NOT EXISTS scope_profiles (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name            VARCHAR(255) NOT NULL,
+    description     TEXT,
+    organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_scope_profiles_organization_id
+    ON scope_profiles(organization_id);
+CREATE INDEX IF NOT EXISTS idx_scope_profiles_name
+    ON scope_profiles(name);
+"""
+
+_SCOPE_DEFINITIONS_DDL = """
+CREATE TABLE IF NOT EXISTS scope_definitions (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    scope_profile_id UUID NOT NULL REFERENCES scope_profiles(id) ON DELETE CASCADE,
+    scope_name       VARCHAR(100) NOT NULL,
+    description      TEXT,
+    acl_filter       JSONB NOT NULL DEFAULT '{}',
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (scope_profile_id, scope_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_scope_definitions_profile_id
+    ON scope_definitions(scope_profile_id);
+"""
+
+_AGENTS_DDL = """
+CREATE TABLE IF NOT EXISTS agents (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name             VARCHAR(255) NOT NULL,
+    description      TEXT,
+    organization_id  UUID REFERENCES organizations(id) ON DELETE SET NULL,
+    scope_profile_id UUID REFERENCES scope_profiles(id) ON DELETE SET NULL,
+    is_disabled      BOOLEAN NOT NULL DEFAULT FALSE,
+    disabled_at      TIMESTAMPTZ,
+    disabled_reason  TEXT,
+    metadata         JSONB NOT NULL DEFAULT '{}',
+    created_by       UUID REFERENCES users(id) ON DELETE SET NULL,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_agents_organization_id
+    ON agents(organization_id);
+CREATE INDEX IF NOT EXISTS idx_agents_scope_profile_id
+    ON agents(scope_profile_id);
+CREATE INDEX IF NOT EXISTS idx_agents_is_disabled
+    ON agents(is_disabled);
+"""
+
+_API_KEYS_AGENT_MIGRATION_DDL = """
+ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS scope_profile_id UUID REFERENCES scope_profiles(id) ON DELETE SET NULL;
+ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS principal_type VARCHAR(50) NOT NULL DEFAULT 'user';
+ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS agent_id UUID REFERENCES agents(id) ON DELETE SET NULL;
+
+CREATE INDEX IF NOT EXISTS idx_api_keys_agent_id
+    ON api_keys(agent_id) WHERE agent_id IS NOT NULL;
+"""
+
 
 def init_db() -> None:
     """앱 시작 시 모든 테이블을 생성하고 마이그레이션을 적용한다 (idempotent)."""
@@ -1050,7 +1118,12 @@ def init_db() -> None:
                 cur.execute(_AUDIT_EVENTS_ACTOR_TYPE_MIGRATION_DDL)
                 # Phase 3 (S2): retention_policies 테이블 생성 (멱등)
                 cur.execute(_RETENTION_POLICIES_DDL)
-        logger.info("DB schema initialized (Phase 3 S2 Conversation domain included)")
+                # Phase 4 (S2): Scope Profile + Agent 도메인 테이블 생성 (멱등)
+                cur.execute(_SCOPE_PROFILES_DDL)
+                cur.execute(_SCOPE_DEFINITIONS_DDL)
+                cur.execute(_AGENTS_DDL)
+                cur.execute(_API_KEYS_AGENT_MIGRATION_DDL)
+        logger.info("DB schema initialized (Phase 4 S2 Agent/ScopeProfile domain included)")
     except Exception as exc:
         logger.error("DB schema initialization failed: %s", exc)
         raise

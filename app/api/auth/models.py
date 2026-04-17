@@ -13,6 +13,7 @@ Actor 분류 모델.
 actor_type 분류:
   - anonymous     : 인증 입력 없음
   - user          : 사람 사용자 (session/bearer/api_key)
+  - agent         : AI 에이전트 (S2 Phase 4 — API key 또는 OAuth client-credentials)
   - service       : 내부 서비스 caller (internal_service header)
 
 auth_method 값:
@@ -25,7 +26,7 @@ auth_method 값:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
@@ -33,6 +34,7 @@ from typing import Optional
 class ActorType(str, Enum):
     ANONYMOUS = "anonymous"
     USER = "user"
+    AGENT = "agent"      # S2 Phase 4: AI 에이전트 Principal
     SERVICE = "service"
 
 
@@ -48,13 +50,15 @@ class ActorContext:
     """요청 주체 컨텍스트.
 
     Attributes:
-        actor_type:       anonymous / user / service
-        actor_id:         식별된 경우의 사용자/서비스 ID (미검증 시 None)
-        is_authenticated: 실제 검증 성공 여부
-        auth_method:      어떤 입력 소스로 식별 시도했는지
-        tenant_id:        멀티테넌시 scope (미검증 시 None)
-        role:             전역 역할명 (VIEWER / AUTHOR / REVIEWER / APPROVER / ORG_ADMIN / SUPER_ADMIN)
-                          인증되지 않은 경우 None.
+        actor_type:        anonymous / user / agent / service
+        actor_id:          식별된 경우의 사용자/서비스/에이전트 ID (미검증 시 None)
+        is_authenticated:  실제 검증 성공 여부
+        auth_method:       어떤 입력 소스로 식별 시도했는지
+        tenant_id:         멀티테넌시 scope (미검증 시 None)
+        role:              전역 역할명 (VIEWER / AUTHOR / ...)  인증 미확인 시 None
+        agent_id:          에이전트 UUID (actor_type=AGENT 전용)
+        scope_profile_id:  바인딩된 ScopeProfile UUID (에이전트 전용)
+        acting_on_behalf_of: 위임 대상 User ID (에이전트 위임 호출 시)
     """
 
     actor_type: ActorType
@@ -63,6 +67,10 @@ class ActorContext:
     auth_method: Optional[AuthMethod]
     tenant_id: Optional[str]
     role: Optional[str] = None
+    # S2 Phase 4: 에이전트 전용 필드
+    agent_id: Optional[str] = field(default=None)
+    scope_profile_id: Optional[str] = field(default=None)
+    acting_on_behalf_of: Optional[str] = field(default=None)  # User ID (위임)
 
     @property
     def is_anonymous(self) -> bool:
@@ -73,10 +81,15 @@ class ActorContext:
         return self.actor_type == ActorType.SERVICE
 
     @property
-    def resolved_id(self) -> Optional[str]:
-        """인증된 경우 actor_id, 미인증이면 None.
+    def is_agent(self) -> bool:
+        return self.actor_type == ActorType.AGENT
 
-        라우터에서 반복되는 ``actor.actor_id if actor.is_authenticated else None``
-        패턴을 대체하는 편의 프로퍼티.
-        """
+    @property
+    def resolved_id(self) -> Optional[str]:
+        """인증된 경우 actor_id, 미인증이면 None."""
         return self.actor_id if self.is_authenticated else None
+
+    @property
+    def audit_actor_type(self) -> str:
+        """감사 로그용 actor_type 문자열 (S2 원칙 ⑥)."""
+        return self.actor_type.value

@@ -73,6 +73,27 @@ def create_app() -> FastAPI:
     # API router 등록: /api prefix
     app.include_router(api_router, prefix="/api")
 
+    # Phase 4 (S2): .well-known/mimir-mcp 메타데이터 엔드포인트
+    from fastapi.responses import JSONResponse
+    from app.schemas.mcp import TOOL_SCHEMAS, MIMIR_EXTENSIONS
+
+    @app.get("/.well-known/mimir-mcp", include_in_schema=False)
+    def well_known_mcp():
+        return JSONResponse({
+            "mcp_version": "2025-11-25",
+            "server_id": "mimir-s2",
+            "capabilities": {
+                "tools": [t["name"] for t in TOOL_SCHEMAS],
+                "resources": True,
+                "prompts": True,
+                "tasks": False,
+            },
+            "authentication": "oauth2_client_credentials",
+            "scope_profile_required": True,
+            "extensions": MIMIR_EXTENSIONS,
+            "documentation_url": "/docs",
+        })
+
     # DB 초기화: documents 테이블 생성 (idempotent)
     @app.on_event("startup")
     def on_startup() -> None:
