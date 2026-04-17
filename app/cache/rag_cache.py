@@ -12,7 +12,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import os
 from datetime import datetime, timedelta, timezone
@@ -94,8 +93,8 @@ def _get(key: str) -> Optional[Any]:
         try:
             from app.cache.response_cache import get_cached
             return get_cached(key)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Valkey get failed, falling back to LRU: %s", exc)
     return _lru.get(key)
 
 
@@ -105,8 +104,8 @@ def _set(key: str, value: Any, ttl: int) -> None:
             from app.cache.response_cache import set_cached
             set_cached(key, value, ttl)
             return
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Valkey set failed, falling back to LRU: %s", exc)
     _lru.set(key, value, ttl)
 
 
@@ -119,8 +118,8 @@ def _del_prefix(prefix: str) -> int:
             keys = list(r.scan_iter(f"{prefix}*"))
             if keys:
                 count += r.delete(*keys)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Valkey del_prefix failed, falling back to LRU: %s", exc)
     count += _lru.delete_prefix(prefix)
     return count
 

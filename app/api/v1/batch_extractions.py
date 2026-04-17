@@ -21,7 +21,7 @@ import logging
 from typing import AsyncGenerator, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 
 from app.api.auth.dependencies import resolve_current_actor

@@ -27,7 +27,7 @@ import hmac
 import logging
 
 import jwt
-from fastapi import Request
+from fastapi import Depends, HTTPException, Request, status
 
 from app.api.auth.models import ActorContext, ActorType, AuthMethod
 from app.config import settings
@@ -102,8 +102,9 @@ def _extract_actor(request: Request) -> ActorContext:
     if session_token:
         return _extract_session_actor(session_token)
 
-    # 5. 개발용 헤더 (X-Actor-Id + X-Actor-Role) — debug=True 전용 (VULN-002 수정)
-    if settings.debug:
+    # 5. 개발용 헤더 (X-Actor-Id + X-Actor-Role) — debug=True + dev/test 환경 전용
+    _DEV_ENVS = ("development", "test")
+    if settings.debug and settings.environment in _DEV_ENVS:
         actor_id = request.headers.get("X-Actor-Id")
         actor_role = request.headers.get("X-Actor-Role")
         if actor_id and actor_role:
@@ -174,8 +175,13 @@ def _extract_bearer_actor(token: str, request: Request) -> ActorContext:
     secret = settings.jwt_secret
 
     if not secret:
-        # jwt_secret 미설정 — debug 환경에서는 개발 헤더 폴백 허용
-        if settings.debug:
+        # jwt_secret 미설정 — debug 모드 + development/test 환경에서만 개발 헤더 폴백 허용
+        _DEV_ENVS = ("development", "test")
+        if settings.debug and settings.environment in _DEV_ENVS:
+            logger.warning(
+                "JWT_SECRET not configured — falling back to X-Actor-Id/X-Actor-Role headers "
+                "(development only, never use in production)"
+            )
             actor_id = request.headers.get("X-Actor-Id") or None
             actor_role = request.headers.get("X-Actor-Role")
             role: str | None = actor_role if actor_role in _VALID_ROLES else None
@@ -282,8 +288,12 @@ def _extract_api_key_actor(api_key: str) -> ActorContext:
                         " WHERE key_prefix = %s",
                         (prefix,),
                     )
-                except Exception:
-                    pass
+                except Exception as tracking_exc:
+                    logger.warning(
+                        "api_key last_used_at update failed (key_prefix=%s): %s",
+                        prefix,
+                        tracking_exc,
+                    )
 
                 principal_type = (row.get("principal_type") or "user").lower()
 
@@ -408,6 +418,34 @@ def _extract_dev_header_actor(actor_id: str, actor_role: str) -> ActorContext:
         tenant_id=None,
         role=role,
     )
+
+
+def require_authenticated(
+    actor: ActorContext = Depends(resolve_current_actor),
+) -> ActorContext:
+    """인증된 actor만 허용한다. 미인증 요청은 401 Unauthorized로 거부한다.
+
+    Default deny 원칙 (OWASP A05): 명시적 인증 없으면 모든 접근을 차단한다.
+    """
+    if not actor.is_authenticated:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return actor
+
+
+def require_role(*allowed_roles: str):
+    """지정된 역할만 허용한다. 권한 없으면 403 Forbidden."""
+    def _check(actor: ActorContext = Depends(require_authenticated)) -> ActorContext:
+        if actor.role not in allowed_roles:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Insufficient permissions",
+            )
+        return actor
+    return _check
 
 
 def _anonymous_actor() -> ActorContext:

@@ -2186,8 +2186,8 @@ def get_component_status(_=Depends(require_admin_access)):
             try:
                 info = client.info("memory")
                 valkey_meta["used_memory_human"] = info.get("used_memory_human")
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Valkey memory info 조회 실패: %s", exc)
     except Exception as exc:
         valkey_meta["error"] = str(exc)[:200]
     components.append({
@@ -2389,8 +2389,8 @@ def create_alert_rule(
             result="success",
             metadata={"name": rule["name"], "severity": rule["severity"]},
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("감사 이벤트 기록 실패: %s", exc)
 
     return success_response(data=rule)
 
@@ -2458,8 +2458,8 @@ def update_alert_rule(
             result="success",
             metadata={"changed_fields": list(fields.keys())},
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("감사 이벤트 기록 실패: %s", exc)
 
     return success_response(data=updated)
 
@@ -2492,8 +2492,8 @@ def delete_alert_rule(
             resource_id=rule_id,
             result="success",
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("감사 이벤트 기록 실패: %s", exc)
 
     return success_response(data={"deleted": True})
 
@@ -2568,8 +2568,8 @@ def acknowledge_alert(
             resource_id=history_id,
             result="success",
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("감사 이벤트 기록 실패: %s", exc)
 
     return success_response(data=acked)
 
@@ -2617,13 +2617,14 @@ def _schedule_with_runs(
     if cron:
         try:
             result["schedule_description"] = describe_ko(cron)
-        except Exception:
+        except Exception as exc:
+            logger.debug("cron 설명 생성 실패: %s", exc)
             result["schedule_description"] = None
         if schedule.get("enabled") and not schedule.get("next_run_at"):
             try:
                 result["next_run_at"] = next_run(cron)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("next_run 계산 실패: %s", exc)
     else:
         result["schedule_description"] = None
 
@@ -2698,8 +2699,8 @@ def run_job_schedule(
             result="success",
             metadata={"run_id": run_id},
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("감사 이벤트 기록 실패: %s", exc)
 
     return success_response(data={"message": "작업이 시작되었습니다", "run_id": run_id})
 
@@ -2726,7 +2727,8 @@ def update_job_schedule(
         fields["schedule"] = body.schedule
         try:
             fields["next_run_at"] = cron_next(body.schedule)
-        except Exception:
+        except Exception as exc:
+            logger.debug("cron next_run 계산 실패: %s", exc)
             fields["next_run_at"] = None
     if body.enabled is not None:
         fields["enabled"] = body.enabled
@@ -2749,8 +2751,8 @@ def update_job_schedule(
             result="success",
             metadata={"changed_fields": list(fields.keys())},
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("감사 이벤트 기록 실패: %s", exc)
 
     return success_response(data=updated)
 
@@ -2785,8 +2787,8 @@ def cancel_job_schedule(
             result="success",
             metadata={"cancelled_run_id": cancelled_id},
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("감사 이벤트 기록 실패: %s", exc)
 
     return success_response(data={"message": "작업 취소가 요청되었습니다", "run_id": cancelled_id})
 
@@ -3301,7 +3303,8 @@ def test_provider(provider_id: str, _=Depends(require_admin_access)):
                         )
                     else:
                         error_detail = resp.text[:500]
-                except Exception:
+                except Exception as exc:
+                    logger.debug("webhook 응답 파싱 실패: %s", exc)
                     error_detail = resp.text[:500] if resp.text else None
         else:
             success_flag = True  # URL 미설정 시 mock 성공 처리

@@ -320,8 +320,8 @@ async def _stream_rag(
                     elif event == "citation":
                         final_citations = payload["data"].get("citations", [])
                         final_chunks = payload["data"].get("context_chunks", [])
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("SSE 이벤트 파싱 실패 (계속 진행): %s", exc)
 
         # --- DB 단계 4: 어시스턴트 응답 저장 ---
         if full_answer:

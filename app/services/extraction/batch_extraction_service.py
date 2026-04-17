@@ -16,17 +16,19 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 from uuid import UUID
 
+from psycopg2.extras import RealDictCursor
+
 from app.db.connection import get_db
+from app.observability.logging import log_api_event
 from app.models.batch_extraction import BatchJobStatus
 from app.repositories.batch_extraction_repository import (
     BatchExtractionJobRepository,
     ExtractionRetryLogRepository,
 )
-from app.repositories.approved_extraction_repository import ApprovedExtractionRepository
 from app.services.extraction.extraction_pipeline_service import ExtractionPipelineService
 
 logger = logging.getLogger(__name__)
@@ -76,8 +78,8 @@ def run_batch_extraction_background(
                 repo = BatchExtractionJobRepository(conn)
                 repo.update_status(UUID(job_id), BatchJobStatus.FAILED, error_summary=str(exc))
                 conn.commit()
-        except Exception:
-            pass
+        except Exception as status_exc:
+            logger.warning("Batch job %s 상태 업데이트 실패: %s", job_id, status_exc)
 
 
 # ---------------------------------------------------------------------------
@@ -182,12 +184,28 @@ async def _execute_batch(
             repo.update_status(job_id, final_status, error_summary=error_summary)
             conn.commit()
 
+        log_api_event(
+            event_type="batch_extraction.finished",
+            actor_type="system",
+            resource_type="batch_extraction_job",
+            resource_id=str(job_id),
+            result="success" if final_status == BatchJobStatus.COMPLETED else "failure",
+            extra={"completed": completed, "failed": failed, "skipped": skipped},
+        )
         logger.info(
             "Batch job %s finished: status=%s ok=%d fail=%d",
             job_id, final_status.value, completed, failed,
         )
 
     except Exception as exc:
+        log_api_event(
+            event_type="batch_extraction.error",
+            actor_type="system",
+            resource_type="batch_extraction_job",
+            resource_id=str(job_id),
+            result="failure",
+            extra={"error": str(exc)},
+        )
         logger.error("Batch job %s failed: %s", job_id, exc, exc_info=True)
         with get_db() as conn:
             repo = BatchExtractionJobRepository(conn)
@@ -325,7 +343,12 @@ async def _re_extract_document(
         conn.commit()
 
 
-def _fetch_doc_and_schema(conn, document_id: UUID, schema_id: str, schema_version: int):
+def _fetch_doc_and_schema(
+    conn: Any,
+    document_id: UUID,
+    schema_id: str,
+    schema_version: int,
+) -> tuple[str, dict[str, Any]]:
     """문서 본문 텍스트와 추출 스키마 필드를 조회한다."""
     # 문서 본문: nodes 테이블에서 content 결합
     with conn.cursor() as cur:
@@ -345,7 +368,7 @@ def _fetch_doc_and_schema(conn, document_id: UUID, schema_id: str, schema_versio
         doc_text = row[0] if row and row[0] else ""
 
     # 스키마 필드
-    with conn.cursor(cursor_factory=__import__("psycopg2.extras", fromlist=["RealDictCursor"]).RealDictCursor) as cur:
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
             """
             SELECT fields

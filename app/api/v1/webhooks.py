@@ -10,8 +10,34 @@ TODO (향후 구현 예정):
   - 전달 상태 확인 API
   - 중복 방지(idempotency) 연계
 """
-from fastapi import APIRouter
+from urllib.parse import urlparse
+
+from fastapi import APIRouter, HTTPException
 
 router = APIRouter()
+
+# SSRF 방어: 웹훅 URL 허용 목록 (allowlist) 기반 검증
+_ALLOWED_URL_SCHEMES = {"https"}
+
+
+def validate_webhook_url(url: str) -> str:
+    """웹훅 대상 URL을 검증한다.
+
+    - https 스킴만 허용 (SSRF 방어)
+    - 로컬호스트/내부 IP 차단
+    - 빈 URL 거부
+    """
+    if not url:
+        raise HTTPException(status_code=400, detail="웹훅 URL이 비어 있습니다.")
+    parsed = urlparse(url)
+    if parsed.scheme not in _ALLOWED_URL_SCHEMES:
+        raise HTTPException(status_code=400, detail="웹훅 URL은 https만 허용됩니다.")
+    hostname = parsed.hostname or ""
+    # 내부 주소 차단 (allowlist 기반 SSRF 방어)
+    blocked_hosts = ("localhost", "127.", "0.0.0.0", "10.", "172.", "192.168.")
+    if any(hostname.startswith(h) for h in blocked_hosts):
+        raise HTTPException(status_code=400, detail="내부 네트워크 URL은 허용되지 않습니다.")
+    return url
+
 
 # TODO: 웹훅 구독/전달 endpoint 구현 예정

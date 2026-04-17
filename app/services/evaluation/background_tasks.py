@@ -7,9 +7,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import threading
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
+from app.observability.logging import log_api_event
 from app.repositories.evaluation_repository import (
     EvaluationResultRecordRepository,
     EvaluationRunRepository,
@@ -70,8 +70,24 @@ async def _execute_evaluation(
             total_cost=report.total_cost,
             duration_seconds=report.duration_seconds or 0.0,
         )
+        log_api_event(
+            event_type="evaluation.completed",
+            actor_type="system",
+            resource_type="evaluation_run",
+            resource_id=run_id,
+            result="success",
+            extra={"successful_items": report.successful_items},
+        )
         logger.info("Evaluation %s completed: %d items", run_id, report.successful_items)
     except Exception as exc:
+        log_api_event(
+            event_type="evaluation.failed",
+            actor_type="system",
+            resource_type="evaluation_run",
+            resource_id=run_id,
+            result="failure",
+            extra={"error": str(exc)},
+        )
         logger.error("Evaluation %s failed: %s", run_id, exc, exc_info=True)
         run_repo.update_status(run_id, scope_id, "failed")
         raise

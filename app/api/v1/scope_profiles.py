@@ -444,7 +444,7 @@ def delete_agent(
     response_model=KillSwitchResponse,
     summary="에이전트 킬스위치 활성화 — 즉시 쓰기 차단",
 )
-def activate_kill_switch(
+async def activate_kill_switch(
     agent_id: str,
     body: KillSwitchActivate,
     actor: ActorContext = Depends(resolve_current_actor),

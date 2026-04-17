@@ -17,7 +17,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.api.auth.dependencies import resolve_current_actor
 from app.api.auth.models import ActorContext
@@ -53,6 +53,18 @@ class EvaluationRunRequest(BaseModel):
     golden_set_id: Optional[str] = None
     golden_items: List[Dict[str, Any]] = Field(..., min_length=1)
     max_concurrent: int = Field(default=5, ge=1, le=20)
+
+    @field_validator("golden_items")
+    @classmethod
+    def _validate_golden_items(cls, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        for i, item in enumerate(items):
+            if not isinstance(item, dict):
+                raise ValueError(f"golden_items[{i}]는 dict여야 합니다")
+            if "question" not in item:
+                raise ValueError(f"golden_items[{i}]에 'question' 필드가 필요합니다")
+            if "expected_answer" not in item:
+                raise ValueError(f"golden_items[{i}]에 'expected_answer' 필드가 필요합니다")
+        return items
 
 
 # ---------------------------------------------------------------------------

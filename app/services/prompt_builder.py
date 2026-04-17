@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from app.models.conversation import Turn
+from app.security.prompt_injection import content_directive_separator
 from app.services.context_window_manager import count_tokens
 
 

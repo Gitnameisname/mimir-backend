@@ -7,6 +7,7 @@ S1 RetrievedChunk(dataclass)와 schemas.rag.RetrievedChunk(Pydantic) 모두 처�
 """
 from __future__ import annotations
 
+import hashlib  # sha256 content hash (delegated to Citation.from_chunk)
 import logging
 from typing import Optional, Union
 from uuid import UUID

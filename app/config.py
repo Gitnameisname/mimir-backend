@@ -48,7 +48,8 @@ class Settings(BaseSettings):
     oauth_token_encryption_key: str = ""  # 32바이트 base64 인코딩
     frontend_url: str = "http://localhost:3000"  # OAuth 콜백 후 프론트엔드 리다이렉트
 
-    # SMTP (Phase 14-5)
+    # SMTP (Phase 14-5) — 빈 문자열(기본값) 시 메일 발송 비활성화 (S2 원칙 ⑦: 폐쇄망 호환)
+    # smtp_host를 설정하면 메일 발송이 활성화됨. 실제 발송 구현은 S3에서 추가 예정.
     smtp_host: str = ""
     smtp_port: int = 587
     smtp_username: str = ""
@@ -64,6 +65,9 @@ class Settings(BaseSettings):
     embedding_model: str = "text-embedding-3-small"
     embedding_dimensions: int = 1536
     embedding_batch_size: int = 100
+    # 외부 서비스 URL — 환경변수로만 관리 (SSRF 방어: 코드에 하드코딩 금지)
+    embedding_service_url: str = ""   # 폐쇄망 임베딩 서버 (빈 문자열 = OpenAI 사용)
+    llm_base_url: str = ""            # 폐쇄망 LLM 서버 (빈 문자열 = 공개 API 사용)
 
     # LLM (Phase 11 RAG)
     llm_provider: str = "openai"           # "openai" | "anthropic"
@@ -87,25 +91,37 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_production_secrets(self) -> "Settings":
-        """VULN-008: production 환경에서 필수 시크릿 미설정 시 startup 실패."""
-        if self.environment == "production":
-            missing = [
-                field for field in _REQUIRED_IN_PRODUCTION
-                if not getattr(self, field, None)
-            ]
+        """필수 시크릿 미설정 검증.
+
+        - production/staging: 미설정 시 startup 실패 (fail-fast)
+        - development/test: 경고 로그만 출력
+        - debug=True + non-development: 보안 경고 추가
+        """
+        _PROD_LIKE = ("production", "staging")
+        missing = [
+            field for field in _REQUIRED_IN_PRODUCTION
+            if not getattr(self, field, None)
+        ]
+        if self.environment in _PROD_LIKE:
             if missing:
                 raise ValueError(
-                    f"Production requires these secrets to be set: {', '.join(missing)}"
+                    f"{self.environment} environment requires these secrets to be set: "
+                    f"{', '.join(missing)}"
                 )
-        elif self.environment != "production":
-            missing = [
-                field for field in _REQUIRED_IN_PRODUCTION
-                if not getattr(self, field, None)
-            ]
+            if self.debug:
+                raise ValueError(
+                    f"debug=True must not be enabled in {self.environment} environment"
+                )
+        else:
             if missing:
                 logger.warning(
-                    "Security secrets not configured (OK for dev, required for prod): %s",
+                    "Security secrets not configured (OK for dev/test, required for prod): %s",
                     ", ".join(missing),
+                )
+            if self.debug and self.environment not in ("development", "test"):
+                logger.warning(
+                    "debug=True is enabled in '%s' environment — ensure this is intentional",
+                    self.environment,
                 )
         return self
 

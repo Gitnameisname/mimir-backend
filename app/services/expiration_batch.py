@@ -153,8 +153,8 @@ class ExpirationBatchJob:
             logger.error("expiration_batch_failed error=%s", exc)
             try:
                 self._conn.rollback()
-            except Exception:
-                pass
+            except Exception as rollback_exc:
+                logger.warning("expiration_batch rollback 실패: %s", rollback_exc)
             return {
                 "status": "error",
                 "expired_count": 0,

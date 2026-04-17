@@ -84,11 +84,12 @@ def log_api_event(
     if extra:
         record.update(extra)
 
-    # result별 로그 레벨 분기
-    if result in ("failure", "denied"):
+    # result/status_code별 로그 레벨 분기
+    status = record.get("status_code")
+    if status and status >= 500:
+        _logger.error("API_EVENT %s", record)
+    elif result in ("failure", "denied") or (status and status >= 400):
         _logger.warning("API_EVENT %s", record)
-    elif result == "validation_error":
-        _logger.info("API_EVENT %s", record)
     else:
         _logger.info("API_EVENT %s", record)
 

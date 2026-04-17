@@ -412,6 +412,11 @@ class ConfigurableDocumentTypePlugin(DocumentTypePlugin):
         return self._config.get("description", "")
 
     def chunking_plugin(self) -> ChunkingPlugin:
+        """청킹 플러그인 반환.
+
+        우선순위: DB chunking_config > _base plugin config > DefaultChunkingPlugin.
+        DB config가 있으면 _base config를 기본값으로 삼아 오버라이드한다.
+        """
         raw = self._config.get("chunking_config") or {}
         base_config = self._base.chunking_plugin().get_config() if self._base else None
         if raw:
@@ -419,6 +424,10 @@ class ConfigurableDocumentTypePlugin(DocumentTypePlugin):
         return self._base.chunking_plugin() if self._base else DefaultChunkingPlugin()
 
     def rag_plugin(self) -> RAGPlugin:
+        """RAG 플러그인 반환.
+
+        우선순위: DB rag_config(system_prompt 포함) > _base prompt template > DefaultRAGPlugin.
+        """
         raw = self._config.get("rag_config") or {}
         base_template = self._base.rag_plugin().get_prompt_template() if self._base else None
         if raw:

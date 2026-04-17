@@ -32,22 +32,22 @@ logger = logging.getLogger(__name__)
 
 # HTTPException status code → (error_code, safe_message) 매핑
 _HTTP_STATUS_MAP: dict[int, tuple[str, str]] = {
-    400: ("bad_request", "Bad request"),
-    401: ("authentication_required", "Authentication is required"),
-    403: ("permission_denied", "You do not have permission to perform this action"),
-    404: ("resource_not_found", "Requested resource was not found"),
-    405: ("method_not_allowed", "Method not allowed"),
-    409: ("resource_conflict", "Request conflicts with the current state of the resource"),
-    410: ("resource_gone", "Requested resource is no longer available"),
-    422: ("validation_error", "Request validation failed"),
-    429: ("rate_limit_exceeded", "Too many requests. Please try again later"),
-    500: ("internal_server_error", "An unexpected error occurred"),
-    502: ("bad_gateway", "Upstream service error"),
-    503: ("service_unavailable", "Service is temporarily unavailable"),
+    400: ("bad_request", "잘못된 요청입니다"),
+    401: ("authentication_required", "인증이 필요합니다"),
+    403: ("permission_denied", "이 작업을 수행할 권한이 없습니다"),
+    404: ("resource_not_found", "요청한 리소스를 찾을 수 없습니다"),
+    405: ("method_not_allowed", "허용되지 않는 HTTP 메서드입니다"),
+    409: ("resource_conflict", "현재 상태와 충돌하는 요청입니다"),
+    410: ("resource_gone", "요청한 리소스가 더 이상 존재하지 않습니다"),
+    422: ("validation_error", "요청 유효성 검사에 실패했습니다"),
+    429: ("rate_limit_exceeded", "요청 한도를 초과했습니다. 잠시 후 다시 시도하세요"),
+    500: ("internal_server_error", "예기치 않은 오류가 발생했습니다"),
+    502: ("bad_gateway", "상위 서비스 오류가 발생했습니다"),
+    503: ("service_unavailable", "서비스를 일시적으로 사용할 수 없습니다"),
 }
 
 _INTERNAL_SERVER_ERROR_CODE = "internal_server_error"
-_INTERNAL_SERVER_ERROR_MSG = "An unexpected error occurred"
+_INTERNAL_SERVER_ERROR_MSG = "예기치 않은 오류가 발생했습니다"
 
 
 def _get_request_meta(request: Request) -> ErrorMeta:
@@ -148,8 +148,8 @@ async def api_error_handler(request: Request, exc: ApiError) -> JSONResponse:
                 request_id=meta.request_id,
                 trace_id=meta.trace_id,
             )
-        except Exception:
-            pass
+        except Exception as audit_exc:
+            logger.warning("에러 핸들러 감사 이벤트 기록 실패: %s", audit_exc)
 
     return _build_response(
         status_code=exc.http_status,

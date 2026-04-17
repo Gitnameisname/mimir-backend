@@ -331,5 +331,5 @@ def _emit_audit(
             result="success",
             metadata=metadata or {},
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("MCP tool 감사 이벤트 기록 실패: %s", exc)

@@ -27,6 +27,7 @@ import psycopg2.extensions
 import psycopg2.extras
 
 from app.config import settings
+from app.security.prompt_injection import content_directive_separator
 from app.services.embedding_service import get_embedding_provider
 
 logger = logging.getLogger(__name__)
@@ -243,7 +244,9 @@ class ContextBuilder:
             included.append(chunk)
             total_chars += len(part)
 
-        context = "\n\n".join(context_parts)
+        raw_context = "\n\n".join(context_parts)
+        # OWASP LLM01: 검색 결과를 신뢰할 수 없는 컨텐츠(untrusted)로 격리
+        context = content_directive_separator.wrap(raw_context)
         return context, included
 
 
@@ -555,8 +558,8 @@ class RAGService:
                 ctx_cfg = plugin.rag_plugin().get_context_config()
                 max_tokens = ctx_cfg.get("max_context_tokens", max_tokens)
                 top_n = ctx_cfg.get("top_n", top_n)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("DocumentType plugin context config 조회 실패 (%s), 기본값 사용: %s", document_type, exc)
 
         # 1. Retrieve
         raw_chunks = self._retriever.retrieve(

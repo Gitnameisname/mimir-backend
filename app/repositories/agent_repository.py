@@ -138,7 +138,11 @@ class AgentRepository:
     # ------------------------------------------------------------------
 
     def enable_kill_switch(self, agent_id: str, *, reason: Optional[str] = None) -> Optional[Agent]:
-        """에이전트 킬스위치 활성화 — 즉시 쓰기 차단."""
+        """에이전트 킬스위치 활성화 — 즉시 쓰기 차단.
+
+        에이전트는 비활성(inactive) 상태가 되어 모든 쓰기 요청이 차단된다.
+        is_disabled = True (is_active = False) 상태로 전환된다.
+        """
         now = datetime.now(timezone.utc)
         with self._conn.cursor() as cur:
             cur.execute(

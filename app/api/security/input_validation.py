@@ -30,9 +30,12 @@ def sanitize_filename(name: str) -> str:
     """파일명에서 경로 순회 문자를 제거한다.
 
     Path traversal (OWASP A01/A03) 방지.
+    Windows/Unix 경로 구분자 모두 처리한다.
     """
-    # 경로 구분자 제거
-    safe = PurePosixPath(name).name
+    # Windows 백슬래시를 슬래시로 정규화
+    normalized = name.replace("\\", "/")
+    # 경로 구분자 제거 (마지막 컴포넌트만 추출)
+    safe = PurePosixPath(normalized).name
     # 숨김 파일(.으로 시작) 허용하되 ..은 단독 컴포넌트로 불가
     if safe in ("", ".", ".."):
         return "_"

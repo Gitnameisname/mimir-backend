@@ -34,7 +34,12 @@ class FTSRetriever(Retriever):
     ) -> List[RetrievalResult]:
         self._warn_if_no_acl(filters)
         filters = filters or {}
-        actor_role = filters.get("actor_role")
+        # S2 ⑥: access_context / scope_profile 기반 ACL 지원
+        # access_context 또는 scope_profile 키에서 actor_role 추출
+        access_context = filters.get("access_context") or filters.get("scope_profile") or {}
+        actor_role = filters.get("actor_role") or (
+            access_context.get("actor_role") if isinstance(access_context, dict) else None
+        )
 
         # ACL 조건: is_public 또는 actor_role이 accessible_roles에 포함
         if actor_role:
