@@ -33,6 +33,10 @@ from app.api.v1 import agent_proposals  # S2 Phase 5 (FG5.1): 에이전트 Draft
 from app.api.v1 import proposal_queue  # S2 Phase 5 (FG5.2): 제안 큐 Admin/User API
 from app.api.v1 import golden_sets  # S2 Phase 7 (FG7.1): Golden Set 도메인
 from app.api.v1 import evaluations  # S2 Phase 7 (FG7.2): 평가 실행 API
+from app.api.v1 import extraction_schemas  # S2 Phase 8 (FG8.1): 추출 스키마 CRUD
+from app.api.v1 import extractions  # S2 Phase 8 (FG8.2): 추출 결과 검토 API
+from app.api.v1 import batch_extractions  # S2 Phase 8 (Task 8-7): 배치 재추출 API
+from app.api.v1 import extraction_evaluations  # S2 Phase 8 (FG8.3): 추출 품질 평가 API
 
 v1_router = APIRouter()
 
@@ -103,3 +107,15 @@ v1_router.include_router(proposal_queue.router, tags=["proposals"])
 v1_router.include_router(golden_sets.router, prefix="/golden-sets", tags=["golden-sets"])
 # S2 Phase 7 (FG7.2): 평가 실행 API
 v1_router.include_router(evaluations.router, prefix="/evaluations", tags=["evaluations"])
+
+# S2 Phase 8 (FG8.1): 추출 스키마 CRUD + 버전 관리
+v1_router.include_router(extraction_schemas.router, prefix="/extraction-schemas", tags=["extraction-schemas"])
+
+# S2 Phase 8 (FG8.2): 추출 결과 검토 API (pending 큐 → approve/modify/reject)
+v1_router.include_router(extractions.router, prefix="/extractions", tags=["extractions"])
+
+# S2 Phase 8 (Task 8-7): 배치 재추출 API
+v1_router.include_router(batch_extractions.router, prefix="/extractions", tags=["extractions"])
+
+# S2 Phase 8 (FG8.3): 추출 품질 평가 API
+v1_router.include_router(extraction_evaluations.router, prefix="/extraction-evaluations", tags=["extraction-evaluations"])

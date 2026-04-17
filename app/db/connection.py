@@ -1404,6 +1404,339 @@ CREATE INDEX IF NOT EXISTS idx_eval_result_created_at
 """
 
 
+# ---------------------------------------------------------------------------
+# S2 Phase 8 (FG8.1): 추출 스키마 도메인 테이블 DDL
+# ---------------------------------------------------------------------------
+
+_EXTRACTION_SCHEMAS_DDL = """
+CREATE TABLE IF NOT EXISTS extraction_schemas (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    doc_type_code   VARCHAR(100) NOT NULL REFERENCES document_types(type_code) ON DELETE RESTRICT,
+    version         INTEGER NOT NULL DEFAULT 1,
+    fields_json     JSONB NOT NULL DEFAULT '{}',
+    extra_metadata  JSONB NOT NULL DEFAULT '{}',
+    is_deprecated   BOOLEAN NOT NULL DEFAULT FALSE,
+    deprecation_reason TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by      VARCHAR(255) NOT NULL,
+    updated_by      VARCHAR(255) NOT NULL,
+    scope_profile_id UUID REFERENCES scope_profiles(id) ON DELETE SET NULL,
+    is_soft_deleted BOOLEAN NOT NULL DEFAULT FALSE,
+    deleted_at      TIMESTAMPTZ,
+    deleted_by      VARCHAR(255),
+    UNIQUE (doc_type_code, version)
+);
+CREATE INDEX IF NOT EXISTS idx_extraction_schemas_doc_type_code
+    ON extraction_schemas(doc_type_code);
+CREATE INDEX IF NOT EXISTS idx_extraction_schemas_scope_profile_id
+    ON extraction_schemas(scope_profile_id);
+CREATE INDEX IF NOT EXISTS idx_extraction_schemas_is_deprecated
+    ON extraction_schemas(is_deprecated);
+CREATE INDEX IF NOT EXISTS idx_extraction_schemas_is_soft_deleted
+    ON extraction_schemas(is_soft_deleted);
+"""
+
+_EXTRACTION_SCHEMA_VERSIONS_DDL = """
+CREATE TABLE IF NOT EXISTS extraction_schema_versions (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    schema_id       UUID NOT NULL REFERENCES extraction_schemas(id) ON DELETE CASCADE,
+    version         INTEGER NOT NULL,
+    fields_json     JSONB NOT NULL DEFAULT '{}',
+    extra_metadata  JSONB NOT NULL DEFAULT '{}',
+    is_deprecated   BOOLEAN NOT NULL DEFAULT FALSE,
+    deprecation_reason TEXT,
+    change_summary  TEXT,
+    changed_fields  JSONB NOT NULL DEFAULT '[]',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by      VARCHAR(255) NOT NULL,
+    UNIQUE (schema_id, version)
+);
+CREATE INDEX IF NOT EXISTS idx_extraction_schema_versions_schema_id
+    ON extraction_schema_versions(schema_id);
+CREATE INDEX IF NOT EXISTS idx_extraction_schema_versions_created_at
+    ON extraction_schema_versions(created_at DESC);
+"""
+
+
+# ---------------------------------------------------------------------------
+# S2 Phase 8 (FG8.2): 추출 캔디데이트 테이블 DDL
+# ---------------------------------------------------------------------------
+
+_EXTRACTION_CANDIDATES_DDL = """
+CREATE TABLE IF NOT EXISTS extraction_candidates (
+    id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    document_id             UUID NOT NULL,
+    document_version        INTEGER NOT NULL DEFAULT 1,
+    extraction_schema_id    VARCHAR(100) NOT NULL,
+    extraction_schema_version INTEGER NOT NULL DEFAULT 1,
+    extracted_fields        JSONB NOT NULL DEFAULT '{}',
+    confidence_scores       JSONB NOT NULL DEFAULT '[]',
+    extraction_model        VARCHAR(255) NOT NULL,
+    extraction_mode         VARCHAR(32) NOT NULL DEFAULT 'deterministic',
+    extraction_latency_ms   INTEGER NOT NULL DEFAULT 0,
+    extraction_tokens       JSONB,
+    extraction_cost_estimate FLOAT,
+    extraction_prompt_version VARCHAR(64),
+    document_content_hash   VARCHAR(64),
+    status                  VARCHAR(32) NOT NULL DEFAULT 'pending',
+    reviewed_by             VARCHAR(255),
+    reviewed_at             TIMESTAMPTZ,
+    human_feedback          TEXT,
+    human_edits             JSONB NOT NULL DEFAULT '[]',
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    actor_type              VARCHAR(32) NOT NULL DEFAULT 'agent',
+    scope_profile_id        UUID REFERENCES scope_profiles(id) ON DELETE SET NULL,
+    is_soft_deleted         BOOLEAN NOT NULL DEFAULT FALSE,
+    deleted_at              TIMESTAMPTZ,
+    deleted_by              VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_extraction_candidates_doc_ver
+    ON extraction_candidates(document_id, document_version);
+CREATE INDEX IF NOT EXISTS idx_extraction_candidates_status
+    ON extraction_candidates(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_extraction_candidates_schema_id
+    ON extraction_candidates(extraction_schema_id);
+CREATE INDEX IF NOT EXISTS idx_extraction_candidates_scope
+    ON extraction_candidates(scope_profile_id, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_extraction_candidates_soft_deleted
+    ON extraction_candidates(is_soft_deleted);
+"""
+
+_APPROVED_EXTRACTIONS_DDL = """
+CREATE TABLE IF NOT EXISTS approved_extractions (
+    id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    candidate_id            UUID REFERENCES extraction_candidates(id) ON DELETE SET NULL,
+    document_id             UUID NOT NULL,
+    document_version        INTEGER NOT NULL,
+    extraction_schema_id    VARCHAR(100) NOT NULL,
+    extraction_schema_version INTEGER NOT NULL,
+    extraction_model        VARCHAR(255) NOT NULL,
+    extraction_latency_ms   INTEGER NOT NULL DEFAULT 0,
+    extraction_tokens       JSONB,
+    extraction_cost_estimate FLOAT,
+    extraction_prompt_version VARCHAR(64),
+    approved_fields         JSONB NOT NULL DEFAULT '{}',
+    human_edits             JSONB NOT NULL DEFAULT '[]',
+    approved_by             VARCHAR(255) NOT NULL,
+    approved_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    approval_comment        TEXT,
+    actor_type              VARCHAR(32) NOT NULL DEFAULT 'user',
+    scope_profile_id        UUID REFERENCES scope_profiles(id) ON DELETE SET NULL,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    is_soft_deleted         BOOLEAN NOT NULL DEFAULT FALSE,
+    deleted_at              TIMESTAMPTZ,
+    deleted_by              VARCHAR(255)
+);
+CREATE INDEX IF NOT EXISTS idx_approved_extractions_doc_ver
+    ON approved_extractions(document_id, document_version);
+CREATE INDEX IF NOT EXISTS idx_approved_extractions_scope_time
+    ON approved_extractions(scope_profile_id, approved_at DESC);
+CREATE INDEX IF NOT EXISTS idx_approved_extractions_candidate
+    ON approved_extractions(candidate_id);
+CREATE INDEX IF NOT EXISTS idx_approved_extractions_soft_deleted
+    ON approved_extractions(is_soft_deleted);
+"""
+
+
+# ---------------------------------------------------------------------------
+# S2 Phase 8 (Task 8-7): 배치 재추출 작업 테이블 DDL
+# ---------------------------------------------------------------------------
+
+_BATCH_EXTRACTION_JOBS_DDL = """
+CREATE TABLE IF NOT EXISTS batch_extraction_jobs (
+    id                          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    extraction_schema_id        VARCHAR(100) NOT NULL,
+    extraction_schema_version   INTEGER NOT NULL DEFAULT 1,
+    scope_profile_id            UUID REFERENCES scope_profiles(id) ON DELETE SET NULL,
+    status                      VARCHAR(32) NOT NULL DEFAULT 'pending',
+    total_count                 INTEGER NOT NULL DEFAULT 0,
+    completed_count             INTEGER NOT NULL DEFAULT 0,
+    failed_count                INTEGER NOT NULL DEFAULT 0,
+    skipped_count               INTEGER NOT NULL DEFAULT 0,
+    progress_percentage         FLOAT NOT NULL DEFAULT 0.0,
+    date_from                   TIMESTAMPTZ,
+    date_to                     TIMESTAMPTZ,
+    sample_count                INTEGER,
+    sample_mode                 BOOLEAN NOT NULL DEFAULT FALSE,
+    comparison_mode             BOOLEAN NOT NULL DEFAULT FALSE,
+    comparison_report_path      TEXT,
+    created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    started_at                  TIMESTAMPTZ,
+    completed_at                TIMESTAMPTZ,
+    estimated_completion_at     TIMESTAMPTZ,
+    current_processing          INTEGER,
+    error_summary               TEXT,
+    failed_document_ids         JSONB NOT NULL DEFAULT '[]',
+    created_by                  VARCHAR(255) NOT NULL,
+    is_cancellation_requested   BOOLEAN NOT NULL DEFAULT FALSE,
+    actor_type                  VARCHAR(32) NOT NULL DEFAULT 'user'
+);
+CREATE INDEX IF NOT EXISTS idx_batch_extraction_jobs_scope_status
+    ON batch_extraction_jobs(scope_profile_id, status);
+CREATE INDEX IF NOT EXISTS idx_batch_extraction_jobs_created_at_status
+    ON batch_extraction_jobs(created_at DESC, status);
+CREATE INDEX IF NOT EXISTS idx_batch_extraction_jobs_schema_id
+    ON batch_extraction_jobs(extraction_schema_id, status);
+"""
+
+_EXTRACTION_RETRY_LOGS_DDL = """
+CREATE TABLE IF NOT EXISTS extraction_retry_logs (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    job_id          UUID NOT NULL REFERENCES batch_extraction_jobs(id) ON DELETE CASCADE,
+    document_id     UUID NOT NULL,
+    attempt_number  INTEGER NOT NULL,
+    status          VARCHAR(32) NOT NULL,
+    error_reason    TEXT,
+    latency_ms      INTEGER NOT NULL DEFAULT 0,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_extraction_retry_logs_job_doc
+    ON extraction_retry_logs(job_id, document_id);
+CREATE INDEX IF NOT EXISTS idx_extraction_retry_logs_created_at
+    ON extraction_retry_logs(created_at DESC);
+"""
+
+# ---------------------------------------------------------------------------
+# S2 Phase 8 FG8.3 (task8-8): extraction_spans 테이블
+# ---------------------------------------------------------------------------
+
+_EXTRACTION_SPANS_DDL = """
+CREATE TABLE IF NOT EXISTS extraction_spans (
+    id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    extraction_candidate_id UUID NOT NULL REFERENCES extraction_candidates(id) ON DELETE CASCADE,
+    field_name              VARCHAR(255) NOT NULL,
+    document_id             UUID NOT NULL,
+    version_id              UUID REFERENCES versions(id) ON DELETE SET NULL,
+    node_id                 UUID REFERENCES nodes(id) ON DELETE SET NULL,
+    span_start              INTEGER NOT NULL,
+    span_end                INTEGER NOT NULL,
+    source_text             TEXT NOT NULL,
+    content_hash            VARCHAR(64),
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (span_start >= 0 AND span_start < span_end)
+);
+CREATE INDEX IF NOT EXISTS idx_extraction_spans_candidate
+    ON extraction_spans(extraction_candidate_id, field_name);
+CREATE INDEX IF NOT EXISTS idx_extraction_spans_document
+    ON extraction_spans(document_id, extraction_candidate_id);
+"""
+
+# ---------------------------------------------------------------------------
+# S2 Phase 8 FG8.3 (task8-9): extraction_records + verification_results
+# ---------------------------------------------------------------------------
+
+_EXTRACTION_RECORDS_DDL = """
+CREATE TABLE IF NOT EXISTS extraction_records (
+    id                          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    extraction_candidate_id     UUID NOT NULL REFERENCES extraction_candidates(id) ON DELETE CASCADE,
+    document_id                 UUID NOT NULL,
+    document_version            INTEGER NOT NULL DEFAULT 1,
+    document_content_hash       VARCHAR(64),
+    extraction_schema_id        VARCHAR(100) NOT NULL,
+    extraction_schema_version   INTEGER NOT NULL DEFAULT 1,
+    extraction_model            VARCHAR(100) NOT NULL,
+    model_version               VARCHAR(100),
+    extraction_prompt_version   VARCHAR(100),
+    extraction_mode             VARCHAR(32) NOT NULL DEFAULT 'deterministic',
+    temperature                 FLOAT NOT NULL DEFAULT 0.0,
+    seed                        INTEGER,
+    extracted_result            JSONB NOT NULL DEFAULT '{}',
+    extracted_timestamp         TIMESTAMPTZ,
+    scope_profile_id            UUID REFERENCES scope_profiles(id) ON DELETE SET NULL,
+    actor_type                  VARCHAR(32) NOT NULL DEFAULT 'agent',
+    created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_extraction_records_candidate
+    ON extraction_records(extraction_candidate_id);
+CREATE INDEX IF NOT EXISTS idx_extraction_records_document
+    ON extraction_records(document_id, extraction_schema_id);
+CREATE INDEX IF NOT EXISTS idx_extraction_records_created_at
+    ON extraction_records(created_at DESC);
+"""
+
+_VERIFICATION_RESULTS_DDL = """
+CREATE TABLE IF NOT EXISTS verification_results (
+    id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    extraction_candidate_id UUID NOT NULL REFERENCES extraction_candidates(id) ON DELETE CASCADE,
+    verified_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    match_status            VARCHAR(32) NOT NULL,
+    field_match_count       INTEGER NOT NULL DEFAULT 0,
+    field_total_count       INTEGER NOT NULL DEFAULT 0,
+    field_accuracy          FLOAT NOT NULL DEFAULT 0.0,
+    diff_details            JSONB NOT NULL DEFAULT '[]',
+    error_message           TEXT,
+    verified_by             VARCHAR(255) NOT NULL DEFAULT 'system',
+    actor_type              VARCHAR(32) NOT NULL DEFAULT 'user'
+);
+CREATE INDEX IF NOT EXISTS idx_verification_results_candidate
+    ON verification_results(extraction_candidate_id, verified_at DESC);
+"""
+
+# ---------------------------------------------------------------------------
+# S2 Phase 8 FG8.3 (task8-10): golden_extraction_sets + golden_extraction_items
+#   + extraction_evaluations
+# ---------------------------------------------------------------------------
+
+_GOLDEN_EXTRACTION_SETS_DDL = """
+CREATE TABLE IF NOT EXISTS golden_extraction_sets (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name            VARCHAR(255) NOT NULL,
+    description     TEXT,
+    document_type   VARCHAR(100) NOT NULL,
+    version         INTEGER NOT NULL DEFAULT 1,
+    created_by      VARCHAR(255) NOT NULL,
+    scope_profile_id UUID REFERENCES scope_profiles(id) ON DELETE SET NULL,
+    actor_type      VARCHAR(32) NOT NULL DEFAULT 'user',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_golden_extraction_sets_doc_type
+    ON golden_extraction_sets(document_type);
+CREATE INDEX IF NOT EXISTS idx_golden_extraction_sets_scope
+    ON golden_extraction_sets(scope_profile_id);
+"""
+
+_GOLDEN_EXTRACTION_ITEMS_DDL = """
+CREATE TABLE IF NOT EXISTS golden_extraction_items (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    golden_set_id   UUID NOT NULL REFERENCES golden_extraction_sets(id) ON DELETE CASCADE,
+    document_id     UUID NOT NULL,
+    document_version INTEGER NOT NULL DEFAULT 1,
+    document_type   VARCHAR(100) NOT NULL,
+    expected_fields JSONB NOT NULL DEFAULT '[]',
+    expected_spans  JSONB NOT NULL DEFAULT '[]',
+    created_by      VARCHAR(255) NOT NULL DEFAULT 'system',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_golden_extraction_items_set
+    ON golden_extraction_items(golden_set_id);
+CREATE INDEX IF NOT EXISTS idx_golden_extraction_items_document
+    ON golden_extraction_items(document_id);
+"""
+
+_EXTRACTION_EVALUATIONS_DDL = """
+CREATE TABLE IF NOT EXISTS extraction_evaluations (
+    id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    golden_set_id           UUID REFERENCES golden_extraction_sets(id) ON DELETE SET NULL,
+    golden_item_id          UUID REFERENCES golden_extraction_items(id) ON DELETE SET NULL,
+    extraction_candidate_id UUID REFERENCES extraction_candidates(id) ON DELETE SET NULL,
+    metrics                 JSONB NOT NULL DEFAULT '{}',
+    field_details           JSONB NOT NULL DEFAULT '[]',
+    evaluated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    evaluated_by            VARCHAR(255) NOT NULL DEFAULT 'system',
+    actor_type              VARCHAR(32) NOT NULL DEFAULT 'user',
+    scope_profile_id        UUID REFERENCES scope_profiles(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_extraction_evaluations_golden_set
+    ON extraction_evaluations(golden_set_id, evaluated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_extraction_evaluations_candidate
+    ON extraction_evaluations(extraction_candidate_id);
+"""
+
+
 def init_db() -> None:
     """앱 시작 시 모든 테이블을 생성하고 마이그레이션을 적용한다 (idempotent)."""
     try:
@@ -1505,7 +1838,25 @@ def init_db() -> None:
                 cur.execute(_GOLDEN_SETS_DDL)
                 # S2 Phase 7 (FG7.2): Evaluation 도메인 테이블 생성 (멱등)
                 cur.execute(_EVALUATION_RUNS_DDL)
-        logger.info("DB schema initialized (S2 Phase 7 FG7.1+FG7.2 included)")
+                # S2 Phase 8 (FG8.1): 추출 스키마 도메인 테이블 생성 (멱등)
+                cur.execute(_EXTRACTION_SCHEMAS_DDL)
+                cur.execute(_EXTRACTION_SCHEMA_VERSIONS_DDL)
+                # S2 Phase 8 (FG8.2): 추출 캔디데이트 + 승인 추출 테이블 생성 (멱등)
+                cur.execute(_EXTRACTION_CANDIDATES_DDL)
+                cur.execute(_APPROVED_EXTRACTIONS_DDL)
+                # S2 Phase 8 (Task 8-7): 배치 재추출 작업 테이블 생성 (멱등)
+                cur.execute(_BATCH_EXTRACTION_JOBS_DDL)
+                cur.execute(_EXTRACTION_RETRY_LOGS_DDL)
+                # S2 Phase 8 (FG8.3 task8-8): extraction_spans 테이블 생성 (멱등)
+                cur.execute(_EXTRACTION_SPANS_DDL)
+                # S2 Phase 8 (FG8.3 task8-9): extraction_records + verification_results (멱등)
+                cur.execute(_EXTRACTION_RECORDS_DDL)
+                cur.execute(_VERIFICATION_RESULTS_DDL)
+                # S2 Phase 8 (FG8.3 task8-10): golden_extraction_sets + items + evaluations (멱등)
+                cur.execute(_GOLDEN_EXTRACTION_SETS_DDL)
+                cur.execute(_GOLDEN_EXTRACTION_ITEMS_DDL)
+                cur.execute(_EXTRACTION_EVALUATIONS_DDL)
+        logger.info("DB schema initialized (S2 Phase 8 FG8.3 included)")
     except Exception as exc:
         logger.error("DB schema initialization failed: %s", exc)
         raise
