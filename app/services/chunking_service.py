@@ -425,8 +425,8 @@ class ChunkingService:
             from app.plugins.base import DocumentTypeRegistry
             plugin = DocumentTypeRegistry.instance().get(document_type)
             return plugin.chunking_plugin().should_index(version_status)
-        except Exception:
-            # 기본값: published_only
+        except Exception as exc:
+            logger.warning("should_index_version 플러그인 조회 실패 (%s), 기본값 사용: %s", document_type, exc)
             return version_status in ("PUBLISHED", "published")
 
 

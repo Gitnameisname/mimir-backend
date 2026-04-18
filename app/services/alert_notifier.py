@@ -7,13 +7,12 @@
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 from typing import Any
 from urllib.parse import urlparse
 
-import urllib.request
-import json as _json
-import ssl
+import httpx
 
 from app.services.email_service import EmailService
 
@@ -22,10 +21,8 @@ logger = logging.getLogger(__name__)
 # 허용된 웹훅 스킴만 — file://, gopher://, ftp:// 등 차단 (SSRF 방어)
 _ALLOWED_WEBHOOK_SCHEMES = {"https", "http"}
 
-# 내부 호스트(loopback/link-local) 차단 — SSRF 기본 방어
-_BLOCKED_HOST_PREFIXES = ("localhost", "127.", "0.", "169.254.", "10.", "172.", "192.168.")
-
-_WEBHOOK_TIMEOUT_SECONDS = 10
+_WEBHOOK_CONNECT_TIMEOUT = 5   # TCP 연결 수립 제한
+_WEBHOOK_READ_TIMEOUT = 10     # 응답 수신 제한 (슬로우 리드 방어)
 
 
 def _is_safe_webhook_url(url: str) -> bool:
@@ -38,9 +35,17 @@ def _is_safe_webhook_url(url: str) -> bool:
     host = (parsed.hostname or "").lower()
     if not host:
         return False
-    # SSRF: private/loopback 차단
-    if any(host.startswith(p) for p in _BLOCKED_HOST_PREFIXES):
+    # SSRF: localhost 문자열 차단
+    if host == "localhost":
         return False
+    # SSRF: IP 주소인 경우 ipaddress 모듈로 private/loopback 검사 (IPv4 + IPv6)
+    try:
+        addr = ipaddress.ip_address(host)
+        if addr.is_loopback or addr.is_private or addr.is_link_local or addr.is_multicast:
+            return False
+    except ValueError:
+        # 도메인명인 경우 — IP 파싱 실패는 정상
+        pass
     return True
 
 
@@ -124,17 +129,20 @@ class AlertNotifier:
             "metric_value": metric_value,
             "message": message,
         }
+        timeout = httpx.Timeout(
+            connect=_WEBHOOK_CONNECT_TIMEOUT,
+            read=_WEBHOOK_READ_TIMEOUT,
+            write=5.0,
+            pool=2.0,
+        )
         try:
-            data = _json.dumps(payload).encode("utf-8")
-            req = urllib.request.Request(
-                url, data=data, method="POST",
-                headers={"Content-Type": "application/json", "User-Agent": "Mimir-Alert/1.0"},
-            )
-            # TLS context — 시스템 CA 사용
-            ctx = ssl.create_default_context()
-            with urllib.request.urlopen(req, timeout=_WEBHOOK_TIMEOUT_SECONDS, context=ctx) as resp:
-                status = getattr(resp, "status", 200)
-                return 200 <= int(status) < 300
+            with httpx.Client(timeout=timeout, verify=True) as client:
+                resp = client.post(
+                    url,
+                    json=payload,
+                    headers={"User-Agent": "Mimir-Alert/1.0"},
+                )
+                return 200 <= resp.status_code < 300
         except Exception as exc:
             logger.warning("웹훅 호출 실패 %s: %s", url, exc)
             return False

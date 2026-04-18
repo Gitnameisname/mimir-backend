@@ -19,6 +19,7 @@ FastAPI application에 등록할 exception handler 모음.
 
 import logging
 import traceback
+import uuid
 
 from fastapi import Request
 from fastapi.exceptions import RequestValidationError
@@ -123,6 +124,7 @@ async def api_error_handler(request: Request, exc: ApiError) -> JSONResponse:
 
     log_api_event(
         event_type="api.error",
+        actor_type="system",
         request_id=meta.request_id,
         trace_id=meta.trace_id,
         http_method=request.method,
@@ -255,15 +257,22 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
     from app.observability.logging import log_api_event
 
     meta = _get_request_meta(request)
+    error_ref = uuid.uuid4().hex[:12]
 
     logger.error(
-        "Unhandled exception | request_id=%s\n%s",
+        "Unhandled exception | request_id=%s error_ref=%s",
         meta.request_id,
+        error_ref,
+    )
+    logger.debug(
+        "Stack trace for error_ref=%s:\n%s",
+        error_ref,
         traceback.format_exc(),
     )
 
     log_api_event(
         event_type="api.unhandled_error",
+        actor_type="system",
         request_id=meta.request_id,
         trace_id=meta.trace_id,
         http_method=request.method,

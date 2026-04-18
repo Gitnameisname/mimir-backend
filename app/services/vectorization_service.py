@@ -450,7 +450,90 @@ class VectorizationPipeline:
                 """,
                 (version_id,),
             )
-            return cur.fetchall()
+            rows = cur.fetchall()
+
+        if rows:
+            return rows
+
+        # nodes 테이블이 비어있으면 content_snapshot에서 파싱 (fallback)
+        return self._parse_nodes_from_snapshot(conn, version_id)
+
+    def _parse_nodes_from_snapshot(
+        self,
+        conn: psycopg2.extensions.connection,
+        version_id: str,
+    ) -> list[dict]:
+        """content_snapshot(ProseMirror JSON)을 nodes 테이블에 삽입하고 row 목록을 반환한다."""
+        import uuid as _uuid
+        import json as _json
+
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT content_snapshot FROM versions WHERE id = %s::uuid",
+                (version_id,),
+            )
+            row = cur.fetchone()
+
+        if not row or not row["content_snapshot"]:
+            return []
+
+        snapshot = row["content_snapshot"]
+        if isinstance(snapshot, str):
+            try:
+                snapshot = _json.loads(snapshot)
+            except Exception:
+                return []
+
+        top_level = snapshot.get("content", []) if isinstance(snapshot, dict) else []
+        node_rows = []
+        for order_index, node in enumerate(top_level):
+            node_type = node.get("type", "paragraph")
+            text_parts = [
+                c.get("text", "")
+                for c in node.get("content", [])
+                if isinstance(c, dict) and c.get("type") == "text"
+            ]
+            text = " ".join(text_parts).strip()
+            if node_type == "heading":
+                node_rows.append({
+                    "id": str(_uuid.uuid4()),
+                    "parent_id": None,
+                    "node_type": "heading",
+                    "order_index": order_index,
+                    "title": text or None,
+                    "content": None,
+                })
+            else:
+                node_rows.append({
+                    "id": str(_uuid.uuid4()),
+                    "parent_id": None,
+                    "node_type": node_type,
+                    "order_index": order_index,
+                    "title": None,
+                    "content": text or None,
+                })
+
+        # nodes 테이블에 삽입하여 FK 제약 충족
+        if node_rows:
+            with conn.cursor() as cur:
+                for n in node_rows:
+                    cur.execute(
+                        """
+                        INSERT INTO nodes (id, version_id, parent_id, node_type, order_index, title, content)
+                        VALUES (%s::uuid, %s::uuid, %s, %s, %s, %s, %s)
+                        ON CONFLICT (id) DO NOTHING
+                        """,
+                        (
+                            n["id"], version_id, n["parent_id"], n["node_type"],
+                            n["order_index"], n["title"], n["content"],
+                        ),
+                    )
+
+        logger.info(
+            "content_snapshot에서 %d개 노드 파싱·삽입 (version_id=%s)",
+            len(node_rows), version_id,
+        )
+        return node_rows
 
     def _soft_delete_existing_chunks(
         self,
@@ -544,15 +627,21 @@ class VectorizationPipeline:
     ) -> None:
         try:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO embedding_token_usage (job_id, document_id, model, total_tokens, chunk_count)
-                    VALUES (%s::uuid, %s::uuid, %s, %s, %s)
-                    """,
-                    (job_id, document_id, model, total_tokens, chunk_count),
-                )
+                cur.execute("SAVEPOINT sp_token_usage")
+                try:
+                    cur.execute(
+                        """
+                        INSERT INTO embedding_token_usage (job_id, document_id, model, total_tokens, chunk_count)
+                        VALUES (%s::uuid, %s::uuid, %s, %s, %s)
+                        """,
+                        (job_id, document_id, model, total_tokens, chunk_count),
+                    )
+                    cur.execute("RELEASE SAVEPOINT sp_token_usage")
+                except Exception as exc:
+                    cur.execute("ROLLBACK TO SAVEPOINT sp_token_usage")
+                    logger.warning("토큰 사용량 기록 실패: %s", exc)
         except Exception as exc:
-            logger.warning("토큰 사용량 기록 실패: %s", exc)
+            logger.warning("토큰 사용량 기록 실패 (savepoint 오류): %s", exc)
 
     # ---------------------------------------------------------------------------
     # 청크 cleanup (소프트 삭제된 청크 물리 삭제)

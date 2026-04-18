@@ -214,11 +214,61 @@ class LocalEmbeddingProvider(EmbeddingProvider):
         return []
 
 
+class SBERTEmbeddingProvider(EmbeddingProvider):
+    """로컬 SBERT 임베딩 서비스 제공자.
+
+    EMBEDDING_SVC_URL(또는 embedding_service_url) 설정 시 사용.
+    POST {url}/embed {"texts": [...]} → {"embeddings": [[...], ...]}
+    """
+
+    def __init__(self, base_url: str) -> None:
+        self._base_url = base_url.rstrip("/")
+
+    @property
+    def model_name(self) -> str:
+        return getattr(settings, "sbert_model_name", "sbert-local")
+
+    @property
+    def dimensions(self) -> int:
+        return getattr(settings, "embedding_dim", settings.embedding_dimensions)
+
+    def embed_batch(self, texts: list[str]) -> EmbeddingResult:
+        import httpx
+        url = f"{self._base_url}/embed"
+        try:
+            resp = httpx.post(
+                url,
+                json={"texts": texts},
+                timeout=getattr(settings, "embedding_svc_timeout", 30),
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            embeddings = data.get("embeddings", data.get("data", []))
+            return EmbeddingResult(
+                embeddings=embeddings,
+                model=self.model_name,
+                total_tokens=sum(len(t.split()) for t in texts),
+            )
+        except Exception as exc:
+            logger.error("SBERT 임베딩 서비스 오류 (%s): %s", url, exc)
+            return EmbeddingResult(embeddings=[[] for _ in texts], model=self.model_name, total_tokens=0)
+
+    def embed_single(self, text: str) -> list[float]:
+        result = self.embed_batch([text])
+        return result.embeddings[0] if result.embeddings else []
+
+
 def get_embedding_provider() -> EmbeddingProvider:
-    """현재 설정에 따라 적절한 EmbeddingProvider를 반환한다."""
+    """현재 설정에 따라 적절한 EmbeddingProvider를 반환한다.
+
+    우선순위: SBERT 로컬 서비스 > OpenAI > placeholder
+    """
+    svc_url = getattr(settings, "embedding_svc_url", "") or getattr(settings, "embedding_service_url", "")
+    if svc_url:
+        return SBERTEmbeddingProvider(svc_url)
     if settings.openai_api_key:
         return OpenAIEmbeddingProvider()
     logger.warning(
-        "OPENAI_API_KEY가 설정되지 않았습니다. LocalEmbeddingProvider(placeholder)를 사용합니다."
+        "임베딩 서비스가 설정되지 않았습니다. LocalEmbeddingProvider(placeholder)를 사용합니다."
     )
     return LocalEmbeddingProvider()

@@ -527,6 +527,15 @@ def import_golden_set(
     scope_id = _require_scope(actor)
     actor_id = actor.actor_id or "anonymous"
 
+    # 파일 타입 및 확장자 검증 (SEC5-BE-001: 허용 MIME만 수락)
+    _ALLOWED_MIME = {"application/json", "text/json", "text/plain"}
+    content_type = (file.content_type or "").split(";")[0].strip().lower()
+    if content_type and content_type not in _ALLOWED_MIME:
+        raise HTTPException(status_code=400, detail="JSON 파일만 업로드할 수 있습니다.")
+    filename = file.filename or ""
+    if filename and not filename.lower().endswith(".json"):
+        raise HTTPException(status_code=400, detail="파일 확장자는 .json이어야 합니다.")
+
     # 파일 읽기 및 크기 제한
     raw = file.file.read(_MAX_UPLOAD_BYTES + 1)
     if len(raw) > _MAX_UPLOAD_BYTES:

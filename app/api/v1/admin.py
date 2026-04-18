@@ -3252,7 +3252,7 @@ def set_default_provider(
 @router.post("/providers/{provider_id}/test", summary="프로바이더 연결 테스트")
 def test_provider(provider_id: str, _=Depends(require_admin_access)):
     import time
-    from datetime import timezone
+    from datetime import datetime, timezone
 
     with get_db() as conn:
         with conn.cursor() as cur:
@@ -3323,7 +3323,7 @@ def test_provider(provider_id: str, _=Depends(require_admin_access)):
 
     latency_ms = int((time.monotonic() - start) * 1000)
     result_str = "success" if success_flag else "error"
-    tested_at = __import__("datetime").datetime.now(timezone.utc)
+    tested_at = datetime.now(timezone.utc)
 
     with get_db() as conn:
         with conn.cursor() as cur:

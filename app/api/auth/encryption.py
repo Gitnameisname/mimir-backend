@@ -39,19 +39,24 @@ def _get_encryption_key() -> Optional[bytes]:
     return key
 
 
-def encrypt_token(plaintext: str) -> Optional[str]:
+def encrypt_token(plaintext: str) -> str:
     """AES-256-GCM으로 토큰을 암호화한다.
 
     Args:
         plaintext: 암호화할 평문 토큰.
 
     Returns:
-        base64 인코딩된 암호문 (nonce 포함) 또는 None (키 미설정 시).
+        base64 인코딩된 암호문 (nonce 포함).
+
+    Raises:
+        RuntimeError: OAUTH_TOKEN_ENCRYPTION_KEY 미설정 시. 평문 저장은 허용하지 않는다.
     """
     key = _get_encryption_key()
     if key is None:
-        logger.warning("encrypt_token: encryption key not configured, storing plaintext")
-        return plaintext
+        raise RuntimeError(
+            "OAUTH_TOKEN_ENCRYPTION_KEY가 설정되지 않았습니다. "
+            "OAuth 토큰 평문 저장은 보안 정책상 허용되지 않습니다."
+        )
 
     aesgcm = AESGCM(key)
     nonce = os.urandom(_NONCE_SIZE)
@@ -71,8 +76,8 @@ def decrypt_token(encrypted: str) -> Optional[str]:
     """
     key = _get_encryption_key()
     if key is None:
-        logger.warning("decrypt_token: encryption key not configured, returning as-is")
-        return encrypted
+        logger.error("decrypt_token: OAUTH_TOKEN_ENCRYPTION_KEY 미설정 — 복호화 불가")
+        return None
 
     try:
         data = base64.b64decode(encrypted)

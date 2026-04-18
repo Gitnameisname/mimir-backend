@@ -30,6 +30,7 @@ import jwt
 from fastapi import Depends, HTTPException, Request, status
 
 from app.api.auth.models import ActorContext, ActorType, AuthMethod
+from app.api.auth.tokens import is_access_token_blacklisted
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -215,6 +216,18 @@ def _extract_bearer_actor(token: str, request: Request) -> ActorContext:
     actor_id: str | None = payload.get("sub")
     role_claim: str | None = payload.get("role")
     role = role_claim if role_claim in _VALID_ROLES else None
+    jti: str = payload.get("jti", "")
+
+    # SEC3-BE-002: 블랙리스트(로그아웃된 AT) 체크
+    if jti:
+        try:
+            from app.cache.valkey import get_valkey
+            valkey = get_valkey()
+            if is_access_token_blacklisted(valkey, jti):
+                logger.info("Bearer token revoked (blacklisted jti=%s)", jti)
+                return _anonymous_actor()
+        except Exception as exc:
+            logger.warning("AT blacklist check failed (jti=%s): %s — allowing token", jti, exc)
 
     # role이 JWT에 없으면 DB에서 조회
     if actor_id and not role:

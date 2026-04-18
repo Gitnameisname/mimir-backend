@@ -60,13 +60,21 @@ class Settings(BaseSettings):
     # CORS
     cors_allow_origins: str = "http://localhost:3000"
 
+    # 신뢰 프록시 수 (SEC3-BE-005: X-Forwarded-For 스푸핑 방어)
+    # 리버스 프록시(Nginx, ALB 등) 개수. 0이면 직접 연결(프록시 없음).
+    # 예: Nginx 1단 + ALB 1단 = 2. X-Forwarded-For 리스트에서 우측 N개만 신뢰.
+    trusted_proxy_count: int = 0
+
     # OpenAI / Embedding
     openai_api_key: str = ""
     embedding_model: str = "text-embedding-3-small"
-    embedding_dimensions: int = 1536
+    embedding_dimensions: int = 768
     embedding_batch_size: int = 100
     # 외부 서비스 URL — 환경변수로만 관리 (SSRF 방어: 코드에 하드코딩 금지)
-    embedding_service_url: str = ""   # 폐쇄망 임베딩 서버 (빈 문자열 = OpenAI 사용)
+    embedding_service_url: str = ""   # 폐쇄망 임베딩 서버 (EMBEDDING_SERVICE_URL)
+    embedding_svc_url: str = ""       # 동일 목적 (EMBEDDING_SVC_URL 호환)
+    embedding_svc_timeout: int = 30
+    embedding_dim: int = 768          # 로컬 SBERT 모델 차원 (EMBEDDING_DIM)
     llm_base_url: str = ""            # 폐쇄망 LLM 서버 (빈 문자열 = 공개 API 사용)
 
     # LLM (Phase 11 RAG)

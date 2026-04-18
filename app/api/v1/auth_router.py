@@ -29,6 +29,8 @@ from urllib.parse import urlencode
 import psycopg2
 from fastapi import APIRouter, Cookie, HTTPException, Query, Request, Response
 from fastapi.responses import RedirectResponse
+
+from app.api.rate_limit import limiter
 from pydantic import BaseModel, EmailStr, Field, model_validator
 
 from app.api.auth.oauth_service import gitlab_oauth_service
@@ -41,6 +43,7 @@ from app.api.auth.purpose_tokens import (
 )
 from app.api.auth.rate_limit import check_login_allowed, clear_attempts, record_failed_attempt
 from app.api.auth.refresh_service import refresh_token_service
+from app.api.auth.tokens import blacklist_access_token, decode_access_token
 from app.api.auth.validators import (
     validate_display_name,
     validate_password_strength,
@@ -436,8 +439,28 @@ def logout(
     response: Response,
     refresh_token: str | None = Cookie(None, alias="refresh_token"),
 ):
-    """로그아웃: RT Family 전체를 폐기하고 Cookie를 삭제한다."""
+    """로그아웃: RT Family 전체를 폐기하고 Cookie를 삭제한다.
+
+    SEC3-BE-002: 요청의 AT jti를 Valkey 블랙리스트에 등록하여 잔여 유효 시간 내 재사용을 차단한다.
+    """
     req_id, trace_id = get_request_ids(request)
+
+    # AT jti 블랙리스트 등록
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        at_raw = auth_header[7:].strip()
+        at_payload = decode_access_token(at_raw)
+        if at_payload:
+            jti = at_payload.get("jti", "")
+            exp = at_payload.get("exp", 0)
+            now_ts = int(datetime.now(timezone.utc).timestamp())
+            remaining_ttl = max(int(exp) - now_ts, 0)
+            if jti and remaining_ttl > 0:
+                try:
+                    valkey = get_valkey()
+                    blacklist_access_token(valkey, jti, ttl_seconds=remaining_ttl + 60)
+                except Exception as exc:
+                    logger.warning("logout: AT 블랙리스트 등록 실패 — %s", exc)
 
     if refresh_token:
         with get_db() as conn:
@@ -493,6 +516,7 @@ def oauth_gitlab_start(request: Request):
 # ---------------------------------------------------------------------------
 
 @router.get("/oauth/gitlab/callback")
+@limiter.limit("20/minute")
 def oauth_gitlab_callback(
     request: Request,
     response: Response,

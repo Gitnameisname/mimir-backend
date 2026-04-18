@@ -177,6 +177,29 @@ class WorkflowService:
         # 6. 상태 전이 수행
         workflow_repository.update_workflow_status(conn, version_id, target_status.value)
 
+        # PUBLISH 전이 시 versions.status / published_by / published_at 동기화,
+        # documents.current_published_version_id 및 documents.status 업데이트
+        if target_status == WorkflowStatus.PUBLISHED:
+            now_ts = datetime.now(timezone.utc)
+            versions_repository.update_status(
+                conn,
+                version_id,
+                status="published",
+                published_by=actor_id,
+                published_at=now_ts,
+            )
+            documents_repository.update_version_pointers(
+                conn,
+                document_id,
+                current_published_version_id=version_id,
+            )
+            # 문서 자체 status도 published로 갱신
+            with conn.cursor() as _cur:
+                _cur.execute(
+                    "UPDATE documents SET status = 'published', updated_at = %s WHERE id = %s",
+                    (now_ts, document_id),
+                )
+
         # admin override 여부 플래그
         is_admin_override = (role == WorkflowRole.ADMIN)
 

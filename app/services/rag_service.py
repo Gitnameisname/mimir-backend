@@ -683,8 +683,8 @@ class RAGService:
                     )
                 elif isinstance(exc, _OAIAuthErr):
                     message = "LLM API 키가 올바르지 않습니다. 관리자에게 문의하세요."
-            except Exception:
-                pass
+            except Exception as type_check_exc:
+                logger.debug("OpenAI 예외 타입 확인 실패 (openai 미설치 가능): %s", type_check_exc)
             yield _sse_data({"event": "error", "data": {"message": message}})
 
     # ------------------------------------------------------------------

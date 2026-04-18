@@ -117,5 +117,6 @@ class ConversationCompressor:
         try:
             template = self._prompt_registry.get(_SUMMARY_PROMPT_KEY)
             return template if template else _DEFAULT_SUMMARY_PROMPT
-        except Exception:
+        except Exception as exc:
+            logger.warning("ConversationCompressor 프롬프트 템플릿 로드 실패, 기본값 사용: %s", exc)
             return _DEFAULT_SUMMARY_PROMPT

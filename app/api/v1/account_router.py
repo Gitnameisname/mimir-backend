@@ -20,11 +20,12 @@ Phase 14-7: 계정 관리 API.
   - GitLab 해제 시 다른 로그인 수단 존재 확인
 """
 
+import ipaddress
 import json
 import logging
 from datetime import datetime, timezone
 from typing import Optional
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
@@ -161,11 +162,28 @@ def update_profile(
         if name_errors:
             raise HTTPException(status_code=422, detail={"errors": name_errors})
 
-    # avatar_url 기본 검증 (길이는 Field에서 처리, 프로토콜만 확인)
+    # avatar_url 검증 — SEC4-BE-001: 스킴 + 내부 IP SSRF 방어
     if body.avatar_url is not None and body.avatar_url.strip():
         url = body.avatar_url.strip()
-        if not url.startswith(("https://", "http://")):
-            raise HTTPException(status_code=422, detail="아바타 URL은 http:// 또는 https://로 시작해야 합니다")
+        try:
+            parsed = urlparse(url)
+            if parsed.scheme not in ("https", "http"):
+                raise HTTPException(status_code=422, detail="아바타 URL은 http:// 또는 https://로 시작해야 합니다")
+            hostname = (parsed.hostname or "").lower()
+            if not hostname:
+                raise HTTPException(status_code=422, detail="아바타 URL의 호스트를 확인할 수 없습니다")
+            if hostname == "localhost":
+                raise HTTPException(status_code=422, detail="내부 네트워크 URL은 허용되지 않습니다")
+            try:
+                addr = ipaddress.ip_address(hostname)
+                if addr.is_loopback or addr.is_private or addr.is_link_local or addr.is_multicast:
+                    raise HTTPException(status_code=422, detail="내부 네트워크 URL은 허용되지 않습니다")
+            except ValueError:
+                pass  # 도메인명 — 정상
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(status_code=422, detail="아바타 URL 형식이 올바르지 않습니다")
 
     update_kwargs = {}
     if body.display_name is not None:

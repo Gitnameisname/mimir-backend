@@ -137,3 +137,42 @@ def generate_family_id() -> str:
         UUID4 문자열.
     """
     return str(uuid4())
+
+
+# ---------------------------------------------------------------------------
+# JWT 액세스 토큰 블랙리스트 (로그아웃 취소 지원)
+# ---------------------------------------------------------------------------
+
+_AT_BLACKLIST_PREFIX = "at_blacklist"
+
+
+def blacklist_access_token(valkey, jti: str, ttl_seconds: int) -> None:
+    """로그아웃된 액세스 토큰의 jti를 Valkey 블랙리스트에 등록한다.
+
+    TTL은 토큰 잔여 유효 시간으로 설정하여 만료 후 자동 제거.
+
+    Args:
+        valkey: Valkey 클라이언트.
+        jti: 토큰의 jti 클레임.
+        ttl_seconds: 블랙리스트 엔트리 유지 시간(초).
+    """
+    if not jti or ttl_seconds <= 0:
+        return
+    key = f"{_AT_BLACKLIST_PREFIX}:{jti}"
+    valkey.setex(key, ttl_seconds, "1")
+
+
+def is_access_token_blacklisted(valkey, jti: str) -> bool:
+    """액세스 토큰의 jti가 블랙리스트에 있는지 확인한다.
+
+    Args:
+        valkey: Valkey 클라이언트.
+        jti: 토큰의 jti 클레임.
+
+    Returns:
+        블랙리스트에 있으면 True.
+    """
+    if not jti:
+        return False
+    key = f"{_AT_BLACKLIST_PREFIX}:{jti}"
+    return valkey.exists(key) > 0

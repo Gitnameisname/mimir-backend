@@ -95,7 +95,7 @@ def list_documents(
         actor=actor,
         action="document.list",
         resource=ResourceRef(resource_type="document"),
-        require_authenticated=False,  # TODO: enforcement 활성화 시 True로 전환
+        require_authenticated=True,
     )
 
     request_id, trace_id = get_request_ids(request)
@@ -220,7 +220,7 @@ def get_document(
         actor=actor,
         action="document.read",
         resource=ResourceRef(resource_type="document", resource_id=document_id),
-        require_authenticated=False,  # TODO: enforcement 활성화 시 True로 전환
+        require_authenticated=True,
     )
 
     request_id, trace_id = get_request_ids(request)

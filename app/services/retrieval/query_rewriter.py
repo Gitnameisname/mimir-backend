@@ -99,7 +99,8 @@ class QueryRewriter:
         try:
             template = self._prompt_registry.get(_REWRITE_PROMPT_KEY)
             return template if template else _DEFAULT_REWRITE_PROMPT
-        except Exception:
+        except Exception as exc:
+            logger.warning("QueryRewriter 프롬프트 템플릿 로드 실패, 기본값 사용: %s", exc)
             return _DEFAULT_REWRITE_PROMPT
 
     # 메시지 하나당 최대 길이 (프롬프트 인젝션 / 토큰 비용 제한)
