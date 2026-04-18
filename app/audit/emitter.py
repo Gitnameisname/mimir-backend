@@ -23,7 +23,16 @@ audit_events 컬럼 매핑:
 
 import logging
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Literal, Optional
+
+# F-07 시정(2026-04-18): actor_type 을 타입 레벨에서 강제.
+#   S2 원칙 ⑥ "AI 에이전트는 사람과 동등한 API 소비자" 에 따라 모든 감사 이벤트는
+#   actor_type 을 반드시 기록해야 한다. 기존 Optional[str] 은 런타임 누락을 허용하여
+#   감사 누수의 원인이 되었으므로 Literal["user", "agent", "system"] 로 제약한다.
+#   - "user"   : 사람(End-user / Admin / Publisher 등)
+#   - "agent"  : LLM / MCP / 외부 서비스 계정
+#   - "system" : 스케줄러, 배치 잡, 서버 자체가 주체인 기록(만료 정리 등)
+ActorType = Literal["user", "agent", "system"]
 
 _audit_logger = logging.getLogger("mimir.audit")
 
@@ -42,6 +51,9 @@ class AuditEmitter:
         event_type: str,
         action: str,
         actor_id: Optional[str],
+        # F-07 시정(2026-04-18): actor_type 필수화 (Literal). 기본값 제거.
+        #   매 호출부는 "user" | "agent" | "system" 중 하나를 명시해야 한다.
+        actor_type: ActorType,
         resource_type: str,
         resource_id: Optional[str] = None,
         result: str,
@@ -51,8 +63,6 @@ class AuditEmitter:
         metadata: Optional[dict[str, Any]] = None,
         # 확장 파라미터 (Phase 4 감사 이벤트용)
         actor_role: Optional[str] = None,
-        # S2 원칙 ⑥: actor_type 필수 — 사람(user)과 에이전트(agent) 구분
-        actor_type: Optional[str] = None,
         target_version_id: Optional[str] = None,
         previous_state: Optional[str] = None,
         new_state: Optional[str] = None,
@@ -81,6 +91,8 @@ class AuditEmitter:
             "audit_event": event_type,
             "action": action,
             "actor_id": actor_id or "anonymous",
+            # F-07: actor_type 은 필수 필드로 항상 기록.
+            "actor_type": actor_type,
             "resource_type": resource_type,
             "result": result,
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -95,8 +107,6 @@ class AuditEmitter:
             log_event["tenant_id"] = tenant_id
         if metadata:
             log_event["metadata"] = metadata
-        if actor_type:
-            log_event["actor_type"] = actor_type
 
         _audit_logger.info("AUDIT %s", log_event)
 
@@ -122,7 +132,8 @@ class AuditEmitter:
         event_type: str,
         actor_id: Optional[str],
         actor_role: Optional[str],
-        actor_type: Optional[str],
+        # F-07: actor_type 은 _persist 에서도 필수.
+        actor_type: ActorType,
         resource_type: str,
         resource_id: Optional[str],
         result: str,
@@ -218,14 +229,16 @@ class AuditEmitter:
 
         패턴을 단순화한다.
         """
-        # S2 원칙 ⑥: ActorType.SERVICE → "agent", ActorType.USER → "user"
+        # S2 원칙 ⑥: ActorType.SERVICE → "agent", ActorType.USER → "user".
+        # F-07(2026-04-18): actor_type 이 Literal 로 강제되어 None 은 허용되지 않으므로
+        #   ActorContext 가 actor_type 을 지니지 않은 드문 케이스(테스트/초기화 오류 등)는
+        #   기본값 "user" 로 폴백. 운영에서는 ActorContext resolver 가 항상 지정한다.
         raw_actor_type = getattr(actor, "actor_type", None)
         if raw_actor_type is not None:
-            # Enum 이면 .value 추출, 아니면 문자열 변환
             raw_value = getattr(raw_actor_type, "value", str(raw_actor_type)).lower()
-            actor_type_str = "agent" if raw_value in ("service", "agent") else "user"
+            actor_type_str: ActorType = "agent" if raw_value in ("service", "agent") else "user"
         else:
-            actor_type_str = None
+            actor_type_str = "user"
 
         self.emit(
             event_type=event_type,

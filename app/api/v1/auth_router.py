@@ -250,6 +250,7 @@ def register(body: RegisterRequest, request: Request):
         event_type="user.registered",
         action="auth.register",
         actor_id=user.id,
+        actor_type="user",
         resource_type="user",
         resource_id=user.id,
         result="success",
@@ -310,6 +311,7 @@ def login(body: LoginRequest, request: Request, response: Response):
             audit_emitter.emit(
                 event_type="user.login_failed", action="auth.login",
                 actor_id=None, resource_type="user", result="failure",
+                actor_type="user",
                 request_id=req_id, metadata={"reason": "user_not_found"},
             )
             raise HTTPException(status_code=401, detail="이메일/아이디 또는 비밀번호가 올바르지 않습니다")
@@ -320,6 +322,7 @@ def login(body: LoginRequest, request: Request, response: Response):
             audit_emitter.emit(
                 event_type="user.login_failed", action="auth.login",
                 actor_id=user.id, resource_type="user", resource_id=user.id,
+                actor_type="user",
                 result="denied", request_id=req_id,
                 metadata={"reason": "account_inactive", "status": user.status},
             )
@@ -342,6 +345,7 @@ def login(body: LoginRequest, request: Request, response: Response):
             audit_emitter.emit(
                 event_type="user.login_failed", action="auth.login",
                 actor_id=user.id, resource_type="user", resource_id=user.id,
+                actor_type="user",
                 result="failure", request_id=req_id,
                 metadata={"reason": "invalid_password"},
             )
@@ -366,6 +370,7 @@ def login(body: LoginRequest, request: Request, response: Response):
     audit_emitter.emit(
         event_type="user.login_success", action="auth.login",
         actor_id=user.id, actor_role=user.role_name,
+        actor_type="user",
         resource_type="user", resource_id=user.id,
         result="success", request_id=req_id,
     )
@@ -472,6 +477,7 @@ def logout(
         event_type="user.logout",
         action="auth.logout",
         actor_id=None,  # AT에서 추출 가능하지만 optional
+        actor_type="user",
         resource_type="user",
         result="success",
         request_id=req_id,
@@ -583,6 +589,8 @@ def oauth_gitlab_callback(
     audit_emitter.emit(
         event_type="user.oauth_callback_success",
         action="auth.oauth.callback",
+        actor_id=None,
+        actor_type="user",
         resource_type="user",
         result="success",
         request_id=req_id,
@@ -622,6 +630,7 @@ def forgot_password(body: ForgotPasswordRequest, request: Request):
             event_type="user.password_reset_requested",
             action="auth.forgot_password",
             actor_id=user.id,
+            actor_type="user",
             resource_type="user",
             resource_id=user.id,
             result="success",
@@ -686,6 +695,7 @@ def reset_password(body: ResetPasswordRequest, request: Request):
         event_type="user.password_reset_completed",
         action="auth.reset_password",
         actor_id=user_id,
+        actor_type="user",
         resource_type="user",
         resource_id=user_id,
         result="success",
@@ -755,6 +765,7 @@ def verify_email(body: VerifyEmailRequest, request: Request):
         event_type="user.email_verified",
         action="auth.verify_email",
         actor_id=user_id,
+        actor_type="user",
         resource_type="user",
         resource_id=user_id,
         result="success",

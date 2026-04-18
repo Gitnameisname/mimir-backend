@@ -257,6 +257,7 @@ class WorkflowService:
             event_type=f"document.workflow.{action.value}",
             action=f"workflow.{action.value}",
             actor_id=actor_id,
+            actor_type="user",
             actor_role=actor_role,
             resource_type="version",
             resource_id=version_id,

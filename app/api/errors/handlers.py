@@ -145,6 +145,7 @@ async def api_error_handler(request: Request, exc: ApiError) -> JSONResponse:
                 event_type="authz.denied",
                 action="authz.check",
                 actor_id=_actor_id,
+                actor_type="user",
                 resource_type="unknown",
                 result="denied",
                 request_id=meta.request_id,
