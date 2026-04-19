@@ -81,115 +81,100 @@ class TestOAuthState:
 class TestEncryption:
     """AES-256-GCM 토큰 암호화/복호화 테스트."""
 
-    def test_encrypt_decrypt_roundtrip(self):
+    def test_encrypt_decrypt_roundtrip(self, monkeypatch):
         """암호화 → 복호화 라운드트립이 성공한다."""
         from app.api.auth.encryption import encrypt_token, decrypt_token, _get_encryption_key
         from app.config import settings
 
         # 테스트용 키 설정
         test_key = os.urandom(32)
-        original_key = settings.oauth_token_encryption_key
-        settings.oauth_token_encryption_key = base64.b64encode(test_key).decode()
+        monkeypatch.setattr(
+            settings,
+            "oauth_token_encryption_key",
+            base64.b64encode(test_key).decode(),
+        )
 
-        try:
-            plaintext = "gho_test_token_12345"
-            encrypted = encrypt_token(plaintext)
-            assert encrypted is not None
-            assert encrypted != plaintext  # 암호화됨
+        plaintext = "gho_test_token_12345"
+        encrypted = encrypt_token(plaintext)
+        assert encrypted is not None
+        assert encrypted != plaintext  # 암호화됨
 
-            decrypted = decrypt_token(encrypted)
-            assert decrypted == plaintext  # 원본 복원
-        finally:
-            settings.oauth_token_encryption_key = original_key
+        decrypted = decrypt_token(encrypted)
+        assert decrypted == plaintext  # 원본 복원
 
-    def test_different_ciphertexts(self):
+    def test_different_ciphertexts(self, monkeypatch):
         """같은 평문이라도 매번 다른 암호문이 생성된다 (nonce 랜덤)."""
         from app.api.auth.encryption import encrypt_token
         from app.config import settings
 
         test_key = os.urandom(32)
-        original_key = settings.oauth_token_encryption_key
-        settings.oauth_token_encryption_key = base64.b64encode(test_key).decode()
+        monkeypatch.setattr(
+            settings,
+            "oauth_token_encryption_key",
+            base64.b64encode(test_key).decode(),
+        )
 
-        try:
-            plaintext = "same-token"
-            enc1 = encrypt_token(plaintext)
-            enc2 = encrypt_token(plaintext)
-            assert enc1 != enc2  # nonce가 다르므로 암호문도 다름
-        finally:
-            settings.oauth_token_encryption_key = original_key
+        plaintext = "same-token"
+        enc1 = encrypt_token(plaintext)
+        enc2 = encrypt_token(plaintext)
+        assert enc1 != enc2  # nonce가 다르므로 암호문도 다름
 
-    def test_tampered_ciphertext_fails(self):
+    def test_tampered_ciphertext_fails(self, monkeypatch):
         """변조된 암호문은 복호화에 실패한다 (GCM 인증)."""
         from app.api.auth.encryption import encrypt_token, decrypt_token
         from app.config import settings
 
         test_key = os.urandom(32)
-        original_key = settings.oauth_token_encryption_key
-        settings.oauth_token_encryption_key = base64.b64encode(test_key).decode()
+        monkeypatch.setattr(
+            settings,
+            "oauth_token_encryption_key",
+            base64.b64encode(test_key).decode(),
+        )
 
-        try:
-            plaintext = "secret-token"
-            encrypted = encrypt_token(plaintext)
+        plaintext = "secret-token"
+        encrypted = encrypt_token(plaintext)
 
-            # 암호문 변조
-            data = base64.b64decode(encrypted)
-            tampered = data[:-1] + bytes([(data[-1] + 1) % 256])
-            tampered_b64 = base64.b64encode(tampered).decode()
+        # 암호문 변조
+        data = base64.b64decode(encrypted)
+        tampered = data[:-1] + bytes([(data[-1] + 1) % 256])
+        tampered_b64 = base64.b64encode(tampered).decode()
 
-            result = decrypt_token(tampered_b64)
-            assert result is None  # GCM 인증 실패
-        finally:
-            settings.oauth_token_encryption_key = original_key
+        result = decrypt_token(tampered_b64)
+        assert result is None  # GCM 인증 실패
 
-    def test_no_key_returns_plaintext(self):
-        """암호화 키 미설정 시 평문 그대로 반환한다."""
+    def test_no_key_raises_and_decrypt_returns_none(self, monkeypatch):
+        """암호화 키 미설정 시 평문 저장 대신 예외/None을 반환한다."""
         from app.api.auth.encryption import encrypt_token, decrypt_token
         from app.config import settings
 
-        original_key = settings.oauth_token_encryption_key
-        settings.oauth_token_encryption_key = ""
+        monkeypatch.setattr(settings, "oauth_token_encryption_key", "")
 
-        try:
-            plaintext = "plain-token"
-            result = encrypt_token(plaintext)
-            assert result == plaintext  # 키 없으면 평문
+        plaintext = "plain-token"
+        with pytest.raises(RuntimeError, match="OAUTH_TOKEN_ENCRYPTION_KEY"):
+            encrypt_token(plaintext)
 
-            decrypted = decrypt_token(plaintext)
-            assert decrypted == plaintext
-        finally:
-            settings.oauth_token_encryption_key = original_key
+        assert decrypt_token(plaintext) is None
 
 
 class TestOIDCDiscovery:
     """OIDC Discovery URL 구성 테스트."""
 
-    def test_discovery_url_gitlab_com(self):
+    def test_discovery_url_gitlab_com(self, monkeypatch):
         """GitLab.com Discovery URL이 올바르다."""
         from app.api.auth.oauth_service import _get_discovery_url
         from app.config import settings
 
-        original = settings.gitlab_base_url
-        settings.gitlab_base_url = "https://gitlab.com"
+        monkeypatch.setattr(settings, "gitlab_base_url", "https://gitlab.com")
+        assert _get_discovery_url() == "https://gitlab.com/.well-known/openid-configuration"
 
-        try:
-            assert _get_discovery_url() == "https://gitlab.com/.well-known/openid-configuration"
-        finally:
-            settings.gitlab_base_url = original
-
-    def test_discovery_url_self_managed(self):
+    def test_discovery_url_self_managed(self, monkeypatch):
         """Self-managed GitLab Discovery URL이 올바르다."""
         from app.api.auth.oauth_service import _get_discovery_url
         from app.config import settings
 
-        original = settings.gitlab_base_url
-        settings.gitlab_base_url = "https://gitlab.mycompany.com/"
-
-        try:
-            # trailing slash 제거됨
-            assert _get_discovery_url() == "https://gitlab.mycompany.com/.well-known/openid-configuration"
-        finally:
-            settings.gitlab_base_url = original
+        monkeypatch.setattr(settings, "gitlab_base_url", "https://gitlab.mycompany.com/")
+        # trailing slash 제거됨
+        assert _get_discovery_url() == "https://gitlab.mycompany.com/.well-known/openid-configuration"
 
 
 class TestConfigOAuthEnabled:

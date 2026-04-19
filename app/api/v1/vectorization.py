@@ -530,6 +530,8 @@ def semantic_search(
             conn,
             query=body.q,
             actor_role=actor_role,
+            actor_user_id=getattr(actor, "actor_id", None),
+            organization_id=getattr(actor, "tenant_id", None),
             document_type=body.document_type,
             top_k=min(body.top_k, 50),
         )

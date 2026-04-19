@@ -29,7 +29,7 @@ from uuid import uuid4
 
 import jwt
 
-from app.config import settings
+from app import config
 
 _ALGORITHM = "HS256"
 
@@ -52,10 +52,12 @@ def create_access_token(
     Raises:
         ValueError: jwt_secret이 설정되지 않은 경우.
     """
-    if not settings.jwt_secret:
+    if not config.settings.jwt_secret:
         raise ValueError("JWT_SECRET is not configured")
 
-    expire_delta = timedelta(minutes=expires_minutes or settings.jwt_expire_minutes)
+    expire_delta = timedelta(
+        minutes=expires_minutes or config.settings.jwt_expire_minutes
+    )
     now = datetime.now(tz=timezone.utc)
     payload = {
         "sub": actor_id,
@@ -65,7 +67,7 @@ def create_access_token(
         "jti": str(uuid4()),
         "type": "access",
     }
-    return jwt.encode(payload, settings.jwt_secret, algorithm=_ALGORITHM)
+    return jwt.encode(payload, config.settings.jwt_secret, algorithm=_ALGORITHM)
 
 
 def decode_access_token(token: str) -> dict | None:
@@ -76,12 +78,12 @@ def decode_access_token(token: str) -> dict | None:
     Returns:
         payload dict (sub, role, exp, jti, type, ...) 또는 None (검증 실패).
     """
-    if not settings.jwt_secret:
+    if not config.settings.jwt_secret:
         return None
     try:
         payload = jwt.decode(
             token,
-            settings.jwt_secret,
+            config.settings.jwt_secret,
             algorithms=[_ALGORITHM],
             options={"require": ["sub", "exp"]},
         )

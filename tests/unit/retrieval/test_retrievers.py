@@ -173,4 +173,4 @@ def test_retriever_warns_without_acl(caplog):
     fts = FTSRetriever(MagicMock())
     with caplog.at_level(logging.WARNING):
         fts._warn_if_no_acl(None)
-    assert "actor_role" in caplog.text
+    assert "delegated ACL filters" in caplog.text

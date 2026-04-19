@@ -221,6 +221,7 @@ class TestA01FtsAcl:
             kw in source for kw in [
                 "scope_profile", "acl_filter", "scope_name",
                 "apply_scope_filter", "access_context",
+                "build_chunk_acl_clause", "accessible_org_ids", "accessible_user_ids",
             ]
         )
         assert has_acl, "FTS retriever에 ACL 적용 코드 없음 (S2 ⑦ 위반 위험)"

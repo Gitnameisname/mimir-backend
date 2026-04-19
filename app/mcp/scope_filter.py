@@ -19,6 +19,10 @@ from app.services.filter_expression import (
 logger = logging.getLogger(__name__)
 
 
+class ScopeFilterResolutionError(RuntimeError):
+    """Scope Profile 기반 ACL 필터를 안전하게 해석할 수 없을 때 발생."""
+
+
 def apply_scope_filter(
     *,
     scope_profile_id: str,
@@ -30,23 +34,35 @@ def apply_scope_filter(
 
     Returns:
         {"sql": "AND (...)", "params": [...]}
-        필터 없음 또는 오류 시: {"sql": "", "params": []}
     """
     try:
         repo = ScopeProfileRepository(conn)
         scope_def = repo.get_definition(scope_profile_id, scope_name)
-        if not scope_def or not scope_def.acl_filter:
-            return {"sql": "", "params": []}
+    except Exception as exc:
+        logger.error("scope_filter unexpected repository error: %s", exc)
+        raise ScopeFilterResolutionError(
+            f"scope profile 조회 실패: profile={scope_profile_id}, scope={scope_name}"
+        ) from exc
 
+    if not scope_def:
+        raise ScopeFilterResolutionError(
+            f"scope profile에 scope 정의가 없습니다: profile={scope_profile_id}, scope={scope_name}"
+        )
+    if not scope_def.acl_filter:
+        raise ScopeFilterResolutionError(
+            f"scope profile acl_filter가 비어 있습니다: profile={scope_profile_id}, scope={scope_name}"
+        )
+
+    try:
         expr = parse_filter_expression(scope_def.acl_filter)
         expr = substitute_ctx(expr, access_context)
         sql_fragment, params = build_sql_filter(expr)
+        if not sql_fragment:
+            raise ScopeFilterResolutionError(
+                f"scope profile acl_filter가 빈 SQL로 해석되었습니다: profile={scope_profile_id}, scope={scope_name}"
+            )
         return {"sql": sql_fragment, "params": params}
-
     except ValueError as exc:
         logger.warning("scope_filter validation error profile=%s scope=%s: %s",
                        scope_profile_id, scope_name, exc)
-        raise
-    except Exception as exc:
-        logger.error("scope_filter unexpected error: %s", exc)
-        return {"sql": "", "params": []}
+        raise ScopeFilterResolutionError(str(exc)) from exc

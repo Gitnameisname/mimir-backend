@@ -46,7 +46,7 @@ class Settings(BaseSettings):
     gitlab_client_secret: str = ""
     gitlab_redirect_uri: str = ""
     oauth_token_encryption_key: str = ""  # 32바이트 base64 인코딩
-    frontend_url: str = "http://localhost:3000"  # OAuth 콜백 후 프론트엔드 리다이렉트
+    frontend_url: str = "http://localhost:3050"  # OAuth 콜백 후 프론트엔드 리다이렉트
 
     # SMTP (Phase 14-5) — 빈 문자열(기본값) 시 메일 발송 비활성화 (S2 원칙 ⑦: 폐쇄망 호환)
     # smtp_host를 설정하면 메일 발송이 활성화됨. 실제 발송 구현은 S3에서 추가 예정.
@@ -58,7 +58,7 @@ class Settings(BaseSettings):
     smtp_use_tls: bool = False
 
     # CORS
-    cors_allow_origins: str = "http://localhost:3000"
+    cors_allow_origins: str = "http://localhost:3050"
 
     # 신뢰 프록시 수 (SEC3-BE-005: X-Forwarded-For 스푸핑 방어)
     # 리버스 프록시(Nginx, ALB 등) 개수. 0이면 직접 연결(프록시 없음).

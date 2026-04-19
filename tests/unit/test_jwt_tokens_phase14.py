@@ -61,17 +61,23 @@ class TestAccessToken:
         import jwt as pyjwt
         from app.config import settings
 
+        original_secret = settings.jwt_secret
+        settings.jwt_secret = original_secret or "phase14-jwt-test-secret"
+
         payload = {
             "sub": "user-1",
             "role": "VIEWER",
             "exp": int(time.time()) + 3600,
         }
-        token = pyjwt.encode(payload, settings.jwt_secret, algorithm="HS256")
+        try:
+            token = pyjwt.encode(payload, settings.jwt_secret, algorithm="HS256")
 
-        from app.api.auth.tokens import decode_access_token
-        result = decode_access_token(token)
-        assert result is not None
-        assert result["sub"] == "user-1"
+            from app.api.auth.tokens import decode_access_token
+            result = decode_access_token(token)
+            assert result is not None
+            assert result["sub"] == "user-1"
+        finally:
+            settings.jwt_secret = original_secret
 
 
 class TestRefreshToken:

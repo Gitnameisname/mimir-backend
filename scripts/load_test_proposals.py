@@ -3,7 +3,7 @@ Mimir 제안 시스템 부하 테스트 (PH5-CARRY-003).
 
 실행 방법:
   locust -f scripts/load_test_proposals.py \
-    --host http://localhost:8000 \
+    --host http://localhost:8050 \
     --users 1000 \
     --spawn-rate 50 \
     --run-time 5m \

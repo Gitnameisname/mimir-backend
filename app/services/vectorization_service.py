@@ -11,10 +11,11 @@
 """
 
 import logging
+import json
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 import psycopg2.extensions
 import psycopg2.extras
@@ -24,6 +25,29 @@ from app.services.chunking_service import DocumentChunk, chunking_service
 from app.services.embedding_service import EmbeddingProvider, get_embedding_provider
 
 logger = logging.getLogger(__name__)
+
+_PUBLISHED_ROLES = ["VIEWER", "AUTHOR", "REVIEWER", "APPROVER", "PUBLISHER", "ORG_ADMIN", "SUPER_ADMIN"]
+_DRAFT_ROLES = ["AUTHOR", "REVIEWER", "APPROVER", "PUBLISHER", "ORG_ADMIN", "SUPER_ADMIN"]
+_ORG_METADATA_KEYS = ("organization_id", "org_id", "organization_ids", "org_ids")
+_USER_METADATA_KEYS = ("owner_user_id", "user_id", "owner_user_ids", "accessible_user_ids")
+
+
+def _normalize_acl_values(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        stripped = value.strip()
+        return [stripped] if stripped else []
+    if isinstance(value, (list, tuple, set)):
+        return [str(v).strip() for v in value if str(v).strip()]
+    return [str(value).strip()] if str(value).strip() else []
+
+
+def _extract_acl_values(metadata: dict[str, Any], keys: tuple[str, ...]) -> list[str]:
+    values: list[str] = []
+    for key in keys:
+        values.extend(_normalize_acl_values(metadata.get(key)))
+    return list(dict.fromkeys(values))
 
 
 # ---------------------------------------------------------------------------
@@ -51,26 +75,39 @@ def _get_permission_snapshot(
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT status, document_type FROM documents WHERE id = %s::uuid",
+                "SELECT status, document_type, metadata, created_by FROM documents WHERE id = %s::uuid",
                 (document_id,),
             )
             row = cur.fetchone()
             if not row:
                 return PermissionSnapshot()
 
-            # published 문서: VIEWER 이상 모든 역할 접근 가능
+            metadata = row.get("metadata") or {}
+            if isinstance(metadata, str):
+                metadata = json.loads(metadata)
+            org_ids = _extract_acl_values(metadata, _ORG_METADATA_KEYS)
+            user_ids = _extract_acl_values(metadata, _USER_METADATA_KEYS)
+            user_ids.extend(_normalize_acl_values(row.get("created_by")))
+            user_ids = list(dict.fromkeys(user_ids))
+
+            visibility = str(metadata.get("visibility") or "").lower()
+            is_public = (
+                row["status"] == "published"
+                and not org_ids
+                and visibility not in {"restricted", "private", "internal"}
+            )
+
             if row["status"] == "published":
                 return PermissionSnapshot(
-                    accessible_roles=["VIEWER", "AUTHOR", "REVIEWER", "APPROVER", "PUBLISHER", "ORG_ADMIN", "SUPER_ADMIN"],
-                    # TODO [M-2]: accessible_org_ids 미구현 — Phase 2 ACL에 org 기반
-                    # 접근 제어가 포함된 경우 여기서 조직 ID를 조회·반영해야 한다.
-                    accessible_org_ids=[],
-                    is_public=True,
+                    accessible_roles=_PUBLISHED_ROLES,
+                    accessible_user_ids=user_ids,
+                    accessible_org_ids=org_ids,
+                    is_public=is_public,
                 )
-            # draft 문서: 편집 역할 이상만 접근
             return PermissionSnapshot(
-                accessible_roles=["AUTHOR", "REVIEWER", "APPROVER", "PUBLISHER", "ORG_ADMIN", "SUPER_ADMIN"],
-                accessible_org_ids=[],  # TODO [M-2]: org 기반 ACL 미구현
+                accessible_roles=_DRAFT_ROLES,
+                accessible_user_ids=user_ids,
+                accessible_org_ids=org_ids,
                 is_public=False,
             )
     except Exception as exc:
@@ -333,6 +370,8 @@ class VectorizationPipeline:
         query: str,
         *,
         actor_role: Optional[str] = None,
+        actor_user_id: Optional[str] = None,
+        organization_id: Optional[str] = None,
         document_type: Optional[str] = None,
         top_k: int = 20,
     ) -> list[dict]:
@@ -350,14 +389,18 @@ class VectorizationPipeline:
             )
             return []
 
-        # 권한 필터: is_public이거나 accessible_roles에 actor_role 포함
-        role_filter = ""
-        role_params: list = []
+        acl_terms = ["is_public = TRUE"]
+        acl_params: list = []
         if actor_role:
-            role_filter = " AND (is_public = TRUE OR %s = ANY(accessible_roles))"
-            role_params = [actor_role]
-        else:
-            role_filter = " AND is_public = TRUE"
+            acl_terms.append("%s = ANY(accessible_roles)")
+            acl_params.append(actor_role)
+        if actor_user_id:
+            acl_terms.append("%s = ANY(accessible_user_ids)")
+            acl_params.append(actor_user_id)
+        if organization_id:
+            acl_terms.append("%s = ANY(accessible_org_ids)")
+            acl_params.append(organization_id)
+        role_filter = " AND (" + " OR ".join(acl_terms) + ")"
 
         type_filter = ""
         type_params: list = []
@@ -366,7 +409,7 @@ class VectorizationPipeline:
             type_params = [document_type]
 
         # 파라미터 순서: SELECT용 query_embedding, role_params, type_params, ORDER BY용 query_embedding, LIMIT
-        all_params = [query_embedding] + role_params + type_params + [query_embedding, top_k]
+        all_params = [query_embedding] + acl_params + type_params + [query_embedding, top_k]
 
         with conn.cursor() as cur:
             cur.execute(

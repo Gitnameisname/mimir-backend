@@ -19,8 +19,8 @@ from typing import Any, Optional
 
 from app.api.auth.models import ActorContext
 from app.audit.emitter import audit_emitter
-from app.mcp.errors import MCPError, MCPErrorCode, not_found, unauthorized
-from app.mcp.scope_filter import apply_scope_filter
+from app.mcp.errors import MCPError, MCPErrorCode, invalid_scope, not_found, unauthorized
+from app.mcp.scope_filter import ScopeFilterResolutionError, apply_scope_filter
 from app.schemas.mcp import (
     AccessContext,
     CitationResult,
@@ -72,16 +72,52 @@ def tool_search_documents(
     results = []
     raw_items = raw.results if hasattr(raw, "results") else raw
     for item in raw_items:
-        doc_id = str(getattr(item, "document_id", "") or "")
+        citation_obj = getattr(item, "citation", None)
+        doc_id = str(
+            getattr(item, "document_id", None)
+            or getattr(item, "id", None)
+            or getattr(citation_obj, "document_id", "")
+            or ""
+        )
         # Scope ACL 후처리 필터
         if allowed_doc_ids is not None and doc_id not in allowed_doc_ids:
             continue
-        ver_id = str(getattr(item, "version_id", "") or "") or None
-        node_id = str(getattr(item, "node_id", "") or "") or None
-        content = str(getattr(item, "snippet", "") or getattr(item, "content", "") or "")
+        ver_id = str(
+            getattr(item, "version_id", None)
+            or getattr(citation_obj, "version_id", "")
+            or ""
+        ) or None
+        node_id = str(
+            getattr(item, "node_id", None)
+            or getattr(citation_obj, "node_id", "")
+            or ""
+        ) or None
+        snippets = getattr(item, "snippets", None) or []
+        snippet_text = ""
+        if snippets:
+            snippet_text = " ".join(
+                str(getattr(snippet, "text", "") or "")
+                for snippet in snippets
+                if getattr(snippet, "text", None)
+            ).strip()
+        content = str(
+            getattr(item, "snippet", "")
+            or getattr(item, "content", "")
+            or snippet_text
+            or getattr(item, "summary", "")
+            or ""
+        )
         score = float(getattr(item, "rank", 0) or getattr(item, "score", 0) or 0)
         citation = None
-        if node_id:
+        if citation_obj is not None:
+            citation = CitationResult(
+                document_id=doc_id,
+                version_id=ver_id,
+                node_id=node_id,
+                span_offset=getattr(citation_obj, "span_offset", None),
+                content_hash=getattr(citation_obj, "content_hash", None),
+            )
+        elif node_id:
             citation = CitationResult(
                 document_id=doc_id,
                 version_id=ver_id,
@@ -90,7 +126,7 @@ def tool_search_documents(
             )
         results.append(SearchResultItem(
             document_id=doc_id,
-            document_title=str(getattr(item, "title", "") or ""),
+            document_title=str(getattr(item, "document_title", "") or getattr(item, "title", "") or ""),
             version_id=ver_id,
             node_id=node_id,
             content=content,
@@ -120,6 +156,18 @@ def tool_fetch_node(
 ) -> FetchNodeData:
     """fetch_node 도구 — 특정 문서 노드 전문 조회."""
     _check_agent_write_blocked(actor)
+    acl_extra = _resolve_acl_filter(actor, None, request.access_context, conn)
+    _ensure_document_allowed(conn, request.document_id, acl_extra)
+    chunk_row = _fetch_accessible_chunk(
+        conn,
+        actor,
+        request.document_id,
+        request.version_id,
+        request.node_id,
+        request.access_context,
+    )
+    if not chunk_row:
+        raise not_found(f"노드 {request.node_id}를 찾을 수 없습니다.")
 
     with conn.cursor() as cur:
         # 버전 ID 결정
@@ -161,7 +209,7 @@ def tool_fetch_node(
         )
         children = [str(r["id"]) for r in cur.fetchall()]
 
-    content = node_row.get("content") or ""
+    content = node_row.get("content") or chunk_row.get("source_text") or ""
     metadata = node_row.get("metadata") or {}
     if isinstance(metadata, str):
         import json
@@ -195,35 +243,37 @@ def tool_verify_citation(
 ) -> VerifyCitationData:
     """verify_citation 도구 — Citation 5-tuple content_hash 검증."""
     _check_agent_write_blocked(actor)
+    acl_extra = _resolve_acl_filter(actor, None, request.access_context, conn)
+    _ensure_document_allowed(conn, request.document_id, acl_extra)
 
     with conn.cursor() as cur:
-        # 버전 유효성 확인
         cur.execute(
             "SELECT id FROM versions WHERE id = %s AND document_id = %s",
             (request.version_id, request.document_id),
         )
         version_valid = cur.fetchone() is not None
 
-        if not version_valid:
-            _emit_audit("mcp.verify_citation", "mcp.tool.call", actor,
-                        metadata={"result": "version_not_found"})
-            return VerifyCitationData(
-                verified=False,
-                current_hash=None,
-                hash_matches=False,
-                content_snapshot=None,
-                version_valid=False,
-                message="버전이 유효하지 않습니다.",
-            )
-
-        # 노드 콘텐츠 조회
-        cur.execute(
-            "SELECT content FROM nodes WHERE id = %s AND version_id = %s",
-            (request.node_id, request.version_id),
+    if not version_valid:
+        _emit_audit("mcp.verify_citation", "mcp.tool.call", actor,
+                    metadata={"result": "version_not_found"})
+        return VerifyCitationData(
+            verified=False,
+            current_hash=None,
+            hash_matches=False,
+            content_snapshot=None,
+            version_valid=False,
+            message="버전이 유효하지 않습니다.",
         )
-        node_row = cur.fetchone()
 
-    if not node_row:
+    chunk_row = _fetch_accessible_chunk(
+        conn,
+        actor,
+        request.document_id,
+        request.version_id,
+        request.node_id,
+        request.access_context,
+    )
+    if not chunk_row:
         _emit_audit("mcp.verify_citation", "mcp.tool.call", actor,
                     metadata={"result": "node_not_found"})
         return VerifyCitationData(
@@ -235,7 +285,7 @@ def tool_verify_citation(
             message="노드를 찾을 수 없습니다.",
         )
 
-    content = node_row.get("content") or ""
+    content = chunk_row.get("source_text") or ""
     current_hash = _compute_content_hash(content)
     hash_matches = current_hash == request.content_hash
 
@@ -266,14 +316,10 @@ def tool_verify_citation(
 
 def _fetch_allowed_doc_ids(conn, acl_extra: dict) -> set:
     """ACL 필터 SQL을 실행하여 허용된 document_id 집합을 반환한다."""
-    try:
-        sql = "SELECT DISTINCT d.id FROM documents d " + acl_extra["sql"].replace("AND (", "WHERE (", 1)
-        with conn.cursor() as cur:
-            cur.execute(sql, acl_extra["params"])
-            return {str(r["id"]) for r in cur.fetchall()}
-    except Exception as exc:
-        logger.warning("allowed_doc_ids fetch failed: %s — skipping scope filter", exc)
-        return set()
+    sql = "SELECT DISTINCT d.id FROM documents d " + acl_extra["sql"].replace("AND (", "WHERE (", 1)
+    with conn.cursor() as cur:
+        cur.execute(sql, acl_extra["params"])
+        return {str(r["id"]) for r in cur.fetchall()}
 
 
 def _check_agent_write_blocked(actor: ActorContext) -> None:
@@ -290,13 +336,13 @@ def _resolve_acl_filter(
     conn,
 ) -> dict:
     """Scope Profile 기반 추가 ACL 필터를 SQL 형태로 반환한다."""
-    if not actor.is_agent or not actor.scope_profile_id or not scope or scope == "default":
+    if not actor.is_agent or not actor.scope_profile_id:
         return {"sql": "", "params": []}
 
     try:
         return apply_scope_filter(
             scope_profile_id=actor.scope_profile_id,
-            scope_name=scope,
+            scope_name=scope or "default",
             access_context={
                 "organization_id": access_context.organization_id if access_context else None,
                 "team_id": access_context.team_id if access_context else None,
@@ -305,13 +351,77 @@ def _resolve_acl_filter(
             },
             conn=conn,
         )
-    except Exception as exc:
+    except ScopeFilterResolutionError as exc:
         logger.warning("scope filter resolve failed: %s", exc)
-        return {"sql": "", "params": []}
+        raise invalid_scope(str(exc)) from exc
 
 
 def _compute_content_hash(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _build_chunk_acl_clause(
+    actor: ActorContext,
+    access_context: Optional[AccessContext],
+) -> tuple[str, list[Any]]:
+    clauses = ["dc.is_public = TRUE"]
+    params: list[Any] = []
+
+    actor_role = actor.role
+    actor_user_id = access_context.user_id if access_context and access_context.user_id else actor.acting_on_behalf_of or actor.actor_id
+    organization_id = access_context.organization_id if access_context else None
+
+    if actor_role:
+        clauses.append("%s = ANY(dc.accessible_roles)")
+        params.append(actor_role)
+    if actor_user_id:
+        clauses.append("%s = ANY(dc.accessible_user_ids)")
+        params.append(actor_user_id)
+    if organization_id:
+        clauses.append("%s = ANY(dc.accessible_org_ids)")
+        params.append(organization_id)
+
+    return "(" + " OR ".join(clauses) + ")", params
+
+
+def _fetch_accessible_chunk(
+    conn,
+    actor: ActorContext,
+    document_id: str,
+    version_id: Optional[str],
+    node_id: str,
+    access_context: Optional[AccessContext],
+):
+    acl_cond, acl_params = _build_chunk_acl_clause(actor, access_context)
+    version_cond = "AND dc.version_id = %s::uuid" if version_id else ""
+    params: list[Any] = [document_id]
+    if version_id:
+        params.append(version_id)
+    params.append(node_id)
+    params.extend(acl_params)
+
+    sql = f"""
+        SELECT dc.document_id, dc.version_id, dc.node_id, dc.source_text
+        FROM document_chunks dc
+        WHERE dc.document_id = %s::uuid
+          {version_cond}
+          AND dc.node_id = %s::uuid
+          AND dc.is_current = TRUE
+          AND {acl_cond}
+        ORDER BY dc.chunk_index
+        LIMIT 1
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        return cur.fetchone()
+
+
+def _ensure_document_allowed(conn, document_id: str, acl_extra: dict) -> None:
+    if not acl_extra.get("sql"):
+        return
+    allowed_doc_ids = _fetch_allowed_doc_ids(conn, acl_extra)
+    if document_id not in allowed_doc_ids:
+        raise unauthorized("요청한 문서에 접근할 수 없습니다.")
 
 
 def _emit_audit(

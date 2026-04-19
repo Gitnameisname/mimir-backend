@@ -19,11 +19,43 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.cache.valkey import get_valkey
 
 logger = logging.getLogger(__name__)
+
+_FALLBACK_CACHE: dict[str, tuple[Any, datetime]] = {}
+
+
+def _fallback_get(key: str) -> Any | None:
+    entry = _FALLBACK_CACHE.get(key)
+    if entry is None:
+        return None
+    value, expires_at = entry
+    if datetime.now(timezone.utc) > expires_at:
+        _FALLBACK_CACHE.pop(key, None)
+        return None
+    return value
+
+
+def _fallback_set(key: str, value: Any, ttl_seconds: int) -> None:
+    _FALLBACK_CACHE[key] = (
+        value,
+        datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds),
+    )
+
+
+def _fallback_invalidate(pattern: str) -> int:
+    prefixes = {
+        pattern.rstrip("*"),
+        f"mimir:{pattern}".rstrip("*"),
+    }
+    keys = [key for key in _FALLBACK_CACHE if any(key.startswith(prefix) for prefix in prefixes)]
+    for key in keys:
+        _FALLBACK_CACHE.pop(key, None)
+    return len(keys)
 
 
 def _make_cache_key(prefix: str, *parts: Any) -> str:
@@ -40,11 +72,11 @@ def get_cached(key: str) -> Any | None:
         r = get_valkey()
         raw = r.get(key)
         if raw is None:
-            return None
+            return _fallback_get(key)
         return json.loads(raw)
     except Exception as exc:
         logger.debug("cache get failed (key=%s): %s", key, exc)
-        return None
+        return _fallback_get(key)
 
 
 def set_cached(key: str, value: Any, ttl_seconds: int = 60) -> bool:
@@ -55,20 +87,21 @@ def set_cached(key: str, value: Any, ttl_seconds: int = 60) -> bool:
         return True
     except Exception as exc:
         logger.debug("cache set failed (key=%s): %s", key, exc)
-        return False
+        _fallback_set(key, value, ttl_seconds)
+        return True
 
 
 def invalidate_pattern(pattern: str) -> int:
     """패턴에 매치되는 키를 모두 삭제한다. 삭제된 키 수 반환."""
+    deleted = 0
     try:
         r = get_valkey()
         keys = list(r.scan_iter(f"mimir:{pattern}"))
         if keys:
-            return r.delete(*keys)
-        return 0
+            deleted += r.delete(*keys)
     except Exception as exc:
         logger.debug("cache invalidate failed (pattern=%s): %s", pattern, exc)
-        return 0
+    return deleted + _fallback_invalidate(pattern)
 
 
 def invalidate_document(document_id: str) -> None:

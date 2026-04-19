@@ -67,7 +67,7 @@ def _make_report(metrics=None, *, overall_passed=True, items=None, insights=None
         closed_network_mode=False,
         commit_sha="abc123",
         pr_number=42,
-        backend_url="http://localhost:8000",
+        backend_url="http://localhost:8050",
     )
 
 

@@ -13,7 +13,11 @@ from uuid import UUID
 import psycopg2.extensions
 import psycopg2.extras
 
-from app.services.retrieval.base import Retriever, RetrievalResult
+from app.services.retrieval.base import (
+    Retriever,
+    RetrievalResult,
+    build_chunk_acl_clause,
+)
 from app.services.retrieval.citation_builder import CitationBuilder, _NIL_NODE_ID
 
 logger = logging.getLogger(__name__)
@@ -39,7 +43,6 @@ class VectorRetriever(Retriever):
     ) -> List[RetrievalResult]:
         self._warn_if_no_acl(filters)
         filters = filters or {}
-        actor_role = filters.get("actor_role")
 
         # 쿼리 임베딩 생성 (Phase 10 embedding_service 활용)
         try:
@@ -50,13 +53,7 @@ class VectorRetriever(Retriever):
             logger.error("VectorRetriever: embedding failed: %s — returning empty", exc)
             return []
 
-        # ACL 조건
-        if actor_role:
-            acl_cond = "(dc.is_public = TRUE OR %s = ANY(dc.accessible_roles))"
-            acl_params: list = [actor_role]
-        else:
-            acl_cond = "dc.is_public = TRUE"
-            acl_params = []
+        acl_cond, acl_params = build_chunk_acl_clause(filters, table_alias="dc")
 
         # document_type 조건
         if document_type:

@@ -113,11 +113,8 @@ def _del_prefix(prefix: str) -> int:
     count = 0
     if _EXTERNAL_ENABLED:
         try:
-            from app.cache.valkey import get_valkey
-            r = get_valkey()
-            keys = list(r.scan_iter(f"{prefix}*"))
-            if keys:
-                count += r.delete(*keys)
+            from app.cache.response_cache import invalidate_pattern
+            count += invalidate_pattern(prefix)
         except Exception as exc:
             logger.debug("Valkey del_prefix failed, falling back to LRU: %s", exc)
     count += _lru.delete_prefix(prefix)

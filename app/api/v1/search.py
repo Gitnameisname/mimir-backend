@@ -217,7 +217,12 @@ async def search_documents(
                 query=q,
                 document_type=type or "",
                 top_k=min(100, max(1, limit)),
-                filters={"actor_role": actor_role, "status": status},
+                filters={
+                    "actor_role": actor_role,
+                    "actor_user_id": getattr(actor, "actor_id", None),
+                    "organization_id": getattr(actor, "tenant_id", None),
+                    "status": status,
+                },
                 retriever_override=retriever,
                 reranker_override=reranker,
             )

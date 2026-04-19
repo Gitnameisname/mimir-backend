@@ -72,9 +72,50 @@ class Retriever(ABC):
 
     def _warn_if_no_acl(self, filters: Optional[Dict]) -> None:
         """filters에 actor_role 정보가 없으면 경고를 로깅한다."""
-        if not filters or "actor_role" not in filters:
+        if not filters or (
+            "actor_role" not in filters
+            and "actor_user_id" not in filters
+            and "organization_id" not in filters
+        ):
             logger.warning(
-                "%s.retrieve() called without actor_role filter — "
+                "%s.retrieve() called without delegated ACL filters — "
                 "only public documents will be returned",
                 self.__class__.__name__,
             )
+
+
+def extract_acl_subjects(filters: Optional[Dict[str, Any]]) -> dict[str, Optional[str]]:
+    """검색 filters에서 delegated ACL 주체를 정규화한다."""
+    filters = filters or {}
+    access_context = filters.get("access_context") or {}
+    if not isinstance(access_context, dict):
+        access_context = {}
+
+    return {
+        "actor_role": filters.get("actor_role") or access_context.get("actor_role"),
+        "actor_user_id": filters.get("actor_user_id") or access_context.get("user_id"),
+        "organization_id": filters.get("organization_id") or access_context.get("organization_id"),
+    }
+
+
+def build_chunk_acl_clause(
+    filters: Optional[Dict[str, Any]],
+    *,
+    table_alias: str = "dc",
+) -> tuple[str, list[Any]]:
+    """document_chunks 계층의 delegated ACL SQL 절을 생성한다."""
+    subjects = extract_acl_subjects(filters)
+    clauses = [f"{table_alias}.is_public = TRUE"]
+    params: list[Any] = []
+
+    if subjects["actor_role"]:
+        clauses.append(f"%s = ANY({table_alias}.accessible_roles)")
+        params.append(subjects["actor_role"])
+    if subjects["actor_user_id"]:
+        clauses.append(f"%s = ANY({table_alias}.accessible_user_ids)")
+        params.append(subjects["actor_user_id"])
+    if subjects["organization_id"]:
+        clauses.append(f"%s = ANY({table_alias}.accessible_org_ids)")
+        params.append(subjects["organization_id"])
+
+    return "(" + " OR ".join(clauses) + ")", params

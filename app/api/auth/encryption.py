@@ -19,7 +19,7 @@ from typing import Optional
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from app.config import settings
+from app import config
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +32,7 @@ def _get_encryption_key() -> Optional[bytes]:
     Returns:
         32바이트 키 또는 None (미설정 시).
     """
-    key = settings.oauth_encryption_key_bytes
+    key = config.settings.oauth_encryption_key_bytes
     if key and len(key) != 32:
         logger.error("OAUTH_TOKEN_ENCRYPTION_KEY must be exactly 32 bytes (256 bits)")
         return None

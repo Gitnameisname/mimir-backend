@@ -127,7 +127,11 @@ def test_a05_no_debug_default():
     import re
     config_path = ROOT / "backend/app/config.py"
     source = config_path.read_text(encoding="utf-8")
-    debug_vals = re.findall(r'debug\s*[:=]\s*(True|False)', source, re.IGNORECASE)
+    debug_vals = re.findall(
+        r"^\s*debug\s*:\s*bool\s*=\s*(True|False)\s*$",
+        source,
+        re.IGNORECASE | re.MULTILINE,
+    )
     if debug_vals:
         assert "False" in debug_vals[0]
 

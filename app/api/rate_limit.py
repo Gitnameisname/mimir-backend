@@ -49,6 +49,8 @@ def _get_client_ip(request: Request) -> str:
 def _build_limiter() -> Limiter:
     try:
         from app.config import settings
+        if settings.environment == "test":
+            return Limiter(key_func=_get_client_ip)
         return Limiter(
             key_func=_get_client_ip,
             storage_uri=settings.valkey_url,

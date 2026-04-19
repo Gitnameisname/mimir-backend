@@ -13,7 +13,11 @@ from uuid import UUID
 import psycopg2.extensions
 import psycopg2.extras
 
-from app.services.retrieval.base import Retriever, RetrievalResult
+from app.services.retrieval.base import (
+    Retriever,
+    RetrievalResult,
+    build_chunk_acl_clause,
+)
 from app.services.retrieval.citation_builder import CitationBuilder, _NIL_NODE_ID
 
 logger = logging.getLogger(__name__)
@@ -34,20 +38,7 @@ class FTSRetriever(Retriever):
     ) -> List[RetrievalResult]:
         self._warn_if_no_acl(filters)
         filters = filters or {}
-        # S2 ⑥: access_context / scope_profile 기반 ACL 지원
-        # access_context 또는 scope_profile 키에서 actor_role 추출
-        access_context = filters.get("access_context") or filters.get("scope_profile") or {}
-        actor_role = filters.get("actor_role") or (
-            access_context.get("actor_role") if isinstance(access_context, dict) else None
-        )
-
-        # ACL 조건: is_public 또는 actor_role이 accessible_roles에 포함
-        if actor_role:
-            acl_cond = "(dc.is_public = TRUE OR %s = ANY(dc.accessible_roles))"
-            acl_params: list = [actor_role]
-        else:
-            acl_cond = "dc.is_public = TRUE"
-            acl_params = []
+        acl_cond, acl_params = build_chunk_acl_clause(filters, table_alias="dc")
 
         # document_type 조건: 빈 문자열이면 전체 검색
         if document_type:

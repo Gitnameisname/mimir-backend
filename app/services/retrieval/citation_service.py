@@ -18,6 +18,8 @@ from uuid import UUID
 import psycopg2.extensions
 import psycopg2.extras
 
+from app.services.retrieval.base import build_chunk_acl_clause
+
 from app.schemas.citation import (
     Citation,
     CitationContentResponse,
@@ -134,13 +136,10 @@ class CitationService:
         """
         is_nil_node = node_id == _NIL_NODE_ID
 
-        # ACL 조건 구성
-        if actor_role:
-            acl_cond = "(dc.is_public = TRUE OR %s = ANY(dc.accessible_roles))"
-            acl_params: list = [actor_role]
-        else:
-            acl_cond = "dc.is_public = TRUE"
-            acl_params = []
+        acl_cond, acl_params = build_chunk_acl_clause(
+            {"actor_role": actor_role},
+            table_alias="dc",
+        )
 
         # node_id 조건
         if is_nil_node:

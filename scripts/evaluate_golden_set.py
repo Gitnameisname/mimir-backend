@@ -4,7 +4,7 @@ evaluate_golden_set.py — 수동 골든셋 평가 실행 CLI
 
 Usage:
   python scripts/evaluate_golden_set.py \
-    --backend-url http://localhost:8000 \
+    --backend-url http://localhost:8050 \
     --golden-set-id default \
     --prompt-version v1.0 \
     --model gpt-4o \
@@ -200,7 +200,7 @@ def _print_summary(eval_id: str, result: Dict[str, Any]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="수동 골든셋 평가 실행")
-    parser.add_argument("--backend-url", default="http://localhost:8000")
+    parser.add_argument("--backend-url", default="http://localhost:8050")
     parser.add_argument("--golden-set-id", default="default")
     parser.add_argument("--prompt-version", required=True)
     parser.add_argument("--model", required=True)

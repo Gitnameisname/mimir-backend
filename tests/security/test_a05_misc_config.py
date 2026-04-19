@@ -108,7 +108,11 @@ class TestA05EnvironmentConfig:
         source = config_path.read_text(encoding="utf-8")
 
         import re
-        debug_default = re.findall(r'debug\s*[:=]\s*(True|False)', source, re.IGNORECASE)
+        debug_default = re.findall(
+            r"^\s*debug\s*:\s*bool\s*=\s*(True|False)\s*$",
+            source,
+            re.IGNORECASE | re.MULTILINE,
+        )
         if debug_default:
             # 기본값이 False이어야 함
             assert "False" in debug_default[0], (

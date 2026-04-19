@@ -15,6 +15,7 @@ import importlib
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -115,13 +116,36 @@ class TestMCPToolInterfaces:
         )
 
     def test_mcp_tools_apply_acl_filter(self):
-        """MCP 도구가 ACL 필터를 적용한다 (S2 원칙 ⑥)."""
-        from app.mcp.tools import tool_search_documents
-        from app.mcp import scope_filter
-        # scope_filter 모듈이 존재하고 apply_scope_filter 함수가 있어야 함
-        assert hasattr(scope_filter, "apply_scope_filter"), (
-            "app.mcp.scope_filter.apply_scope_filter 없음"
+        """MCP fetch/read 경로가 실제 ACL을 적용한다."""
+        from app.api.auth.models import ActorContext, ActorType
+        from app.mcp.errors import MCPErrorCode
+        from app.mcp.tools import tool_fetch_node
+        from app.schemas.mcp import FetchNodeRequest
+
+        actor = ActorContext(
+            actor_type=ActorType.AGENT,
+            actor_id="agent-1",
+            is_authenticated=True,
+            auth_method=None,
+            tenant_id=None,
+            role="VIEWER",
+            agent_id="agent-1",
+            scope_profile_id="scope-profile-1",
         )
+        request = FetchNodeRequest(document_id="doc-1", version_id="ver-1", node_id="node-1")
+        conn = MagicMock()
+
+        import app.mcp.tools as tools
+        from app.mcp.errors import MCPError
+
+        original_resolve = tools._resolve_acl_filter
+        try:
+            tools._resolve_acl_filter = lambda *args, **kwargs: {"sql": "AND (d.id = %s)", "params": ["other-doc"]}
+            with pytest.raises(MCPError) as exc_info:
+                tool_fetch_node(request, actor, conn)
+            assert exc_info.value.code == MCPErrorCode.UNAUTHORIZED
+        finally:
+            tools._resolve_acl_filter = original_resolve
 
     def test_mcp_tools_apply_injection_detection(self):
         """MCP 도구 호출 시 Prompt Injection 탐지가 적용된다."""
@@ -165,15 +189,58 @@ class TestMCPResponseStructure:
         )
 
     def test_mcp_search_result_includes_citation(self):
-        """MCP search_documents 결과에 Citation 5-tuple이 포함된다."""
-        mcp_tools_path = ROOT / "backend/app/mcp/tools.py"
-        source = mcp_tools_path.read_text(encoding="utf-8")
-        has_citation = (
-            "citation" in source.lower()
-            or "content_hash" in source.lower()
-            or "CitationBuilder" in source
+        """MCP search_documents가 실제 citation 필드를 전달한다."""
+        from app.api.auth.models import ActorContext, ActorType
+        from app.mcp.tools import tool_search_documents
+        from app.schemas.citation import Citation
+        from app.schemas.mcp import SearchDocumentsRequest
+        from app.schemas.search import DocumentSearchResponse, DocumentSearchResult, SearchPagination
+
+        actor = ActorContext(
+            actor_type=ActorType.AGENT,
+            actor_id="agent-1",
+            is_authenticated=True,
+            auth_method=None,
+            tenant_id=None,
+            role="VIEWER",
         )
-        assert has_citation, "MCP search 결과에 citation 없음"
+        citation = Citation.from_chunk("11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222", "33333333-3333-3333-3333-333333333333", "chunk text")
+        fake_result = DocumentSearchResult(
+            id="11111111-1111-1111-1111-111111111111",
+            title="문서",
+            document_type="POLICY",
+            status="published",
+            metadata={},
+            created_at="2026-04-18T00:00:00Z",
+            updated_at="2026-04-18T00:00:00Z",
+            rank=0.9,
+            citation=citation,
+        )
+        fake_response = DocumentSearchResponse(
+            query="hello",
+            results=[fake_result],
+            pagination=SearchPagination(page=1, limit=1, total=1, has_next=False),
+        )
+
+        import app.mcp.tools as tools
+
+        class FakeSearchService:
+            def search_documents(self, **kwargs):
+                return fake_response
+
+        original_search_service = None
+        from app.services import search_service as _unused  # noqa: F401
+        try:
+            import app.services.search_service as svc_module
+            original_search_service = svc_module.SearchService
+            svc_module.SearchService = FakeSearchService
+            result = tool_search_documents(SearchDocumentsRequest(query="hello"), actor, MagicMock())
+        finally:
+            if original_search_service is not None:
+                svc_module.SearchService = original_search_service
+
+        assert result.results[0].citation is not None
+        assert result.results[0].citation.content_hash == citation.content_hash
 
     def test_mcp_agent_context_recorded(self):
         """MCP 도구 호출 시 ActorContext가 전달되어 감사 기록 가능."""
@@ -237,3 +304,80 @@ class TestMCPSecurity:
         assert scope_filter_path.exists(), "app/mcp/scope_filter.py 없음"
         source = scope_filter_path.read_text(encoding="utf-8")
         assert "apply_scope_filter" in source, "apply_scope_filter 함수 없음"
+
+    def test_scope_filter_resolution_fails_closed(self):
+        """scope profile 해석 실패 시 빈 필터가 아니라 예외가 발생해야 한다."""
+        from app.mcp.scope_filter import ScopeFilterResolutionError, apply_scope_filter
+
+        class FakeRepo:
+            def __init__(self, conn):
+                self.conn = conn
+
+            def get_definition(self, profile_id, scope_name):
+                return None
+
+        import app.mcp.scope_filter as scope_filter_module
+
+        original_repo = scope_filter_module.ScopeProfileRepository
+        try:
+            scope_filter_module.ScopeProfileRepository = FakeRepo
+            with pytest.raises(ScopeFilterResolutionError):
+                apply_scope_filter(
+                    scope_profile_id="scope-profile-1",
+                    scope_name="default",
+                    access_context={},
+                    conn=MagicMock(),
+                )
+        finally:
+            scope_filter_module.ScopeProfileRepository = original_repo
+
+    def test_verify_citation_uses_chunk_source_text_hash(self):
+        """MCP verify_citation은 nodes.content가 아니라 chunk source_text를 기준으로 검증해야 한다."""
+        from app.api.auth.models import ActorContext, ActorType
+        from app.mcp.tools import tool_verify_citation
+        from app.schemas.citation import Citation
+        from app.schemas.mcp import VerifyCitationRequest
+
+        actor = ActorContext(
+            actor_type=ActorType.AGENT,
+            actor_id="agent-1",
+            is_authenticated=True,
+            auth_method=None,
+            tenant_id=None,
+            role="VIEWER",
+        )
+        citation = Citation.from_chunk(
+            "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+            "33333333-3333-3333-3333-333333333333",
+            "parent-context actual chunk body",
+        )
+        request = VerifyCitationRequest(
+            document_id=str(citation.document_id),
+            version_id=str(citation.version_id),
+            node_id=str(citation.node_id),
+            content_hash=citation.content_hash,
+        )
+
+        conn = MagicMock()
+        cursor = MagicMock()
+        cursor.__enter__.return_value = cursor
+        cursor.__exit__.return_value = False
+        cursor.fetchone.side_effect = [{"id": str(citation.version_id)}]
+        conn.cursor.return_value = cursor
+
+        import app.mcp.tools as tools
+
+        original_fetch_chunk = tools._fetch_accessible_chunk
+        try:
+            tools._fetch_accessible_chunk = lambda *args, **kwargs: {
+                "document_id": request.document_id,
+                "version_id": request.version_id,
+                "node_id": request.node_id,
+                "source_text": "parent-context actual chunk body",
+            }
+            result = tool_verify_citation(request, actor, conn)
+        finally:
+            tools._fetch_accessible_chunk = original_fetch_chunk
+
+        assert result.verified is True

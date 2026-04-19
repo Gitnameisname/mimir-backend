@@ -2,8 +2,8 @@
 부하 테스트용 시드 데이터 생성/정리 스크립트 (PH5-CARRY-003).
 
 실행:
-  python scripts/seed_load_test_data.py --action seed --backend-url http://localhost:8000
-  python scripts/seed_load_test_data.py --action cleanup --backend-url http://localhost:8000
+  python scripts/seed_load_test_data.py --action seed --backend-url http://localhost:8050
+  python scripts/seed_load_test_data.py --action cleanup --backend-url http://localhost:8050
 
 주의: 스테이징 환경 전용. 프로덕션에서 절대 실행 금지 (지침 7-12-2).
 """
@@ -101,7 +101,7 @@ async def cleanup(backend_url: str, admin_token: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="부하 테스트 시드 데이터 관리")
     parser.add_argument("--action", choices=["seed", "cleanup"], required=True)
-    parser.add_argument("--backend-url", default="http://localhost:8000")
+    parser.add_argument("--backend-url", default="http://localhost:8050")
     parser.add_argument("--admin-token", default="admin-test-token")
     args = parser.parse_args()
 

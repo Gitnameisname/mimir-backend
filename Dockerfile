@@ -43,11 +43,11 @@ COPY --chown=mimir:mimir app/ ./app/
 
 USER mimir
 
-EXPOSE 8000
+EXPOSE 8050
 
 # 헬스체크
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-    CMD curl -sf http://localhost:8000/api/v1/system/health || exit 1
+    CMD curl -sf http://localhost:8050/api/v1/system/health || exit 1
 
 # 시작 명령
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8050", "--workers", "4"]

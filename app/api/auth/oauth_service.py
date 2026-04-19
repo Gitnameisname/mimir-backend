@@ -32,7 +32,7 @@ import psycopg2.extensions
 
 from app.api.auth.encryption import encrypt_token
 from app.api.auth.refresh_service import refresh_token_service
-from app.config import settings
+from app import config
 from app.repositories.users_repository import users_repository
 
 logger = logging.getLogger(__name__)
@@ -72,7 +72,7 @@ def _generate_state() -> str:
 
 def _get_discovery_url() -> str:
     """GitLab OIDC Discovery URL."""
-    base = settings.gitlab_base_url.rstrip("/")
+    base = config.settings.gitlab_base_url.rstrip("/")
     return f"{base}/.well-known/openid-configuration"
 
 
@@ -90,7 +90,7 @@ def _fetch_oidc_config() -> dict[str, Any] | None:
             resp.raise_for_status()
             return resp.json()
     except Exception:
-        logger.exception("OIDC discovery failed for %s", settings.gitlab_base_url)
+        logger.exception("OIDC discovery failed for %s", config.settings.gitlab_base_url)
         return None
 
 
@@ -115,7 +115,7 @@ class GitLabOAuthService:
         Returns:
             {"url": str, "state": str} 또는 None (설정 미완료 시).
         """
-        if not settings.is_oauth_enabled:
+        if not config.settings.is_oauth_enabled:
             logger.warning("GitLab OAuth is not configured")
             return None
 
@@ -146,8 +146,8 @@ class GitLabOAuthService:
 
         # Authorization URL 구성
         params = {
-            "client_id": settings.gitlab_client_id,
-            "redirect_uri": settings.gitlab_redirect_uri,
+            "client_id": config.settings.gitlab_client_id,
+            "redirect_uri": config.settings.gitlab_redirect_uri,
             "response_type": "code",
             "scope": _GITLAB_SCOPES,
             "state": state,
@@ -289,10 +289,10 @@ class GitLabOAuthService:
                     token_endpoint,
                     data={
                         "grant_type": "authorization_code",
-                        "client_id": settings.gitlab_client_id,
-                        "client_secret": settings.gitlab_client_secret,
+                        "client_id": config.settings.gitlab_client_id,
+                        "client_secret": config.settings.gitlab_client_secret,
                         "code": code,
-                        "redirect_uri": settings.gitlab_redirect_uri,
+                        "redirect_uri": config.settings.gitlab_redirect_uri,
                         "code_verifier": code_verifier,
                     },
                 )
