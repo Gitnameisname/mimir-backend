@@ -43,7 +43,7 @@ router = APIRouter()
 # capabilities 캐시 (5분 TTL, thread-safe)
 # ---------------------------------------------------------------------------
 
-_CAP_CACHE_TTL = timedelta(minutes=5)
+_CAP_CACHE_TTL = timedelta(seconds=30)
 _cap_cache: dict = {"data": None, "expires": datetime.min.replace(tzinfo=timezone.utc)}
 _cap_lock = threading.Lock()
 
@@ -67,9 +67,10 @@ def _detect_pgvector() -> bool:
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname='vector')"
+                    "SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname='vector') AS exists"
                 )
-                return bool(cur.fetchone()[0])
+                row = cur.fetchone()
+                return bool(row["exists"])
     except Exception as exc:
         logger.debug("pgvector DB 감지 실패 (기본값 False): %s", exc)
         return False
@@ -77,8 +78,57 @@ def _detect_pgvector() -> bool:
 
 def _build_capabilities() -> dict:
     """capabilities 응답 dict를 빌드한다."""
-    pgvector = _detect_pgvector()
-    has_llm_key = bool(settings.openai_api_key or settings.anthropic_api_key)
+    # ── DB에서 llm_providers 조회 ──
+    llm_total = 0
+    llm_active = 0
+    default_llm_model: str | None = None
+    default_embed_model: str | None = None
+    try:
+        from app.db.connection import get_db
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT type, model_name, status, is_default FROM llm_providers"
+                )
+                rows = cur.fetchall()
+                for r in rows:
+                    if r["type"] == "llm":
+                        llm_total += 1
+                        if r["status"] == "active":
+                            llm_active += 1
+                        if r["is_default"] and not default_llm_model:
+                            default_llm_model = r["model_name"]
+                    elif r["type"] == "embedding":
+                        if r["is_default"] and not default_embed_model:
+                            default_embed_model = r["model_name"]
+    except Exception as exc:
+        logger.debug("llm_providers 조회 실패: %s", exc)
+
+    # ── Milvus 연결 확인 ──
+    milvus_ok = False
+    try:
+        from app.db.milvus import get_milvus
+        client = get_milvus()
+        milvus_ok = client.is_available()
+    except Exception:
+        pass
+
+    # ── FTS는 PostgreSQL 기반으로 항상 활성 ──
+    fts_enabled = True
+
+    # ── RAG = Milvus + default LLM + default embedding 모두 필요 ──
+    has_llm = (default_llm_model is not None) or bool(settings.openai_api_key or settings.anthropic_api_key)
+    has_embed = default_embed_model is not None
+    rag_available = milvus_ok and has_llm and has_embed
+
+    # ── 저하 원인 수집 ──
+    degraded_reasons: list[str] = []
+    if not milvus_ok:
+        degraded_reasons.append("벡터 스토어(Milvus)에 연결할 수 없습니다")
+    if not has_llm:
+        degraded_reasons.append("활성화된 기본 LLM 프로바이더가 없습니다")
+    if not has_embed:
+        degraded_reasons.append("기본 임베딩 프로바이더가 설정되지 않았습니다")
 
     providers: list[str] = []
     if settings.openai_api_key:
@@ -88,14 +138,19 @@ def _build_capabilities() -> dict:
 
     return {
         "version": settings.api_version,
-        "pgvector_enabled": pgvector,
-        # RAG = pgvector + LLM provider 둘 다 필요
-        "rag_available": pgvector and has_llm_key,
-        # chunking 은 pgvector 파이프라인과 연동 (pgvector 없으면 비활성)
-        "chunking_enabled": pgvector,
+        "pgvector_enabled": False,
+        "rag_available": rag_available,
+        "chunking_enabled": milvus_ok,
         "supported_providers": providers,
-        # MCP 스펙: Phase 4 구현 예정
         "mcp_spec_version": None,
+        # 프론트엔드 SystemCapabilities 필드
+        "embedding_model": default_embed_model,
+        "llm_providers_count": llm_total,
+        "active_llm_providers": llm_active,
+        "vector_store": "milvus" if milvus_ok else None,
+        "fts_enabled": fts_enabled,
+        "degraded": len(degraded_reasons) > 0,
+        "degraded_reasons": degraded_reasons,
     }
 
 
@@ -136,6 +191,13 @@ def _get_full_capabilities() -> dict:
             _cap_cache["data"] = _build_capabilities()
             _cap_cache["expires"] = now + _CAP_CACHE_TTL
         return _cap_cache["data"]
+
+
+def invalidate_capabilities_cache() -> None:
+    """프로바이더 변경 등으로 캐시를 즉시 만료시킨다."""
+    with _cap_lock:
+        _cap_cache["data"] = None
+        _cap_cache["expires"] = datetime.min.replace(tzinfo=timezone.utc)
 
 
 # Tier 2 응답에 포함할 필드 (내부 구성 정보 제외)

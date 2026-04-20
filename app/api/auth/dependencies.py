@@ -55,6 +55,29 @@ def _lookup_role_from_db(actor_id: str) -> str | None:
         return None
 
 
+def _lookup_user_scope_profile_id(actor_id: str) -> str | None:
+    """S2-5 (2026-04-20): 사람 사용자의 Scope Profile 바인딩을 DB에서 조회한다.
+
+    S2 ⑥ 원칙상 골든셋·평가 Admin API 는 scope_profile_id 가 없는 actor 를 403 으로
+    차단한다. 에이전트는 API key 경로에서 이미 scope_profile_id 를 채우지만, 사람
+    사용자는 기존에 비어 있었다. 본 함수는 users.scope_profile_id 를 읽어 ActorContext
+    에 주입하는 용도로, 인증 이후(actor_id 검증 완료)에만 호출되어야 한다.
+
+    조회 실패·칼럼 미존재·DB 오류 시 None 반환 (caller 는 scope 필요 API 에서 403).
+    """
+    if not actor_id:
+        return None
+    try:
+        from app.db.connection import get_db
+        from app.repositories.users_repository import users_repository
+        with get_db() as conn:
+            user = users_repository.get_by_id(conn, actor_id)
+            return user.scope_profile_id if user else None
+    except Exception as exc:
+        logger.warning("scope profile lookup failed for actor %s: %s", actor_id, exc)
+        return None
+
+
 def resolve_current_actor(request: Request) -> ActorContext:
     """요청에서 actor를 추출하여 ActorContext로 정규화한다.
 
@@ -188,6 +211,7 @@ def _extract_bearer_actor(token: str, request: Request) -> ActorContext:
             role: str | None = actor_role if actor_role in _VALID_ROLES else None
             if actor_id and not role:
                 role = _lookup_role_from_db(actor_id)
+            scope_pid = _lookup_user_scope_profile_id(actor_id) if actor_id else None
             return ActorContext(
                 actor_type=ActorType.USER,
                 actor_id=actor_id,
@@ -195,6 +219,7 @@ def _extract_bearer_actor(token: str, request: Request) -> ActorContext:
                 auth_method=AuthMethod.BEARER,
                 tenant_id=None,
                 role=role,
+                scope_profile_id=scope_pid,
             )
         logger.warning("Bearer token received but JWT_SECRET not configured — rejecting")
         return _anonymous_actor()
@@ -233,6 +258,9 @@ def _extract_bearer_actor(token: str, request: Request) -> ActorContext:
     if actor_id and not role:
         role = _lookup_role_from_db(actor_id)
 
+    # S2-5 (2026-04-20): 사람 사용자 Scope Profile 주입 (S2 ⑥ 대상 API 에서 필요)
+    scope_pid = _lookup_user_scope_profile_id(actor_id) if actor_id else None
+
     return ActorContext(
         actor_type=ActorType.USER,
         actor_id=actor_id,
@@ -240,6 +268,7 @@ def _extract_bearer_actor(token: str, request: Request) -> ActorContext:
         auth_method=AuthMethod.BEARER,
         tenant_id=None,
         role=role,
+        scope_profile_id=scope_pid,
     )
 
 
@@ -314,6 +343,8 @@ def _extract_api_key_actor(api_key: str) -> ActorContext:
                 if principal_type == "agent" and row.get("agent_id"):
                     return _extract_agent_context(conn, row)
 
+                # S2-5 (2026-04-20): 사용자 API key 에도 Scope Profile 주입
+                user_scope_pid = _lookup_user_scope_profile_id(row["issuer_id"])
                 return ActorContext(
                     actor_type=ActorType.USER,
                     actor_id=row["issuer_id"],
@@ -321,6 +352,7 @@ def _extract_api_key_actor(api_key: str) -> ActorContext:
                     auth_method=AuthMethod.API_KEY,
                     tenant_id=None,
                     role=row.get("role_name"),
+                    scope_profile_id=user_scope_pid,
                 )
     except Exception as exc:
         logger.warning("api_key lookup failed: %s", exc)
@@ -406,6 +438,8 @@ def _extract_session_actor(session_token: str) -> ActorContext:
     if actor_id and not role:
         role = _lookup_role_from_db(actor_id)
 
+    scope_pid = _lookup_user_scope_profile_id(actor_id) if actor_id else None
+
     return ActorContext(
         actor_type=ActorType.USER,
         actor_id=actor_id,
@@ -413,6 +447,7 @@ def _extract_session_actor(session_token: str) -> ActorContext:
         auth_method=AuthMethod.SESSION,
         tenant_id=None,
         role=role,
+        scope_profile_id=scope_pid,
     )
 
 
@@ -423,6 +458,8 @@ def _extract_dev_header_actor(actor_id: str, actor_role: str) -> ActorContext:
     프로덕션에서는 settings.debug=False 시 이 경로를 차단해야 한다.
     """
     role = actor_role if actor_role in _VALID_ROLES else "VIEWER"
+    # S2-5 (2026-04-20): 개발 경로도 Scope Profile 주입 (테스트에서 S2 ⑥ 대상 API 사용 가능)
+    scope_pid = _lookup_user_scope_profile_id(actor_id)
     return ActorContext(
         actor_type=ActorType.USER,
         actor_id=actor_id,
@@ -430,6 +467,7 @@ def _extract_dev_header_actor(actor_id: str, actor_role: str) -> ActorContext:
         auth_method=AuthMethod.BEARER,
         tenant_id=None,
         role=role,
+        scope_profile_id=scope_pid,
     )
 
 

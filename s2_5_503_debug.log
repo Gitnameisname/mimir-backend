@@ -1,0 +1,21 @@
+[2026-04-20T14:01:05.100571] ENTER list_golden_sets | scope=0a65654c-1fdd-4cc4-85bd-91df87229b76 offset=0 limit=50 domain=None status=None
+[2026-04-20T14:01:05.113752] DEBUG-S2-5-503 list_by_scope failed | scope=0a65654c-1fdd-4cc4-85bd-91df87229b76 | ValueError: "GoldenSet" object has no field "item_count"
+Traceback (most recent call last):
+  File "/Users/ckchoi/Desktop/projects/mimir/backend/app/api/v1/golden_sets.py", line 199, in list_golden_sets
+    sets, total = repo.list_by_scope(
+                  ~~~~~~~~~~~~~~~~~~^
+        scope_id, offset=offset, limit=limit, domain=domain, status=status
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/Users/ckchoi/Desktop/projects/mimir/backend/app/repositories/golden_set_repository.py", line 206, in list_by_scope
+    gs.item_count = self._count_items(str(row["id"]))  # type: ignore[attr-defined]
+    ^^^^^^^^^^^^^
+  File "/Users/ckchoi/Desktop/projects/mimir/backend/.venv/lib/python3.13/site-packages/pydantic/main.py", line 1032, in __setattr__
+    elif (setattr_handler := self._setattr_handler(name, value)) is not None:
+                             ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "/Users/ckchoi/Desktop/projects/mimir/backend/.venv/lib/python3.13/site-packages/pydantic/main.py", line 1079, in _setattr_handler
+    raise ValueError(f'"{cls.__name__}" object has no field "{name}"')
+ValueError: "GoldenSet" object has no field "item_count"
+
+---

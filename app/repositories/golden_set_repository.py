@@ -203,7 +203,8 @@ class GoldenSetRepository:
         sets = []
         for row in rows:
             gs = _row_to_golden_set(row)
-            gs.item_count = self._count_items(str(row["id"]))  # type: ignore[attr-defined]
+            # GoldenSet.item_count (Optional[int]) 는 영속 컬럼이 아닌 응답 보조 필드.
+            gs.item_count = self._count_items(str(row["id"]))
             sets.append(gs)
         return sets, total
 

@@ -53,15 +53,25 @@ CREATE INDEX IF NOT EXISTS idx_rag_messages_conversation_id
 
 
 def ensure_tables(conn: psycopg2.extensions.connection) -> None:
-    """rag_conversations / rag_messages 테이블이 없으면 생성한다."""
-    try:
-        with conn.cursor() as cur:
-            cur.execute(_CREATE_TABLES_SQL)
-        conn.commit()
-    except Exception as exc:
-        conn.rollback()
-        logger.error("RAG 테이블 생성 실패: %s", exc)
-        raise
+    """rag_conversations / rag_messages 테이블이 없으면 생성한다.
+
+    테이블 소유권이 없어 일부 DDL이 실패해도 나머지를 계속 실행한다.
+    """
+    statements = [s.strip() for s in _CREATE_TABLES_SQL.split(";") if s.strip()]
+    skipped = 0
+    with conn.cursor() as cur:
+        for stmt in statements:
+            try:
+                cur.execute("SAVEPOINT rag_ddl")
+                cur.execute(stmt)
+                cur.execute("RELEASE SAVEPOINT rag_ddl")
+            except Exception as exc:
+                cur.execute("ROLLBACK TO SAVEPOINT rag_ddl")
+                skipped += 1
+                logger.debug("RAG DDL skipped: %s", str(exc).strip())
+    conn.commit()
+    if skipped:
+        logger.warning("RAG 테이블 init: %d 구문 건너뜀 (이미 존재하거나 권한 부족)", skipped)
 
 
 # ---------------------------------------------------------------------------

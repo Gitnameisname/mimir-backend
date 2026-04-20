@@ -242,7 +242,7 @@ class ExtractionCandidateRepository:
                 params,
             )
             row = cur.fetchone()
-        return row[0] if row else 0
+        return row["count"] if row else 0
 
     def list_by_status(
         self,

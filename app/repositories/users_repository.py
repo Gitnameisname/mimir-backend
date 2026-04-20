@@ -42,6 +42,12 @@ def _row_to_user(row: dict[str, Any]) -> User:
         failed_login_count=row.get("failed_login_count", 0),
         locked_until=row.get("locked_until"),
         avatar_url=row.get("avatar_url"),
+        # S2-5 (2026-04-20): Scope Profile 바인딩 — 칼럼 없는 구버전 DB 도 방어
+        scope_profile_id=(
+            str(row["scope_profile_id"])
+            if row.get("scope_profile_id")
+            else None
+        ),
     )
 
 

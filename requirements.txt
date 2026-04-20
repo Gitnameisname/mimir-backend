@@ -12,7 +12,7 @@ httptools==0.7.1
 httpx==0.28.1
 idna==3.11
 openai==1.84.0
-pgvector==0.4.1
+pymilvus==2.5.8
 psycopg2-binary==2.9.11
 pydantic==2.12.5
 pydantic-settings==2.13.1
@@ -31,6 +31,11 @@ websockets==16.0
 # ---- Phase 14: 인증 시스템 의존성 ----
 bcrypt>=4.0.0,<5.0.0
 cryptography>=43.0.0,<45.0.0
+
+# ---- S2-5 (2026-04-20): Alembic 기반 DB 마이그레이션 ----
+# Alembic 1.13+ 는 SQLAlchemy 2.0+ 가 필요. ORM 은 쓰지 않고 raw SQL (op.execute) 전용.
+alembic>=1.13,<2.0
+SQLAlchemy>=2.0,<3.0
 
 # ---- 개발/테스트 의존성 ----
 pytest==8.3.5

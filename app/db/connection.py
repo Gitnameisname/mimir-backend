@@ -437,12 +437,8 @@ CREATE INDEX IF NOT EXISTS idx_api_keys_status ON api_keys(status);
 """
 
 # ---------------------------------------------------------------------------
-# Phase 10: pgvector 확장 및 document_chunks 테이블
+# Phase 10: document_chunks 테이블 (벡터는 Milvus로 분리, embedding 컬럼 없음)
 # ---------------------------------------------------------------------------
-
-_PGVECTOR_EXTENSION_DDL = """
-CREATE EXTENSION IF NOT EXISTS vector;
-"""
 
 _DOCUMENT_CHUNKS_DDL = """
 CREATE TABLE IF NOT EXISTS document_chunks (
@@ -452,7 +448,6 @@ CREATE TABLE IF NOT EXISTS document_chunks (
     node_id             UUID REFERENCES nodes(id) ON DELETE SET NULL,
     chunk_index         INTEGER NOT NULL,
     source_text         TEXT NOT NULL,
-    embedding           vector(1536),
     embedding_model     VARCHAR(100),
     token_count         INTEGER,
     node_path           TEXT[] NOT NULL DEFAULT '{}',
@@ -476,14 +471,6 @@ CREATE INDEX IF NOT EXISTS idx_chunks_is_current
     WHERE is_current = TRUE;
 CREATE INDEX IF NOT EXISTS idx_chunks_document_type
     ON document_chunks(document_type);
-"""
-
-# HNSW 인덱스: 테이블 생성 후 별도 DDL (embedding NULL인 행 제외)
-_DOCUMENT_CHUNKS_VECTOR_INDEX_DDL = """
-CREATE INDEX IF NOT EXISTS idx_chunks_embedding_hnsw
-    ON document_chunks USING hnsw (embedding vector_cosine_ops)
-    WITH (m = 16, ef_construction = 64)
-    WHERE embedding IS NOT NULL AND is_current = TRUE;
 """
 
 # embedding_token_usage 테이블: 임베딩 API 비용 추적
@@ -666,6 +653,18 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS username            VARCHAR(50);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_unique
     ON users(LOWER(username)) WHERE username IS NOT NULL;
 """
+
+
+# ---------------------------------------------------------------------------
+# S2-5 (2026-04-20): users.scope_profile_id 스키마 변경은 Alembic 으로 이관.
+# ---------------------------------------------------------------------------
+# 런타임 DB 유저는 users 테이블 OWNER 가 아니어서 init_db() 안에서 ALTER TABLE
+# 이 권한 부족으로 skip 된다. 따라서 본 스키마 변경과 관련 시드는 Alembic 으로
+# 옮겼다. 실행 경로:
+#     backend/app/db/migrations/versions/20260420_1330_s2_5_users_scope_profile_binding.py
+#     cd backend && alembic upgrade head   (OWNER 권한 DB 유저)
+# 이곳에 DDL 상수를 두지 않는 이유는 "한 곳에서만 스키마 변경을 선언" 하기 위함
+# (S1 ② generic+config 원칙과 동일 정신의 single source of truth).
 
 
 # ---------------------------------------------------------------------------
@@ -1144,6 +1143,7 @@ CREATE TABLE IF NOT EXISTS llm_providers (
     type             VARCHAR(32)  NOT NULL CHECK (type IN ('llm', 'embedding')),
     model_name       VARCHAR(255) NOT NULL,
     api_base_url     VARCHAR(1024),
+    embed_endpoint   VARCHAR(512),
     api_key          TEXT,
     description      VARCHAR(500),
     is_default       BOOLEAN NOT NULL DEFAULT FALSE,
@@ -1738,125 +1738,114 @@ CREATE INDEX IF NOT EXISTS idx_extraction_evaluations_candidate
 
 
 def init_db() -> None:
-    """앱 시작 시 모든 테이블을 생성하고 마이그레이션을 적용한다 (idempotent)."""
+    """앱 시작 시 모든 테이블을 생성하고 마이그레이션을 적용한다 (idempotent).
+
+    각 DDL을 개별 savepoint로 감싸므로, 테이블 소유권이 없어 ALTER TABLE이 실패해도
+    나머지 DDL은 계속 실행된다. 이미 스키마가 구성된 환경에서 재시작할 때 안전하다.
+    """
+    _ddl_steps = [
+        # Phase 1~3 기본 테이블
+        ("DOCUMENTS_DDL", _DOCUMENTS_DDL),
+        ("VERSIONS_DDL", _VERSIONS_DDL),
+        ("NODES_DDL", _NODES_DDL),
+        ("IDEMPOTENCY_DDL", _IDEMPOTENCY_DDL),
+        ("AUDIT_EVENTS_DDL", _AUDIT_EVENTS_DDL),
+        # Phase 4 마이그레이션
+        ("VERSIONS_MIGRATION", _VERSIONS_MIGRATION_DDL),
+        ("DOCUMENTS_MIGRATION", _DOCUMENTS_MIGRATION_DDL),
+        # Phase 5
+        ("REVIEW_ACTIONS_DDL", _REVIEW_ACTIONS_DDL),
+        ("WORKFLOW_HISTORY_DDL", _WORKFLOW_HISTORY_DDL),
+        ("CHANGE_LOGS_DDL", _CHANGE_LOGS_DDL),
+        ("VERSIONS_WORKFLOW_MIGRATION", _VERSIONS_WORKFLOW_MIGRATION_DDL),
+        ("REVIEW_ACTIONS_MIGRATION", _REVIEW_ACTIONS_MIGRATION_DDL),
+        ("WORKFLOW_HISTORY_MIGRATION", _WORKFLOW_HISTORY_MIGRATION_DDL),
+        ("CHANGE_LOGS_MIGRATION", _CHANGE_LOGS_MIGRATION_DDL),
+        # Phase 7 Admin 테이블
+        ("ORGANIZATIONS_DDL", _ORGANIZATIONS_DDL),
+        ("ROLES_DDL", _ROLES_DDL),
+        ("USERS_DDL", _USERS_DDL),
+        ("USER_ORG_ROLES_DDL", _USER_ORG_ROLES_DDL),
+        ("DOCUMENT_TYPES_DDL", _DOCUMENT_TYPES_DDL),
+        ("BACKGROUND_JOBS_DDL", _BACKGROUND_JOBS_DDL),
+        ("API_KEYS_DDL", _API_KEYS_DDL),
+        # Phase 8 FTS
+        ("FTS_MIGRATION", _FTS_MIGRATION_DDL),
+        ("SEARCH_INDEX_STATS_DDL", _SEARCH_INDEX_STATS_DDL),
+        # Phase 10
+        ("DOCUMENT_CHUNKS_DDL", _DOCUMENT_CHUNKS_DDL),
+        ("EMBEDDING_TOKEN_USAGE_DDL", _EMBEDDING_TOKEN_USAGE_DDL),
+        # Phase 14
+        ("USERS_AUTH_MIGRATION", _USERS_AUTH_MIGRATION_DDL),
+        ("REFRESH_TOKENS_DDL", _REFRESH_TOKENS_DDL),
+        ("OAUTH_ACCOUNTS_DDL", _OAUTH_ACCOUNTS_DDL),
+        ("SYSTEM_SETTINGS_DDL", _SYSTEM_SETTINGS_DDL),
+        ("SYSTEM_SETTINGS_SEED", _SYSTEM_SETTINGS_SEED_DDL),
+        ("ALERT_RULES_DDL", _ALERT_RULES_DDL),
+        ("ALERT_HISTORY_DDL", _ALERT_HISTORY_DDL),
+        ("JOB_SCHEDULES_DDL", _JOB_SCHEDULES_DDL),
+        ("JOB_SCHEDULES_SEED", _JOB_SCHEDULES_SEED_DDL),
+        # S2 Phase 2
+        ("DOCUMENT_TYPES_RETRIEVAL_CONFIG_MIGRATION", _DOCUMENT_TYPES_RETRIEVAL_CONFIG_MIGRATION_DDL),
+        # S2 Phase 3
+        ("CONVERSATIONS_DDL", _CONVERSATIONS_DDL),
+        ("TURNS_DDL", _TURNS_DDL),
+        ("MESSAGES_DDL", _MESSAGES_DDL),
+        ("CONVERSATIONS_FTS", _CONVERSATIONS_FTS_DDL),
+        ("CONVERSATIONS_TITLE_TSV", _CONVERSATIONS_TITLE_TSV_DDL),
+        ("AUDIT_EVENTS_ACTOR_TYPE_MIGRATION", _AUDIT_EVENTS_ACTOR_TYPE_MIGRATION_DDL),
+        ("RETENTION_POLICIES_DDL", _RETENTION_POLICIES_DDL),
+        # S2 Phase 4
+        ("SCOPE_PROFILES_DDL", _SCOPE_PROFILES_DDL),
+        ("SCOPE_DEFINITIONS_DDL", _SCOPE_DEFINITIONS_DDL),
+        ("AGENTS_DDL", _AGENTS_DDL),
+        ("API_KEYS_AGENT_MIGRATION", _API_KEYS_AGENT_MIGRATION_DDL),
+        # S2-5 (2026-04-20): users.scope_profile_id + 기본 Scope Profile 시드는
+        # Alembic 으로 이관. backend/app/db/migrations/versions/20260420_1330_*.py 참고.
+        # S2 Phase 5
+        ("AUDIT_EVENTS_AGENT_MIGRATION", _AUDIT_EVENTS_AGENT_MIGRATION_DDL),
+        ("TRANSITION_PROPOSALS_DDL", _TRANSITION_PROPOSALS_DDL),
+        ("MCP_TASKS_DDL", _MCP_TASKS_DDL),
+        ("AGENT_PROPOSALS_DDL", _AGENT_PROPOSALS_DDL),
+        # S2 Phase 6
+        ("LLM_PROVIDERS_DDL", _LLM_PROVIDERS_DDL),
+        ("PROMPTS_DDL", _PROMPTS_DDL),
+        ("PROMPTS_SEED", _PROMPTS_SEED_DDL),
+        # S2 Phase 7
+        ("GOLDEN_SETS_DDL", _GOLDEN_SETS_DDL),
+        ("EVALUATION_RUNS_DDL", _EVALUATION_RUNS_DDL),
+        # S2 Phase 8
+        ("EXTRACTION_SCHEMAS_DDL", _EXTRACTION_SCHEMAS_DDL),
+        ("EXTRACTION_SCHEMA_VERSIONS_DDL", _EXTRACTION_SCHEMA_VERSIONS_DDL),
+        ("EXTRACTION_CANDIDATES_DDL", _EXTRACTION_CANDIDATES_DDL),
+        ("APPROVED_EXTRACTIONS_DDL", _APPROVED_EXTRACTIONS_DDL),
+        ("BATCH_EXTRACTION_JOBS_DDL", _BATCH_EXTRACTION_JOBS_DDL),
+        ("EXTRACTION_RETRY_LOGS_DDL", _EXTRACTION_RETRY_LOGS_DDL),
+        ("EXTRACTION_SPANS_DDL", _EXTRACTION_SPANS_DDL),
+        ("EXTRACTION_RECORDS_DDL", _EXTRACTION_RECORDS_DDL),
+        ("VERIFICATION_RESULTS_DDL", _VERIFICATION_RESULTS_DDL),
+        ("GOLDEN_EXTRACTION_SETS_DDL", _GOLDEN_EXTRACTION_SETS_DDL),
+        ("GOLDEN_EXTRACTION_ITEMS_DDL", _GOLDEN_EXTRACTION_ITEMS_DDL),
+        ("EXTRACTION_EVALUATIONS_DDL", _EXTRACTION_EVALUATIONS_DDL),
+    ]
+
+    skipped: list[str] = []
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
-                # Phase 1~3 기본 테이블
-                cur.execute(_DOCUMENTS_DDL)
-                cur.execute(_VERSIONS_DDL)
-                cur.execute(_NODES_DDL)
-                cur.execute(_IDEMPOTENCY_DDL)
-                cur.execute(_AUDIT_EVENTS_DDL)
-                # Phase 4 마이그레이션 (ADD COLUMN IF NOT EXISTS — 멱등)
-                cur.execute(_VERSIONS_MIGRATION_DDL)
-                cur.execute(_DOCUMENTS_MIGRATION_DDL)
-                # Phase 5 테이블 생성 (멱등)
-                cur.execute(_REVIEW_ACTIONS_DDL)
-                cur.execute(_WORKFLOW_HISTORY_DDL)
-                cur.execute(_CHANGE_LOGS_DDL)
-                # Phase 5 마이그레이션
-                cur.execute(_VERSIONS_WORKFLOW_MIGRATION_DDL)
-                cur.execute(_REVIEW_ACTIONS_MIGRATION_DDL)
-                cur.execute(_WORKFLOW_HISTORY_MIGRATION_DDL)
-                cur.execute(_CHANGE_LOGS_MIGRATION_DDL)
-                # Phase 7 Admin 테이블 (멱등)
-                cur.execute(_ORGANIZATIONS_DDL)
-                cur.execute(_ROLES_DDL)
-                cur.execute(_USERS_DDL)
-                cur.execute(_USER_ORG_ROLES_DDL)
-                cur.execute(_DOCUMENT_TYPES_DDL)
-                cur.execute(_BACKGROUND_JOBS_DDL)
-                cur.execute(_API_KEYS_DDL)
-                # Phase 8 FTS 마이그레이션
-                cur.execute(_FTS_MIGRATION_DDL)
-                cur.execute(_SEARCH_INDEX_STATS_DDL)
-                # Phase 10 pgvector 확장 및 문서 청크 테이블.
-                # pgvector 가 서버에 설치되지 않은 개발 환경(로컬 등)에서는
-                # SAVEPOINT 로 격리해 인증·관리 기능을 위한 나머지 DDL 만이라도
-                # 진행되도록 한다. RAG / 벡터 검색 기능은 pgvector 설치 전까지
-                # 비활성 상태가 된다.
-                cur.execute("SAVEPOINT sp_pgvector")
-                try:
-                    cur.execute(_PGVECTOR_EXTENSION_DDL)
-                    cur.execute(_DOCUMENT_CHUNKS_DDL)
-                    cur.execute(_DOCUMENT_CHUNKS_VECTOR_INDEX_DDL)
-                    cur.execute("RELEASE SAVEPOINT sp_pgvector")
-                except psycopg2.Error as vec_err:
-                    cur.execute("ROLLBACK TO SAVEPOINT sp_pgvector")
-                    cur.execute("RELEASE SAVEPOINT sp_pgvector")
-                    logger.warning(
-                        "pgvector DDL skipped (extension not available): %s. "
-                        "벡터 검색/RAG 기능이 비활성됩니다. 사용하려면 Postgres 에 "
-                        "pgvector 확장을 설치 후 앱을 재기동하세요.",
-                        vec_err,
-                    )
-                cur.execute(_EMBEDDING_TOKEN_USAGE_DDL)
-                # Phase 14 마이그레이션 (users 인증 컬럼 + refresh_tokens)
-                cur.execute(_USERS_AUTH_MIGRATION_DDL)
-                cur.execute(_REFRESH_TOKENS_DDL)
-                # Phase 14-4: OAuth 계정 연동 테이블
-                cur.execute(_OAUTH_ACCOUNTS_DDL)
-                # Phase 14-11: 시스템 설정 테이블 + 시드
-                cur.execute(_SYSTEM_SETTINGS_DDL)
-                cur.execute(_SYSTEM_SETTINGS_SEED_DDL)
-                # Phase 14-13: 알림 관리 테이블
-                cur.execute(_ALERT_RULES_DDL)
-                cur.execute(_ALERT_HISTORY_DDL)
-                # Phase 14-14: 배치 작업 스케줄 + 시드
-                cur.execute(_JOB_SCHEDULES_DDL)
-                cur.execute(_JOB_SCHEDULES_SEED_DDL)
-                # Phase 2 (S2): retrieval_config 컬럼 추가 (멱등)
-                cur.execute(_DOCUMENT_TYPES_RETRIEVAL_CONFIG_MIGRATION_DDL)
-                # Phase 3 (S2): Conversation 도메인 테이블 생성 (멱등)
-                cur.execute(_CONVERSATIONS_DDL)
-                cur.execute(_TURNS_DDL)
-                cur.execute(_MESSAGES_DDL)
-                cur.execute(_CONVERSATIONS_FTS_DDL)
-                cur.execute(_CONVERSATIONS_TITLE_TSV_DDL)  # PH3-CARRY-002 (task7-10)
-                # Phase 3 (S2): audit_events actor_type 컬럼 추가 (멱등)
-                cur.execute(_AUDIT_EVENTS_ACTOR_TYPE_MIGRATION_DDL)
-                # Phase 3 (S2): retention_policies 테이블 생성 (멱등)
-                cur.execute(_RETENTION_POLICIES_DDL)
-                # Phase 4 (S2): Scope Profile + Agent 도메인 테이블 생성 (멱등)
-                cur.execute(_SCOPE_PROFILES_DDL)
-                cur.execute(_SCOPE_DEFINITIONS_DDL)
-                cur.execute(_AGENTS_DDL)
-                cur.execute(_API_KEYS_AGENT_MIGRATION_DDL)
-                # S2 Phase 5 (FG5.1): 에이전트 제안 도메인 테이블 생성 (멱등)
-                cur.execute(_AUDIT_EVENTS_AGENT_MIGRATION_DDL)
-                cur.execute(_TRANSITION_PROPOSALS_DDL)
-                cur.execute(_MCP_TASKS_DDL)
-                # S2 Phase 5 (FG5.2): 통합 제안 큐 테이블 생성 (멱등)
-                cur.execute(_AGENT_PROPOSALS_DDL)
-                # S2 Phase 6 (FG6.1): LLM 프로바이더 테이블 생성 (멱등)
-                cur.execute(_LLM_PROVIDERS_DDL)
-                # S2 Phase 6 (FG6.1): 프롬프트 버전 관리 테이블 + 샘플 시드 (멱등)
-                cur.execute(_PROMPTS_DDL)
-                cur.execute(_PROMPTS_SEED_DDL)
-                # S2 Phase 7 (FG7.1): Golden Set 도메인 테이블 생성 (멱등)
-                cur.execute(_GOLDEN_SETS_DDL)
-                # S2 Phase 7 (FG7.2): Evaluation 도메인 테이블 생성 (멱등)
-                cur.execute(_EVALUATION_RUNS_DDL)
-                # S2 Phase 8 (FG8.1): 추출 스키마 도메인 테이블 생성 (멱등)
-                cur.execute(_EXTRACTION_SCHEMAS_DDL)
-                cur.execute(_EXTRACTION_SCHEMA_VERSIONS_DDL)
-                # S2 Phase 8 (FG8.2): 추출 캔디데이트 + 승인 추출 테이블 생성 (멱등)
-                cur.execute(_EXTRACTION_CANDIDATES_DDL)
-                cur.execute(_APPROVED_EXTRACTIONS_DDL)
-                # S2 Phase 8 (Task 8-7): 배치 재추출 작업 테이블 생성 (멱등)
-                cur.execute(_BATCH_EXTRACTION_JOBS_DDL)
-                cur.execute(_EXTRACTION_RETRY_LOGS_DDL)
-                # S2 Phase 8 (FG8.3 task8-8): extraction_spans 테이블 생성 (멱등)
-                cur.execute(_EXTRACTION_SPANS_DDL)
-                # S2 Phase 8 (FG8.3 task8-9): extraction_records + verification_results (멱등)
-                cur.execute(_EXTRACTION_RECORDS_DDL)
-                cur.execute(_VERIFICATION_RESULTS_DDL)
-                # S2 Phase 8 (FG8.3 task8-10): golden_extraction_sets + items + evaluations (멱등)
-                cur.execute(_GOLDEN_EXTRACTION_SETS_DDL)
-                cur.execute(_GOLDEN_EXTRACTION_ITEMS_DDL)
-                cur.execute(_EXTRACTION_EVALUATIONS_DDL)
-        logger.info("DB schema initialized (S2 Phase 8 FG8.3 included)")
+                for label, ddl in _ddl_steps:
+                    try:
+                        cur.execute("SAVEPOINT ddl_step")
+                        cur.execute(ddl)
+                        cur.execute("RELEASE SAVEPOINT ddl_step")
+                    except Exception as exc:
+                        cur.execute("ROLLBACK TO SAVEPOINT ddl_step")
+                        skipped.append(label)
+                        logger.debug("DDL skipped [%s]: %s", label, str(exc).strip())
+        if skipped:
+            logger.warning("DB init: %d DDL step(s) skipped (already applied or insufficient privilege): %s",
+                           len(skipped), ", ".join(skipped))
+        logger.info("DB schema initialized")
     except Exception as exc:
         logger.error("DB schema initialization failed: %s", exc)
         raise

@@ -18,6 +18,7 @@ Phase 11: 문서 기반 자연어 질의응답 파이프라인.
 import json
 import logging
 import re
+import time as _time
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -282,18 +283,22 @@ class LLMProvider(ABC):
 
 
 class OpenAILLMProvider(LLMProvider):
-    """OpenAI GPT-4o 연동."""
+    """OpenAI GPT-4o 연동 (vLLM 등 OpenAI-호환 커스텀 엔드포인트도 지원)."""
 
-    def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
-        self._api_key = api_key or settings.openai_api_key
+    def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None, base_url: Optional[str] = None):
+        self._api_key = api_key or settings.openai_api_key or "dummy"
         self._model = model or settings.llm_model
+        self._base_url = base_url
         self._client = None
 
     def _get_client(self):
         if self._client is None:
             try:
                 from openai import AsyncOpenAI
-                self._client = AsyncOpenAI(api_key=self._api_key)
+                kwargs: dict = {"api_key": self._api_key}
+                if self._base_url:
+                    kwargs["base_url"] = self._base_url
+                self._client = AsyncOpenAI(**kwargs)
             except ImportError:
                 raise RuntimeError("openai 패키지가 설치되지 않았습니다.")
         return self._client
@@ -343,7 +348,7 @@ class AnthropicLLMProvider(LLMProvider):
 
     def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
         self._api_key = api_key or settings.anthropic_api_key
-        self._model = model or "claude-sonnet-4-6"
+        self._model = model or settings.llm_model or "claude-sonnet-4-6"
         self._client = None
 
     def _get_client(self):
@@ -394,16 +399,56 @@ class AnthropicLLMProvider(LLMProvider):
         return content, token_used
 
 
+_provider_cache: dict = {}
+_PROVIDER_CACHE_TTL = 60  # seconds
+
+
+def invalidate_provider_cache() -> None:
+    """관리자가 기본 프로바이더를 변경할 때 캐시를 무효화한다."""
+    _provider_cache.clear()
+
+
+def _get_default_llm_from_db() -> Optional[dict]:
+    """DB에서 기본 LLM 프로바이더를 조회 (60초 메모리 캐시)."""
+    now = _time.monotonic()
+    cached = _provider_cache.get("llm")
+    if cached and cached["expires"] > now:
+        return cached["data"]
+    try:
+        from app.db.connection import get_db
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM llm_providers "
+                    "WHERE type = 'llm' AND is_default = TRUE AND status = 'active' "
+                    "LIMIT 1"
+                )
+                row = cur.fetchone()
+        _provider_cache["llm"] = {"data": dict(row) if row else None, "expires": now + _PROVIDER_CACHE_TTL}
+        return _provider_cache["llm"]["data"]
+    except Exception as exc:
+        logger.warning("DB LLM 프로바이더 조회 실패 (%s) — 환경변수 설정 사용", exc)
+        return None
+
+
 def get_llm_provider() -> LLMProvider:
-    """설정에 따라 적절한 LLMProvider를 반환한다."""
+    """기본 LLM 프로바이더 반환 — DB 설정 우선, 환경변수 폴백."""
+    row = _get_default_llm_from_db()
+    if row:
+        model: str = row["model_name"]
+        api_key: Optional[str] = row.get("api_key") or None
+        base_url: Optional[str] = row.get("api_base_url") or None
+        # base_url이 있거나 모델이 claude로 시작하지 않으면 OpenAI-호환 클라이언트 사용
+        if base_url or not model.startswith("claude-"):
+            return OpenAILLMProvider(api_key=api_key, model=model, base_url=base_url)
+        return AnthropicLLMProvider(api_key=api_key, model=model)
+    # 폴백: 환경변수
     provider_name = settings.llm_provider.lower()
     if provider_name == "anthropic" and settings.anthropic_api_key:
         return AnthropicLLMProvider()
     if settings.openai_api_key:
         return OpenAILLMProvider()
-    logger.warning(
-        "LLM API 키가 설정되지 않았습니다. MockLLMProvider를 사용합니다."
-    )
+    logger.warning("LLM API 키가 설정되지 않았습니다. MockLLMProvider를 사용합니다.")
     return MockLLMProvider()
 
 

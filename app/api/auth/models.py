@@ -57,7 +57,9 @@ class ActorContext:
         tenant_id:         멀티테넌시 scope (미검증 시 None)
         role:              전역 역할명 (VIEWER / AUTHOR / ...)  인증 미확인 시 None
         agent_id:          에이전트 UUID (actor_type=AGENT 전용)
-        scope_profile_id:  바인딩된 ScopeProfile UUID (에이전트 전용)
+        scope_profile_id:  바인딩된 ScopeProfile UUID. 에이전트(S2 Phase 4)와 사용자
+                           (S2-5, 2026-04-20 추가) 모두 사용. 값이 없으면 S2 ⑥ 대상
+                           리소스(골든셋·평가 Admin 등) 접근 시 403.
         acting_on_behalf_of: 위임 대상 User ID (에이전트 위임 호출 시)
     """
 
@@ -67,7 +69,7 @@ class ActorContext:
     auth_method: Optional[AuthMethod]
     tenant_id: Optional[str]
     role: Optional[str] = None
-    # S2 Phase 4: 에이전트 전용 필드
+    # S2 Phase 4: 에이전트 전용 필드 + S2-5 (2026-04-20): scope_profile_id 는 사용자도 사용
     agent_id: Optional[str] = field(default=None)
     scope_profile_id: Optional[str] = field(default=None)
     acting_on_behalf_of: Optional[str] = field(default=None)  # User ID (위임)

@@ -233,7 +233,7 @@ class BatchExtractionJobRepository:
         with self._conn.cursor() as cur:
             cur.execute(sql, (str(job_id),))
             row = cur.fetchone()
-        return bool(row[0]) if row else False
+        return bool(row["is_cancellation_requested"]) if row else False
 
 
 class ExtractionRetryLogRepository:

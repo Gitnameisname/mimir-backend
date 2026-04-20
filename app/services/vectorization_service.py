@@ -2,7 +2,9 @@
 벡터화 파이프라인 서비스 — 청킹 + 임베딩 + 저장.
 
 설계 원칙:
-  - VectorizationPipeline: 단일 문서 버전을 청크 → 임베딩 → pgvector 저장하는 전체 흐름
+  - VectorizationPipeline: 단일 문서 버전을 청크 → 임베딩 → 저장하는 전체 흐름
+  - PostgreSQL document_chunks: 메타데이터 + ACL 스냅샷 보관 (embedding 컬럼 없음)
+  - Milvus: chunk_id + embedding 보관 (벡터 유사도 검색 전용)
   - 배치 처리로 임베딩 API 비용 최소화 (settings.embedding_batch_size)
   - 권한 메타데이터(ACL 스냅샷) 각 청크에 반영
   - 재색인 시 기존 청크 소프트 삭제 (is_current = false)
@@ -375,20 +377,31 @@ class VectorizationPipeline:
         document_type: Optional[str] = None,
         top_k: int = 20,
     ) -> list[dict]:
-        """쿼리 텍스트와 유사한 청크를 코사인 유사도로 검색한다.
+        """쿼리 텍스트와 유사한 청크를 검색한다.
 
-        권한 필터링: actor_role에 따라 접근 가능한 청크만 반환.
+        1단계: Milvus에서 top_k * 3 후보 chunk_id 검색 (벡터 유사도)
+        2단계: PostgreSQL에서 chunk_id IN (...) + ACL 필터로 최종 결과 반환
         """
+        from app.db.milvus import get_milvus
+        milvus = get_milvus()
+
         provider = self._get_provider()
         query_embedding = provider.embed_single(query)
 
-        # 임베딩 생성 실패(zero vector 또는 빈 리스트) 시 검색 불가
         if not query_embedding or not any(query_embedding):
-            logger.warning(
-                "쿼리 임베딩 생성 실패 — 빈 결과 반환 (query=%s…)", query[:80]
-            )
+            logger.warning("쿼리 임베딩 생성 실패 — 빈 결과 반환 (query=%s…)", query[:80])
             return []
 
+        if not milvus.is_available():
+            logger.warning("Milvus 비활성 — 벡터 검색 불가, 빈 결과 반환")
+            return []
+
+        # 1단계: Milvus 벡터 검색 (ACL 무관, top_k * 3 후보)
+        candidate_ids = milvus.search(query_embedding, top_k=top_k * 3)
+        if not candidate_ids:
+            return []
+
+        # 2단계: PostgreSQL ACL 필터 + 메타데이터 조회
         acl_terms = ["is_public = TRUE"]
         acl_params: list = []
         if actor_role:
@@ -408,8 +421,11 @@ class VectorizationPipeline:
             type_filter = " AND document_type = %s"
             type_params = [document_type]
 
-        # 파라미터 순서: SELECT용 query_embedding, role_params, type_params, ORDER BY용 query_embedding, LIMIT
-        all_params = [query_embedding] + acl_params + type_params + [query_embedding, top_k]
+        # Milvus 결과 순서(유사도 내림차순)를 CASE WHEN으로 보존
+        id_order = ", ".join(f"'{cid}'" for cid in candidate_ids)
+        order_clause = f"CASE id::text {' '.join(f'WHEN {repr(cid)} THEN {idx}' for idx, cid in enumerate(candidate_ids))} ELSE {len(candidate_ids)} END"
+
+        all_params = list(acl_params) + list(type_params) + [top_k]
 
         with conn.cursor() as cur:
             cur.execute(
@@ -424,19 +440,21 @@ class VectorizationPipeline:
                     node_path,
                     document_type,
                     document_status,
-                    token_count,
-                    1 - (embedding <=> %s::vector) AS similarity
+                    token_count
                 FROM document_chunks
                 WHERE is_current = TRUE
-                  AND embedding IS NOT NULL
+                  AND id::text IN ({id_order})
                   {role_filter}
                   {type_filter}
-                ORDER BY embedding <=> %s::vector
+                ORDER BY {order_clause}
                 LIMIT %s
                 """,
                 all_params,
             )
             rows = cur.fetchall()
+
+        # Milvus 유사도는 search 결과 순서로 근사값 부여 (1.0에서 감소)
+        id_to_score = {cid: 1.0 - idx * 0.01 for idx, cid in enumerate(candidate_ids)}
 
         return [
             {
@@ -450,7 +468,7 @@ class VectorizationPipeline:
                 "document_type": row["document_type"],
                 "document_status": row["document_status"],
                 "token_count": row["token_count"],
-                "similarity": float(row["similarity"] or 0.0),
+                "similarity": id_to_score.get(str(row["id"]), 0.0),
             }
             for row in rows
         ]
@@ -600,36 +618,42 @@ class VectorizationPipeline:
         embeddings: list[list[float]],
         model_name: str,
     ) -> tuple[int, int]:
-        """청크와 임베딩을 DB에 저장한다. (saved, failed) 반환.
+        """청크 메타데이터를 PostgreSQL에, 임베딩을 Milvus에 저장한다.
 
+        PostgreSQL: id, source_text, ACL 스냅샷 등 메타데이터
+        Milvus: chunk_id + embedding 벡터
         각 INSERT를 개별 savepoint로 감싸 한 청크 실패가 전체 트랜잭션을
         aborted 상태로 만들지 않도록 한다.
         """
+        from app.db.milvus import get_milvus
+        milvus = get_milvus()
+
         saved = 0
         failed = 0
+        milvus_records: list[dict] = []
 
         with conn.cursor() as cur:
             for i, chunk in enumerate(chunks):
                 try:
                     cur.execute("SAVEPOINT sp_chunk")
                     embedding = embeddings[i] if i < len(embeddings) else None
-                    embedding_val = embedding if embedding else None
 
                     cur.execute(
                         """
                         INSERT INTO document_chunks (
                             document_id, version_id, node_id,
-                            chunk_index, source_text, embedding, embedding_model,
+                            chunk_index, source_text, embedding_model,
                             token_count, node_path, document_type, document_status,
                             accessible_roles, accessible_user_ids, accessible_org_ids,
                             is_public, is_current
                         ) VALUES (
                             %s::uuid, %s::uuid, %s::uuid,
-                            %s, %s, %s::vector, %s,
+                            %s, %s, %s,
                             %s, %s, %s, %s,
                             %s, %s, %s,
                             %s, TRUE
                         )
+                        RETURNING id
                         """,
                         (
                             chunk.document_id,
@@ -637,8 +661,7 @@ class VectorizationPipeline:
                             chunk.node_id,
                             chunk.chunk_index,
                             chunk.source_text,
-                            embedding_val,
-                            model_name if embedding_val else None,
+                            model_name if embedding else None,
                             chunk.token_count,
                             chunk.node_path,
                             chunk.document_type,
@@ -649,12 +672,26 @@ class VectorizationPipeline:
                             chunk.is_public,
                         ),
                     )
+                    row = cur.fetchone()
+                    chunk_id = str(row["id"]) if row else None
                     cur.execute("RELEASE SAVEPOINT sp_chunk")
                     saved += 1
+
+                    if chunk_id and embedding and any(embedding):
+                        milvus_records.append({"chunk_id": chunk_id, "embedding": embedding})
+
                 except Exception as exc:
                     cur.execute("ROLLBACK TO SAVEPOINT sp_chunk")
                     logger.error("청크 저장 실패 (index=%d): %s", i, exc)
                     failed += 1
+
+        # Milvus 배치 upsert (PostgreSQL 커밋 후)
+        if milvus_records:
+            try:
+                milvus.upsert_batch(milvus_records)
+                logger.info("Milvus upsert 완료: %d 벡터", len(milvus_records))
+            except Exception as exc:
+                logger.error("Milvus upsert 실패 (벡터 검색 불가): %s", exc)
 
         return saved, failed
 

@@ -30,6 +30,8 @@ class User:
         failed_login_count: 연속 로그인 실패 횟수 (Phase 14)
         locked_until      : 계정 잠금 해제 시각 (Phase 14)
         avatar_url        : 프로필 이미지 URL (Phase 14)
+        scope_profile_id  : 바인딩된 Scope Profile UUID (S2-5 / S2 ⑥). 값이 없으면
+                            골든셋·평가 등 S2 ⑥ 대상 리소스 접근 시 403.
     """
 
     id: str
@@ -49,3 +51,5 @@ class User:
     failed_login_count: int = 0
     locked_until: Optional[datetime] = None
     avatar_url: Optional[str] = None
+    # S2-5 (2026-04-20): 사람 사용자 Scope Profile 바인딩
+    scope_profile_id: Optional[str] = None

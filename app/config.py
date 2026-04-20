@@ -1,4 +1,5 @@
 import logging
+from pathlib import Path
 
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -7,10 +8,13 @@ logger = logging.getLogger(__name__)
 
 _REQUIRED_IN_PRODUCTION = ["jwt_secret", "postgres_password", "internal_service_secret"]
 
+# config.py는 backend/app/ 안에 있으므로 부모의 부모가 backend/
+_ENV_FILE = Path(__file__).parent.parent / ".env"
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=str(_ENV_FILE),
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
@@ -89,6 +93,19 @@ class Settings(BaseSettings):
     rag_reranker_threshold: float = 0.0    # 최소 유사도 점수 (0.0 = 비활성)
     rag_max_context_tokens: int = 6000     # ContextBuilder 최대 토큰 수
     rag_max_history_turns: int = 10        # Multi-turn 최대 이전 대화 수
+
+    # Milvus
+    milvus_host: str = ""        # 빈 문자열 = 비활성 (NullClient 폴백)
+    milvus_port: int = 19530
+    milvus_user: str = ""        # 빈 문자열 = 인증 없음
+    milvus_password: str = ""
+
+    # MinIO (Object Storage)
+    minio_endpoint: str = ""     # 빈 문자열 = 비활성
+    minio_access_key: str = ""
+    minio_secret_key: str = ""
+    minio_bucket_name: str = "mimir"
+    minio_secure: bool = False
 
     # Valkey / Redis
     valkey_host: str = "localhost"

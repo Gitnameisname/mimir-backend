@@ -18,6 +18,20 @@ from slowapi.util import get_remote_address
 logger = logging.getLogger(__name__)
 
 
+class _SafeLimiter(Limiter):
+    """view_rate_limit 미설정 시 AttributeError를 방지하는 Limiter.
+
+    swallow_errors=True로 Valkey 오류가 skip되면 __evaluate_limits가
+    request.state.view_rate_limit를 설정하지 못해 async_wrapper에서
+    AttributeError가 발생한다. _check_request_limit 전에 기본값을 초기화한다.
+    """
+
+    def _check_request_limit(self, request, endpoint_func, in_middleware):
+        if not hasattr(request.state, "view_rate_limit"):
+            request.state.view_rate_limit = None
+        super()._check_request_limit(request, endpoint_func, in_middleware)
+
+
 def _get_client_ip(request: Request) -> str:
     """X-Forwarded-For 스푸핑 방어를 적용한 클라이언트 IP 추출.
 
@@ -46,18 +60,20 @@ def _get_client_ip(request: Request) -> str:
     return addrs[idx] if addrs else get_remote_address(request)
 
 
-def _build_limiter() -> Limiter:
+def _build_limiter() -> _SafeLimiter:
     try:
         from app.config import settings
         if settings.environment == "test":
-            return Limiter(key_func=_get_client_ip)
-        return Limiter(
+            return _SafeLimiter(key_func=_get_client_ip)
+        return _SafeLimiter(
             key_func=_get_client_ip,
             storage_uri=settings.valkey_url,
+            swallow_errors=True,
+            headers_enabled=False,
         )
     except Exception as exc:
         logger.warning("Rate limiter Valkey init failed (%s), falling back to memory", exc)
-        return Limiter(key_func=_get_client_ip)
+        return _SafeLimiter(key_func=_get_client_ip, swallow_errors=True, headers_enabled=False)
 
 
-limiter: Limiter = _build_limiter()
+limiter: _SafeLimiter = _build_limiter()

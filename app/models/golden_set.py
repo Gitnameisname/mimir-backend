@@ -110,6 +110,12 @@ class GoldenSet(BaseModel):
     deleted_at: Optional[datetime] = None
     is_deleted: bool = False
 
+    # FG7.1: list_by_scope 가 _count_items 결과를 덧붙여 응답 직렬화 시 사용한다.
+    # 영속 컬럼이 아니므로 DB row → model 매핑 시에는 설정되지 않고, None 인 상태로
+    # 남는다 (응답 포맷에서는 None → 미표시). Pydantic v2 strict 모드에서 속성 할당
+    # 허용을 위해 명시적으로 필드로 선언한다.
+    item_count: Optional[int] = None
+
 
 # ---------------------------------------------------------------------------
 # Request / Response DTOs

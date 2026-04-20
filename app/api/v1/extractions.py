@@ -32,7 +32,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from app.api.auth.dependencies import resolve_current_actor
-from app.api.auth.models import ActorContext
+from app.api.auth.models import ActorContext, ActorType
 from app.api.responses import SuccessResponse, list_response, success_response
 from app.audit.emitter import audit_emitter
 from app.db.connection import get_db
@@ -87,10 +87,14 @@ def list_pending_extractions(
     offset: int = Query(default=0, ge=0),
     actor: ActorContext = Depends(resolve_current_actor),
 ):
-    scope_id = _scope_profile_id(actor)
-    role = getattr(actor, "role", None)
-    if scope_id is None and role not in {"ORG_ADMIN", "SUPER_ADMIN"}:
-        raise HTTPException(status_code=403, detail="scope_profile_id가 없는 사용자는 목록을 조회할 수 없습니다.")
+    # 에이전트는 자신의 scope_profile_id로 필터링, 사용자는 전체 조회 (ACL은 DB 레벨에서 처리)
+    if actor.actor_type == ActorType.AGENT:
+        scope_id = _scope_profile_id(actor)
+        role = getattr(actor, "role", None)
+        if scope_id is None and role not in {"ORG_ADMIN", "SUPER_ADMIN"}:
+            raise HTTPException(status_code=403, detail="scope_profile_id가 없는 에이전트는 목록을 조회할 수 없습니다.")
+    else:
+        scope_id = None
 
     with get_db() as conn:
         repo = ExtractionCandidateRepository(conn)

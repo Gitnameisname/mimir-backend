@@ -38,7 +38,9 @@ import hashlib
 import logging
 import re
 import secrets as _secrets
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
+from uuid import UUID
 
 logger = logging.getLogger(__name__)
 
@@ -158,23 +160,61 @@ def get_dashboard_metrics(_=Depends(require_admin_access)):
 
 @router.get("/dashboard/health", summary="컴포넌트 상태")
 def get_dashboard_health(_=Depends(require_admin_access)):
-    # DB 연결 확인
-    db_status = "HEALTHY"
+    components = []
+
+    # 1. API Server — 이 엔드포인트에 도달했으면 서버 자체는 정상
+    components.append({"name": "API Server", "status": "ok"})
+
+    # 2. Database
+    db_status = "ok"
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT 1")
     except Exception:
-        db_status = "DOWN"
+        db_status = "error"
+    components.append({"name": "Database", "status": db_status})
 
-    return success_response(data={
-        "components": [
-            {"name": "API Server", "status": "HEALTHY"},
-            {"name": "Database", "status": db_status},
-            {"name": "Background Job Queue", "status": "UNKNOWN"},
-            {"name": "Indexing Pipeline", "status": "UNKNOWN"},
-        ]
-    })
+    # 3. Background Job Queue — 스테일 RUNNING 잡이 많으면 degraded
+    job_status = "ok"
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                        COUNT(*) FILTER (WHERE status = 'RUNNING'
+                            AND created_at < NOW() - INTERVAL '1 hour')::int AS stale
+                    FROM background_jobs
+                """)
+                row = cur.fetchone()
+                stale = (row["stale"] if row else 0) or 0
+                if stale > 0:
+                    job_status = "degraded"
+    except Exception:
+        job_status = "error"
+    components.append({"name": "Background Job Queue", "status": job_status})
+
+    # 4. Indexing Pipeline — Milvus 연결 여부로 판단
+    index_status = "ok"
+    try:
+        from app.db.milvus import get_milvus
+        milvus = get_milvus()
+        if not milvus.is_available():
+            index_status = "degraded"
+    except Exception:
+        index_status = "error"
+    components.append({"name": "Indexing Pipeline", "status": index_status})
+
+    # 전체 상태
+    statuses = {c["status"] for c in components}
+    if "error" in statuses:
+        overall = "error"
+    elif "degraded" in statuses:
+        overall = "degraded"
+    else:
+        overall = "ok"
+
+    return success_response(data={"overall": overall, "components": components})
 
 
 @router.get("/dashboard/errors", summary="최근 오류 요약")
@@ -255,31 +295,46 @@ def list_users(
 ):
     offset = (page - 1) * limit
     conditions = []
+    count_conditions = []
     params: list = []
+    count_params: list = []
 
     if search:
-        conditions.append("(display_name ILIKE %s OR email ILIKE %s)")
+        cond = "(u.display_name ILIKE %s OR u.email ILIKE %s)"
+        conditions.append(cond)
+        count_conditions.append("(display_name ILIKE %s OR email ILIKE %s)")
         params += [f"%{search}%", f"%{search}%"]
+        count_params += [f"%{search}%", f"%{search}%"]
     if status:
-        conditions.append("status = %s")
+        conditions.append("u.status = %s")
+        count_conditions.append("status = %s")
         params.append(status)
+        count_params.append(status)
     if role:
-        conditions.append("role_name = %s")
+        conditions.append("u.role_name = %s")
+        count_conditions.append("role_name = %s")
         params.append(role)
+        count_params.append(role)
 
     where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    count_where = ("WHERE " + " AND ".join(count_conditions)) if count_conditions else ""
 
     with get_db() as conn:
         with conn.cursor() as cur:
-            cur.execute(f"SELECT COUNT(*) AS total FROM users {where}", params)
+            cur.execute(f"SELECT COUNT(*) AS total FROM users {count_where}", count_params)
             total = cur.fetchone()["total"]
 
             cur.execute(
                 f"""
-                SELECT id, email, display_name, status, role_name,
-                       last_login_at, created_at
-                FROM users {where}
-                ORDER BY created_at DESC
+                SELECT u.id, u.email, u.display_name, u.status, u.role_name,
+                       u.last_login_at, u.created_at,
+                       NULLIF(STRING_AGG(o.name, ', ' ORDER BY o.name), '') AS org_names
+                FROM users u
+                LEFT JOIN user_org_roles uor ON uor.user_id = u.id
+                LEFT JOIN organizations o ON o.id = uor.org_id
+                {where}
+                GROUP BY u.id
+                ORDER BY u.created_at DESC
                 LIMIT %s OFFSET %s
                 """,
                 params + [limit, offset],
@@ -293,6 +348,7 @@ def list_users(
             "display_name": r["display_name"],
             "status": r["status"],
             "role_name": r["role_name"],
+            "organizations": r["org_names"],
             "last_login_at": r["last_login_at"].isoformat() if r["last_login_at"] else None,
             "created_at": r["created_at"].isoformat() if r["created_at"] else None,
         }
@@ -347,13 +403,14 @@ def get_user(user_id: str, _=Depends(require_admin_access)):
         "role_name": row["role_name"],
         "last_login_at": row["last_login_at"].isoformat() if row["last_login_at"] else None,
         "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+        "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
         "org_roles": [
             {
                 "mapping_id": str(m["id"]),
                 "org_id": str(m["org_id"]),
                 "org_name": m["org_name"],
                 "role_name": m["role_name"],
-                "created_at": m["created_at"].isoformat() if m["created_at"] else None,
+                "joined_at": m["created_at"].isoformat() if m["created_at"] else None,
             }
             for m in mappings
         ],
@@ -361,8 +418,9 @@ def get_user(user_id: str, _=Depends(require_admin_access)):
             {
                 "id": str(a["id"]),
                 "event_type": a["event_type"],
-                "occurred_at": a["occurred_at"].isoformat() if a["occurred_at"] else None,
+                "severity": "NORMAL",
                 "result": a["action_result"],
+                "created_at": a["occurred_at"].isoformat() if a["occurred_at"] else None,
             }
             for a in audit_rows
         ],
@@ -415,7 +473,7 @@ def list_organizations(
             "name": r["name"],
             "description": r["description"],
             "status": r["status"],
-            "user_count": r["user_count"],
+            "member_count": r["user_count"],
             "created_at": r["created_at"].isoformat() if r["created_at"] else None,
         }
         for r in rows
@@ -554,7 +612,7 @@ def get_role(role_id: str, _=Depends(require_admin_access)):
 # 감사 로그
 # ---------------------------------------------------------------------------
 
-_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2})?)?Z?$")
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d+)?)?([+-]\d{2}:\d{2}|Z)?)?$")
 
 
 def _validate_date_param(value: Optional[str], param_name: str) -> None:
@@ -566,10 +624,18 @@ def _validate_date_param(value: Optional[str], param_name: str) -> None:
         )
 
 
+@router.get("/audit-logs/event-types", summary="감사 이벤트 유형 카탈로그 (필터 드롭다운)")
+def list_audit_event_types_inline(_=Depends(require_admin_access)):
+    """감사 로그 필터 드롭다운용 이벤트 유형 목록."""
+    return success_response(
+        data={"items": [{"value": v, "label": label} for v, label in _AUDIT_EVENT_TYPES]}
+    )
+
+
 @router.get("/audit-logs", summary="감사 로그 목록")
 def list_audit_logs(
     page: int = Query(default=1, ge=1),
-    limit: int = Query(default=20, ge=1, le=100),
+    page_size: int = Query(default=20, ge=1, le=100),
     from_dt: Optional[str] = Query(default=None, alias="from"),
     to_dt: Optional[str] = Query(default=None, alias="to"),
     actor_id: Optional[str] = Query(default=None),
@@ -580,7 +646,7 @@ def list_audit_logs(
     _validate_date_param(from_dt, "from")
     _validate_date_param(to_dt, "to")
 
-    offset = (page - 1) * limit
+    offset = (page - 1) * page_size
     conditions = []
     params: list = []
 
@@ -616,7 +682,7 @@ def list_audit_logs(
                 ORDER BY occurred_at DESC
                 LIMIT %s OFFSET %s
                 """,
-                params + [limit, offset],
+                params + [page_size, offset],
             )
             rows = cur.fetchall()
 
@@ -625,7 +691,7 @@ def list_audit_logs(
             "id": str(r["id"]),
             "event_type": r["event_type"],
             "severity": _audit_severity(r["event_type"]),
-            "occurred_at": r["occurred_at"].isoformat() if r["occurred_at"] else None,
+            "created_at": r["occurred_at"].isoformat() if r["occurred_at"] else None,
             "actor_id": r["actor_user_id"],
             "actor_role": r["actor_role"],
             "resource_type": "Document" if r["document_id"] else None,
@@ -637,7 +703,7 @@ def list_audit_logs(
         }
         for r in rows
     ]
-    return list_response(data=items, page=page, page_size=limit, total=total)
+    return list_response(data=items, page=page, page_size=page_size, total=total)
 
 
 @router.get("/audit-logs/{event_id}", summary="감사 로그 상세")
@@ -653,7 +719,7 @@ def get_audit_log(event_id: str, _=Depends(require_admin_access)):
         "id": str(row["id"]),
         "event_type": row["event_type"],
         "severity": _audit_severity(row["event_type"]),
-        "occurred_at": row["occurred_at"].isoformat() if row["occurred_at"] else None,
+        "created_at": row["occurred_at"].isoformat() if row["occurred_at"] else None,
         "actor_id": row["actor_user_id"],
         "actor_role": row["actor_role"],
         "resource_type": "Document" if row["document_id"] else None,
@@ -888,10 +954,10 @@ def get_jobs_summary(_=Depends(require_admin_access)):
 
 
 @router.get("/jobs/{job_id}", summary="작업 상세")
-def get_job(job_id: str, _=Depends(require_admin_access)):
+def get_job(job_id: UUID, _=Depends(require_admin_access)):
     with get_db() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM background_jobs WHERE id = %s", (job_id,))
+            cur.execute("SELECT * FROM background_jobs WHERE id = %s", (str(job_id),))
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="작업을 찾을 수 없습니다.")
@@ -2200,26 +2266,30 @@ def get_component_status(_=Depends(require_admin_access)):
         "metadata": valkey_meta,
     })
 
-    # 3. Vector DB (pgvector — DB와 동일 인스턴스, 인덱스 행 수만 보고)
-    vec_status, vec_latency_ms = "UNKNOWN", None
+    # 3. Vector DB (Milvus)
+    vec_status, vec_latency_ms = "DOWN", None
     vec_meta: dict[str, Any] = {}
     try:
+        from app.db.milvus import get_milvus, COLLECTION_NAME
         t0 = time.perf_counter()
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT
-                        COUNT(*) FILTER (WHERE is_current = TRUE AND embedding IS NOT NULL)::int AS embedded_count
-                    FROM document_chunks
-                """)
-                row = cur.fetchone()
-                vec_meta["embedded_chunks"] = row["embedded_count"] if row else 0
-        vec_latency_ms = round((time.perf_counter() - t0) * 1000, 1)
-        vec_status = "HEALTHY"
+        milvus = get_milvus()
+        if milvus.is_available():
+            # 청크 수 조회
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT COUNT(*) AS cnt FROM document_chunks WHERE is_current = TRUE"
+                    )
+                    row = cur.fetchone()
+                    vec_meta["indexed_chunks"] = row["cnt"] if row else 0
+            vec_latency_ms = round((time.perf_counter() - t0) * 1000, 1)
+            vec_status = "HEALTHY"
+        else:
+            vec_meta["error"] = "Milvus unavailable (NullClient)"
     except Exception as exc:
         vec_meta["error"] = str(exc)[:200]
     components.append({
-        "name": "Vector DB (pgvector)",
+        "name": "Vector DB (Milvus)",
         "status": vec_status,
         "latency_ms": vec_latency_ms,
         "metadata": vec_meta,
@@ -3058,16 +3128,180 @@ _AUDIT_EVENT_TYPES: list[tuple[str, str]] = [
 ]
 
 
-@router.get("/audit-logs/event-types", summary="감사 이벤트 유형 카탈로그")
-def list_audit_event_types(_=Depends(require_admin_access)):
-    """감사 로그 필터 드롭다운용 이벤트 유형 목록 (정적 카탈로그).
+# ---------------------------------------------------------------------------
+# 비용·사용량 대시보드 (FG6.1)
+# ---------------------------------------------------------------------------
 
-    실제 발생한 이벤트 유형만 노출하지 않고 전체 카탈로그를 반환 —
-    운영 중 새로 나타날 유형에 대비.
-    """
-    return success_response(
-        data={"items": [{"value": v, "label": label} for v, label in _AUDIT_EVENT_TYPES]}
+@router.get("/usage/export", summary="사용량 CSV 내보내기")
+def export_usage_csv(
+    days: int = Query(default=30, ge=1, le=365),
+    _=Depends(require_admin_access),
+):
+    import csv
+    import io
+    from fastapi.responses import StreamingResponse
+
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+    rows: list[dict] = []
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            # LLM (rag_messages assistant turns)
+            cur.execute(
+                """
+                SELECT DATE(created_at AT TIME ZONE 'UTC') AS date,
+                       COALESCE(model, 'unknown') AS model_name,
+                       COUNT(*) AS call_count,
+                       COALESCE(SUM(token_used), 0) AS total_tokens
+                FROM rag_messages
+                WHERE role = 'assistant' AND created_at >= %s
+                GROUP BY 1, 2
+                ORDER BY 1, 2
+                """,
+                (since,),
+            )
+            for r in cur.fetchall():
+                rows.append({
+                    "date": str(r["date"]),
+                    "provider": "llm",
+                    "model_name": r["model_name"],
+                    "input_tokens": 0,
+                    "output_tokens": r["total_tokens"],
+                    "call_count": r["call_count"],
+                    "estimated_cost_usd": 0,
+                })
+
+            # Embedding
+            cur.execute(
+                """
+                SELECT DATE(created_at AT TIME ZONE 'UTC') AS date,
+                       COALESCE(model, 'unknown') AS model_name,
+                       COUNT(*) AS call_count,
+                       COALESCE(SUM(total_tokens), 0) AS total_tokens
+                FROM embedding_token_usage
+                WHERE created_at >= %s
+                GROUP BY 1, 2
+                ORDER BY 1, 2
+                """,
+                (since,),
+            )
+            for r in cur.fetchall():
+                rows.append({
+                    "date": str(r["date"]),
+                    "provider": "embedding",
+                    "model_name": r["model_name"],
+                    "input_tokens": r["total_tokens"],
+                    "output_tokens": 0,
+                    "call_count": r["call_count"],
+                    "estimated_cost_usd": 0,
+                })
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=["date", "provider", "model_name", "input_tokens", "output_tokens", "call_count", "estimated_cost_usd"])
+    writer.writeheader()
+    writer.writerows(rows)
+
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=usage_{days}d.csv"},
     )
+
+
+@router.get("/usage", summary="비용·사용량 대시보드")
+def get_usage_dashboard(
+    days: int = Query(default=30, ge=1, le=365),
+    provider: Optional[str] = Query(default=None),
+    _=Depends(require_admin_access),
+):
+    """rag_messages + embedding_token_usage 테이블 기반 사용량 집계."""
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+    daily: list[dict] = []
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            # LLM usage (rag_messages assistant rows)
+            if not provider or provider == "llm":
+                cur.execute(
+                    """
+                    SELECT DATE(created_at AT TIME ZONE 'UTC') AS date,
+                           COALESCE(model, 'unknown') AS model_name,
+                           COUNT(*) AS call_count,
+                           COALESCE(SUM(token_used), 0) AS total_tokens
+                    FROM rag_messages
+                    WHERE role = 'assistant' AND created_at >= %s
+                    GROUP BY 1, 2
+                    ORDER BY 1, 2
+                    """,
+                    (since,),
+                )
+                for r in cur.fetchall():
+                    daily.append({
+                        "date": str(r["date"]),
+                        "provider": "llm",
+                        "model_name": r["model_name"],
+                        "input_tokens": 0,
+                        "output_tokens": int(r["total_tokens"]),
+                        "call_count": int(r["call_count"]),
+                        "avg_latency_ms": 0.0,
+                        "estimated_cost_usd": 0.0,
+                    })
+
+            # Embedding usage
+            if not provider or provider == "embedding":
+                cur.execute(
+                    """
+                    SELECT DATE(created_at AT TIME ZONE 'UTC') AS date,
+                           COALESCE(model, 'unknown') AS model_name,
+                           COUNT(*) AS call_count,
+                           COALESCE(SUM(total_tokens), 0) AS total_tokens
+                    FROM embedding_token_usage
+                    WHERE created_at >= %s
+                    GROUP BY 1, 2
+                    ORDER BY 1, 2
+                    """,
+                    (since,),
+                )
+                for r in cur.fetchall():
+                    daily.append({
+                        "date": str(r["date"]),
+                        "provider": "embedding",
+                        "model_name": r["model_name"],
+                        "input_tokens": int(r["total_tokens"]),
+                        "output_tokens": 0,
+                        "call_count": int(r["call_count"]),
+                        "avg_latency_ms": 0.0,
+                        "estimated_cost_usd": 0.0,
+                    })
+
+    # summary_by_model 집계
+    from collections import defaultdict
+    model_map: dict[str, dict] = defaultdict(lambda: {
+        "total_input_tokens": 0,
+        "total_output_tokens": 0,
+        "total_calls": 0,
+        "total_cost_usd": 0.0,
+    })
+    for row in daily:
+        key = f"{row['provider']}::{row['model_name']}"
+        m = model_map[key]
+        m["provider"] = row["provider"]
+        m["model_name"] = row["model_name"]
+        m["total_input_tokens"] += row["input_tokens"]
+        m["total_output_tokens"] += row["output_tokens"]
+        m["total_calls"] += row["call_count"]
+        m["avg_latency_ms"] = 0.0
+        m["total_cost_usd"] += row["estimated_cost_usd"]
+
+    summary = list(model_map.values())
+    total_cost = sum(s["total_cost_usd"] for s in summary)
+
+    return success_response(data={
+        "period_days": days,
+        "total_cost_usd": total_cost,
+        "daily_metrics": daily,
+        "summary_by_model": summary,
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -3099,8 +3333,131 @@ def get_admin_capabilities(
     from app.api.v1.system import _get_full_capabilities
 
     data = _get_full_capabilities()
-    response.headers["Cache-Control"] = "private, max-age=300"
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     return success_response(data=data)
+
+
+# ---------------------------------------------------------------------------
+# 에이전트 활동 대시보드 (FG6.2)
+# ---------------------------------------------------------------------------
+
+@router.get("/agent-activity", summary="에이전트 활동 대시보드")
+def get_agent_activity_dashboard(
+    days: int = Query(default=30, ge=1, le=365),
+    _=Depends(require_admin_access),
+):
+    """agent_proposals 기반 에이전트별 활동 통계·시계열·이상 알림."""
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            # 1. 일별·에이전트별 시계열
+            cur.execute(
+                """
+                SELECT
+                    DATE(ap.created_at AT TIME ZONE 'UTC') AS date,
+                    ap.agent_id,
+                    a.name AS agent_name,
+                    COUNT(*) AS proposals,
+                    COUNT(*) FILTER (WHERE ap.status = 'approved') AS approved
+                FROM agent_proposals ap
+                JOIN agents a ON a.id = ap.agent_id
+                WHERE ap.created_at >= %s
+                GROUP BY 1, 2, 3
+                ORDER BY 1, 3
+                """,
+                (since,),
+            )
+            series_rows = cur.fetchall()
+
+            # 2. 에이전트별 집계
+            cur.execute(
+                """
+                SELECT
+                    ap.agent_id,
+                    a.name AS agent_name,
+                    COUNT(*) AS total_proposals,
+                    COUNT(*) FILTER (WHERE ap.status = 'approved') AS approved,
+                    COUNT(*) FILTER (WHERE ap.status = 'rejected') AS rejected,
+                    COUNT(*) FILTER (WHERE ap.status = 'pending') AS pending,
+                    AVG(
+                        EXTRACT(EPOCH FROM (ap.review_timestamp - ap.created_at)) / 3600.0
+                    ) FILTER (WHERE ap.review_timestamp IS NOT NULL) AS avg_review_hours
+                FROM agent_proposals ap
+                JOIN agents a ON a.id = ap.agent_id
+                WHERE ap.created_at >= %s
+                GROUP BY ap.agent_id, a.name
+                ORDER BY total_proposals DESC
+                """,
+                (since,),
+            )
+            stats_rows = cur.fetchall()
+
+            # 3. 킬스위치 적용 에이전트
+            cur.execute(
+                "SELECT id, name, disabled_reason, disabled_at FROM agents WHERE is_disabled = TRUE"
+            )
+            disabled_agents = cur.fetchall()
+
+    series = [
+        {
+            "date": str(r["date"]),
+            "agent_id": str(r["agent_id"]),
+            "agent_name": r["agent_name"],
+            "proposals": int(r["proposals"]),
+            "approved": int(r["approved"]),
+            "approval_rate": round(int(r["approved"]) / int(r["proposals"]) * 100, 1) if r["proposals"] else 0.0,
+        }
+        for r in series_rows
+    ]
+
+    stats_by_agent = []
+    anomalies = []
+    for r in stats_rows:
+        total = int(r["total_proposals"])
+        approved = int(r["approved"])
+        rejected = int(r["rejected"])
+        pending = int(r["pending"])
+        approval_rate = round(approved / total * 100, 1) if total else 0.0
+
+        stats_by_agent.append({
+            "agent_id": str(r["agent_id"]),
+            "agent_name": r["agent_name"],
+            "total_proposals": total,
+            "approved": approved,
+            "rejected": rejected,
+            "pending": pending,
+            "approval_rate": approval_rate,
+            "avg_review_hours": round(float(r["avg_review_hours"]), 1) if r["avg_review_hours"] is not None else None,
+            "top_rejection_reasons": [],
+            "top_document_types": [],
+        })
+
+        # 이상 감지: 거절률 50% 초과 + 10건 이상
+        if total >= 10 and rejected / total >= 0.5:
+            anomalies.append({
+                "agent_id": str(r["agent_id"]),
+                "agent_name": r["agent_name"],
+                "type": "high_rejection_rate",
+                "detail": f"거절률 {round(rejected/total*100,1)}% (총 {total}건 중 {rejected}건 거절)",
+                "detected_at": datetime.now(timezone.utc).isoformat(),
+            })
+
+    for row in disabled_agents:
+        anomalies.append({
+            "agent_id": str(row["id"]),
+            "agent_name": row["name"],
+            "type": "kill_switch_triggered",
+            "detail": row["disabled_reason"] or "관리자에 의해 비활성화됨",
+            "detected_at": row["disabled_at"].isoformat() if row["disabled_at"] else datetime.now(timezone.utc).isoformat(),
+        })
+
+    return success_response(data={
+        "period_days": days,
+        "series": series,
+        "stats_by_agent": stats_by_agent,
+        "anomalies": anomalies,
+    })
 
 
 # ===========================================================================
@@ -3114,6 +3471,7 @@ def _provider_row(r: dict) -> dict:
         "type": r["type"],
         "model_name": r["model_name"],
         "api_base_url": r["api_base_url"],
+        "embed_endpoint": r.get("embed_endpoint"),
         "description": r["description"],
         "is_default": r["is_default"],
         "status": r["status"],
@@ -3146,6 +3504,7 @@ class CreateProviderBody(BaseModel):
     type: str = Field(..., pattern="^(llm|embedding)$")
     model_name: str = Field(..., min_length=1, max_length=255)
     api_base_url: Optional[str] = Field(None, max_length=1024)
+    embed_endpoint: Optional[str] = Field(None, max_length=512)
     api_key: Optional[str] = None
     description: Optional[str] = Field(None, max_length=500)
     is_default: bool = False
@@ -3160,9 +3519,11 @@ class UpdateProviderBody(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=255)
     model_name: Optional[str] = Field(None, min_length=1, max_length=255)
     api_base_url: Optional[str] = Field(None, max_length=1024)
+    embed_endpoint: Optional[str] = Field(None, max_length=512)
     api_key: Optional[str] = None
     description: Optional[str] = Field(None, max_length=500)
     status: Optional[str] = Field(None, pattern="^(active|inactive)$")
+    is_default: Optional[bool] = None
 
     @field_validator("api_key")
     @classmethod
@@ -3182,12 +3543,12 @@ def create_provider(body: CreateProviderBody, _=Depends(require_admin_access)):
             cur.execute(
                 """
                 INSERT INTO llm_providers
-                    (name, type, model_name, api_base_url, api_key, description, is_default)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    (name, type, model_name, api_base_url, embed_endpoint, api_key, description, is_default)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING *
                 """,
                 (body.name, body.type, body.model_name, body.api_base_url,
-                 body.api_key, body.description, body.is_default),
+                 body.embed_endpoint, body.api_key, body.description, body.is_default),
             )
             row = cur.fetchone()
     return success_response(data=_provider_row(row))
@@ -3203,21 +3564,41 @@ def update_provider(
         k: v for k, v in body.model_dump().items()
         if v is not None and not (k == "api_key" and v == "")
     }
-    if not updates:
-        raise HTTPException(status_code=422, detail="변경할 항목이 없습니다.")
+    # is_default 은 별도 처리 — 일반 SET 절에서 제거
+    is_default_requested = updates.pop("is_default", None)
 
-    set_clauses = [f"{k} = %s" for k in updates] + ["updated_at = NOW()"]
-    values = list(updates.values()) + [provider_id]
+    if not updates and is_default_requested is None:
+        raise HTTPException(status_code=422, detail="변경할 항목이 없습니다.")
 
     with get_db() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                f"UPDATE llm_providers SET {', '.join(set_clauses)} WHERE id = %s RETURNING *",
-                values,
-            )
-            row = cur.fetchone()
+            if is_default_requested is True:
+                # 같은 type의 기존 기본 모델 해제 후 이 provider를 기본으로 지정
+                cur.execute(
+                    "UPDATE llm_providers SET is_default = FALSE "
+                    "WHERE type = (SELECT type FROM llm_providers WHERE id = %s)",
+                    (provider_id,),
+                )
+                updates["is_default"] = True
+
+            if updates:
+                set_clauses = [f"{k} = %s" for k in updates] + ["updated_at = NOW()"]
+                values = list(updates.values()) + [provider_id]
+                cur.execute(
+                    f"UPDATE llm_providers SET {', '.join(set_clauses)} WHERE id = %s RETURNING *",
+                    values,
+                )
+                row = cur.fetchone()
+            else:
+                cur.execute("SELECT * FROM llm_providers WHERE id = %s", (provider_id,))
+                row = cur.fetchone()
+
     if not row:
         raise HTTPException(status_code=404, detail="프로바이더를 찾을 수 없습니다.")
+    from app.services.rag_service import invalidate_provider_cache
+    from app.api.v1.system import invalidate_capabilities_cache
+    invalidate_provider_cache()
+    invalidate_capabilities_cache()
     return success_response(data=_provider_row(row))
 
 
@@ -3258,6 +3639,10 @@ def set_default_provider(
                 (provider_id,),
             )
             row = cur.fetchone()
+    from app.services.rag_service import invalidate_provider_cache
+    from app.api.v1.system import invalidate_capabilities_cache
+    invalidate_provider_cache()
+    invalidate_capabilities_cache()
     return success_response(data=_provider_row(row))
 
 
@@ -3273,7 +3658,6 @@ def test_provider(provider_id: str, _=Depends(require_admin_access)):
             if not provider:
                 raise HTTPException(status_code=404, detail="프로바이더를 찾을 수 없습니다.")
 
-    # 실제 연결 테스트 (api_base_url이 있으면 /models 엔드포인트 GET, 없으면 mock)
     import httpx
     start = time.monotonic()
     success_flag = False
@@ -3283,41 +3667,98 @@ def test_provider(provider_id: str, _=Depends(require_admin_access)):
 
     try:
         base_url = provider["api_base_url"]
+        embed_endpoint = provider.get("embed_endpoint")
+        provider_type = provider.get("type", "llm")
         if base_url:
             headers = {}
             if provider["api_key"]:
                 headers["Authorization"] = f"Bearer {provider['api_key']}"
-            with httpx.Client(timeout=10.0) as client:
-                resp = client.get(base_url.rstrip("/") + "/models", headers=headers)
-            http_status = resp.status_code
-            success_flag = resp.status_code < 400
-            if not success_flag:
-                _status_labels = {
-                    400: "잘못된 요청",
-                    401: "인증 실패 — API Key를 확인하세요",
-                    403: "접근 권한 없음",
-                    404: "엔드포인트를 찾을 수 없음 — API Base URL을 확인하세요",
-                    429: "요청 횟수 초과 (Rate Limit)",
-                    500: "서버 내부 오류",
-                    502: "게이트웨이 오류",
-                    503: "서비스 이용 불가",
-                }
-                error_msg = _status_labels.get(resp.status_code, f"HTTP {resp.status_code} 오류")
-                # 응답 바디에서 오류 메시지 추출
-                try:
-                    body = resp.json()
-                    if isinstance(body, dict):
-                        error_detail = (
-                            body.get("error", {}).get("message")
-                            or body.get("message")
-                            or body.get("detail")
-                            or resp.text[:500]
+
+            # embedding + embed_endpoint: 실제 임베딩 요청 POST
+            if provider_type == "embedding" and embed_endpoint:
+                url = embed_endpoint if embed_endpoint.startswith("http") else base_url.rstrip("/") + embed_endpoint
+                with httpx.Client(timeout=15.0) as client:
+                    resp = client.post(
+                        url,
+                        json={"texts": ["test"]},
+                        headers={**headers, "Content-Type": "application/json"},
+                    )
+                http_status = resp.status_code
+                if resp.status_code < 400:
+                    try:
+                        body_json = resp.json()
+                        # 응답이 벡터 데이터를 포함하는지 확인
+                        has_vectors = (
+                            isinstance(body_json, list)
+                            or (isinstance(body_json, dict) and (
+                                "embeddings" in body_json
+                                or "data" in body_json
+                                or "vectors" in body_json
+                            ))
                         )
-                    else:
-                        error_detail = resp.text[:500]
-                except Exception as exc:
-                    logger.debug("webhook 응답 파싱 실패: %s", exc)
-                    error_detail = resp.text[:500] if resp.text else None
+                        success_flag = has_vectors
+                        if not success_flag:
+                            error_msg = "임베딩 응답 형식 오류"
+                            error_detail = f"예상 형식(list 또는 embeddings/data/vectors 키)이 아닙니다: {str(body_json)[:300]}"
+                    except Exception:
+                        success_flag = True  # JSON 파싱 실패해도 2xx면 성공으로 간주
+                else:
+                    success_flag = False
+            else:
+                # provider type에 따라 probe 엔드포인트 결정
+                # embedding: /health → /info → /v1/models 순으로 시도
+                # llm: /v1/models → /models 순으로 시도
+                if provider_type == "embedding":
+                    _probe_paths = ["/health", "/info", "/v1/models", "/models"]
+                else:
+                    _probe_paths = ["/v1/models", "/models", "/health"]
+
+                resp = None
+                with httpx.Client(timeout=10.0) as client:
+                    for _path in _probe_paths:
+                        try:
+                            _r = client.get(base_url.rstrip("/") + _path, headers=headers)
+                            if _r.status_code < 400:
+                                resp = _r
+                                break
+                            elif _r.status_code not in (404, 405):
+                                resp = _r
+                                break
+                        except (httpx.ConnectError, httpx.TimeoutException):
+                            raise
+                        except Exception:
+                            continue
+                if resp is None:
+                    raise httpx.ConnectError(f"접근 가능한 엔드포인트가 없습니다: {base_url}")
+
+                http_status = resp.status_code
+                success_flag = resp.status_code < 400
+                if not success_flag:
+                    _status_labels = {
+                        400: "잘못된 요청",
+                        401: "인증 실패 — API Key를 확인하세요",
+                        403: "접근 권한 없음",
+                        404: "엔드포인트를 찾을 수 없음 — API Base URL을 확인하세요",
+                        429: "요청 횟수 초과 (Rate Limit)",
+                        500: "서버 내부 오류",
+                        502: "게이트웨이 오류",
+                        503: "서비스 이용 불가",
+                    }
+                    error_msg = _status_labels.get(resp.status_code, f"HTTP {resp.status_code} 오류")
+                    try:
+                        _rbody = resp.json()
+                        if isinstance(_rbody, dict):
+                            error_detail = (
+                                _rbody.get("error", {}).get("message")
+                                or _rbody.get("message")
+                                or _rbody.get("detail")
+                                or resp.text[:500]
+                            )
+                        else:
+                            error_detail = resp.text[:500]
+                    except Exception as exc:
+                        logger.debug("probe 응답 파싱 실패: %s", exc)
+                        error_detail = resp.text[:500] if resp.text else None
         else:
             success_flag = True  # URL 미설정 시 mock 성공 처리
     except UnicodeEncodeError:
@@ -3350,6 +3791,9 @@ def test_provider(provider_id: str, _=Depends(require_admin_access)):
                  "active" if success_flag else "error",
                  provider_id),
             )
+
+    from app.api.v1.system import invalidate_capabilities_cache
+    invalidate_capabilities_cache()
 
     return success_response(data={
         "success": success_flag,
