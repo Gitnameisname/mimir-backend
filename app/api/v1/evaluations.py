@@ -23,7 +23,7 @@ from app.api.auth.dependencies import resolve_current_actor
 from app.api.auth.models import ActorContext
 from app.api.responses import list_response, success_response
 from app.audit.emitter import audit_emitter
-from app.db.connection import get_db
+from app.db.connection import db_dependency
 from app.repositories.evaluation_repository import (
     EvaluationResultRecordRepository,
     EvaluationRunRepository,
@@ -76,7 +76,7 @@ def run_evaluation(
     request: EvaluationRunRequest,
     background_tasks: BackgroundTasks,
     actor: ActorContext = Depends(resolve_current_actor),
-    conn=Depends(get_db),
+    conn=Depends(db_dependency),
 ):
     scope_id = _require_scope(actor)
     if getattr(actor, "role", None) not in _WRITE_ROLES:
@@ -100,10 +100,11 @@ def run_evaluation(
         conn=conn,
     )
 
-    audit_emitter.emit(
+    # emit_for_actor: action/result 기본값 처리 + ActorType enum → Literal 변환을 헬퍼가 담당.
+    audit_emitter.emit_for_actor(
         event_type="evaluation.run.started",
-        actor_id=str(actor.actor_id),
-        actor_type=actor.actor_type,
+        action="evaluation.run.start",
+        actor=actor,
         resource_type="evaluation_run",
         resource_id=run["id"],
         metadata={
@@ -133,21 +134,24 @@ def list_evaluations(
     limit: int = Query(20, ge=1, le=100),
     status: Optional[str] = Query(None),
     actor: ActorContext = Depends(resolve_current_actor),
-    conn=Depends(get_db),
+    conn=Depends(db_dependency),
 ):
     scope_id = _require_scope(actor)
     run_repo = EvaluationRunRepository(conn)
     items, total = run_repo.list_by_scope(scope_id, offset=offset, limit=limit, status=status)
 
-    audit_emitter.emit(
+    audit_emitter.emit_for_actor(
         event_type="evaluation.run.list",
-        actor_id=str(actor.actor_id),
-        actor_type=actor.actor_type,
+        action="evaluation.run.list",
+        actor=actor,
         resource_type="evaluation_run",
         resource_id=None,
         metadata={"total": total},
     )
-    return list_response(items, total=total, offset=offset, limit=limit)
+    # offset/limit → page/page_size 변환: list_response helper 는 page 기반 pagination 만 지원.
+    page_size = max(limit, 1)
+    page = (offset // page_size) + 1
+    return list_response(items, total=total, page=page, page_size=page_size)
 
 
 # ---------------------------------------------------------------------------
@@ -158,7 +162,7 @@ def list_evaluations(
 def get_evaluation(
     eval_id: str,
     actor: ActorContext = Depends(resolve_current_actor),
-    conn=Depends(get_db),
+    conn=Depends(db_dependency),
 ):
     scope_id = _require_scope(actor)
     run_repo = EvaluationRunRepository(conn)
@@ -170,10 +174,10 @@ def get_evaluation(
 
     results = result_repo.list_by_run(eval_id)
 
-    audit_emitter.emit(
+    audit_emitter.emit_for_actor(
         event_type="evaluation.run.read",
-        actor_id=str(actor.actor_id),
-        actor_type=actor.actor_type,
+        action="evaluation.run.read",
+        actor=actor,
         resource_type="evaluation_run",
         resource_id=eval_id,
         metadata={},
@@ -190,7 +194,7 @@ def compare_evaluations(
     eval_id: str,
     eval_id2: str = Query(..., description="두 번째 평가 ID"),
     actor: ActorContext = Depends(resolve_current_actor),
-    conn=Depends(get_db),
+    conn=Depends(db_dependency),
 ):
     scope_id = _require_scope(actor)
     run_repo = EvaluationRunRepository(conn)
@@ -232,10 +236,10 @@ def compare_evaluations(
         "improvement": (run2.get("overall_score") or 0) - (run1.get("overall_score") or 0),
     }
 
-    audit_emitter.emit(
+    audit_emitter.emit_for_actor(
         event_type="evaluation.run.compare",
-        actor_id=str(actor.actor_id),
-        actor_type=actor.actor_type,
+        action="evaluation.run.compare",
+        actor=actor,
         resource_type="evaluation_run",
         resource_id=eval_id,
         metadata={"eval_id2": eval_id2},

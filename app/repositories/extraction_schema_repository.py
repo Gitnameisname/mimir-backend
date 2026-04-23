@@ -182,23 +182,39 @@ class ExtractionSchemaRepository:
         self,
         doc_type_code: str,
         *,
+        include_deprecated: bool = False,
         scope_profile_id: Optional[UUID] = None,
     ) -> Optional[ExtractionTargetSchema]:
-        """DocumentType별 최신(미삭제) 스키마 조회."""
+        """DocumentType별 최신(미삭제) 스키마 조회.
+
+        include_deprecated=False(기본)면 is_deprecated=TRUE 스키마는 제외한다.
+        scope_profile_id 지정 시 해당 scope 로 필터링한다 (S2 원칙 ⑥ ACL 슬롯).
+        """
+        conditions = ["doc_type_code = %s", "is_soft_deleted = FALSE"]
+        params: list = [doc_type_code]
+
+        if not include_deprecated:
+            conditions.append("is_deprecated = FALSE")
+
+        if scope_profile_id is not None:
+            conditions.append("scope_profile_id = %s")
+            params.append(str(scope_profile_id))
+
+        where = " AND ".join(conditions)
+
         with self._conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT id, doc_type_code, version, fields_json, extra_metadata,
                        is_deprecated, deprecation_reason,
                        created_at, updated_at, created_by, updated_by,
                        scope_profile_id
                 FROM extraction_schemas
-                WHERE doc_type_code = %s
-                  AND is_soft_deleted = FALSE
+                WHERE {where}
                 ORDER BY version DESC
                 LIMIT 1
                 """,
-                (doc_type_code,),
+                params,
             )
             row = cur.fetchone()
         return self._row_to_schema(row) if row else None
@@ -225,19 +241,79 @@ class ExtractionSchemaRepository:
             row = cur.fetchone()
         return self._row_to_schema(row) if row else None
 
+    def get_version(
+        self,
+        doc_type_code: str,
+        version: int,
+        *,
+        scope_profile_id: Optional[UUID] = None,
+    ) -> Optional[ExtractionSchemaVersion]:
+        """특정 버전 이력을 extraction_schema_versions 에서 직접 조회.
+
+        scope_profile_id 지정 시 같은 scope 의 스키마에 속한 버전만 조회한다.
+        P4-A: diff/rollback 이 과거 fields 값을 획득하는 경로.
+        """
+        conditions = ["doc_type_code = %s", "is_soft_deleted = FALSE"]
+        params: list = [doc_type_code]
+
+        if scope_profile_id is not None:
+            conditions.append("scope_profile_id = %s")
+            params.append(str(scope_profile_id))
+
+        where = " AND ".join(conditions)
+
+        with self._conn.cursor() as cur:
+            # scope 가드를 포함하여 schema_id 확보
+            cur.execute(
+                f"SELECT id FROM extraction_schemas WHERE {where} ORDER BY version DESC LIMIT 1",
+                params,
+            )
+            schema_row = cur.fetchone()
+            if not schema_row:
+                return None
+            schema_id = schema_row["id"]
+
+            cur.execute(
+                """
+                SELECT id, schema_id, version, fields_json, extra_metadata,
+                       is_deprecated, deprecation_reason,
+                       change_summary, changed_fields, created_at, created_by
+                FROM extraction_schema_versions
+                WHERE schema_id = %s AND version = %s
+                LIMIT 1
+                """,
+                (str(schema_id), version),
+            )
+            row = cur.fetchone()
+        return self._row_to_version(row) if row else None
+
     def get_versions(
         self,
         doc_type_code: str,
         *,
         limit: int = 10,
         offset: int = 0,
+        scope_profile_id: Optional[UUID] = None,
     ) -> List[ExtractionSchemaVersion]:
-        """버전 이력 조회 (최신순)."""
+        """버전 이력 조회 (최신순).
+
+        scope_profile_id 지정 시 해당 Scope 에 속하는 스키마의 이력만 반환한다.
+        S2 원칙 ⑥ — 타 Scope 의 이력을 열람할 수 없도록 한다.
+        """
+        conditions = ["doc_type_code = %s", "is_soft_deleted = FALSE"]
+        params: list = [doc_type_code]
+
+        if scope_profile_id is not None:
+            conditions.append("scope_profile_id = %s")
+            params.append(str(scope_profile_id))
+
+        where = " AND ".join(conditions)
+
         with self._conn.cursor() as cur:
-            # schema_id 먼저 조회
+            # schema_id 먼저 조회 — scope 가드를 여기서 적용해 없는 경우 빈 목록 반환.
             cur.execute(
-                "SELECT id FROM extraction_schemas WHERE doc_type_code = %s ORDER BY version DESC LIMIT 1",
-                (doc_type_code,),
+                f"SELECT id FROM extraction_schemas WHERE {where} ORDER BY version DESC LIMIT 1",
+                params,
             )
             schema_row = cur.fetchone()
             if not schema_row:
@@ -412,6 +488,149 @@ class ExtractionSchemaRepository:
                     change_summary or "필드 업데이트",
                     json.dumps(changed),
                     now, actor_info.actor_id,
+                ),
+            )
+
+        return self._row_to_schema(updated_row)
+
+    # ------------------------------------------------------------------
+    # Rollback (P4-B)
+    # ------------------------------------------------------------------
+
+    def rollback_to_version(
+        self,
+        doc_type_code: str,
+        *,
+        target_version: int,
+        actor_info: ActorInfo,
+        change_summary: Optional[str] = None,
+        scope_profile_id: Optional[UUID] = None,
+    ) -> ExtractionTargetSchema:
+        """target_version 의 fields 를 복사하여 새 버전을 생성.
+
+        - 원칙: 버전 이력은 immutable. 되돌리기는 "과거 버전 복원" 이 아니라
+          "과거 버전의 fields 로 새 버전을 만드는" 것이다.
+        - scope_profile_id 지정 시 같은 scope 의 스키마에만 적용 (S2 ⑥).
+        - target_version 이 현재 최신 버전과 같거나 더 최근(미래)이면 거절.
+        - target_version 의 fields 가 비어 있으면 거절 (모델 불변식 유지).
+        - 폐기(deprecated) 된 스키마는 롤백 불가.
+        - change_summary 가 없으면 "v{N} 로 되돌리기" 가 자동 기록됨.
+        """
+        now = datetime.now(timezone.utc)
+
+        conditions = ["doc_type_code = %s", "is_soft_deleted = FALSE"]
+        params: list = [doc_type_code]
+        if scope_profile_id is not None:
+            conditions.append("scope_profile_id = %s")
+            params.append(str(scope_profile_id))
+        where = " AND ".join(conditions)
+
+        with self._conn.cursor() as cur:
+            # 현재 스키마 잠금 겸 조회
+            cur.execute(
+                f"""
+                SELECT id, version, is_deprecated
+                FROM extraction_schemas
+                WHERE {where}
+                ORDER BY version DESC LIMIT 1
+                FOR UPDATE
+                """,
+                params,
+            )
+            row = cur.fetchone()
+            if not row:
+                raise ExtractionSchemaNotFoundError(
+                    f"DocumentType '{doc_type_code}'에 대한 추출 스키마를 찾을 수 없음"
+                )
+            if row["is_deprecated"]:
+                raise ValueError("폐기된 스키마는 되돌릴 수 없음")
+
+            schema_id = row["id"]
+            current_version = row["version"]
+
+            if target_version < 1 or target_version >= current_version:
+                raise ValueError(
+                    f"target_version 은 1 이상이고 현재 버전({current_version}) 보다 작아야 함"
+                )
+
+            # 타겟 버전의 fields 획득
+            cur.execute(
+                """
+                SELECT fields_json
+                FROM extraction_schema_versions
+                WHERE schema_id = %s AND version = %s
+                LIMIT 1
+                """,
+                (str(schema_id), target_version),
+            )
+            target_row = cur.fetchone()
+            if not target_row:
+                raise ExtractionSchemaNotFoundError(
+                    f"target_version={target_version} 버전 이력을 찾을 수 없음"
+                )
+
+            raw_fields = target_row["fields_json"]
+            target_fields_map: dict = (
+                raw_fields if isinstance(raw_fields, dict) else json.loads(raw_fields)
+            )
+            if not target_fields_map:
+                raise ValueError("target_version 의 fields 가 비어 있어 되돌릴 수 없음")
+
+            fields_json = json.dumps(target_fields_map, ensure_ascii=False)
+            new_version = current_version + 1
+
+            # 스키마 레코드 갱신
+            cur.execute(
+                """
+                UPDATE extraction_schemas
+                SET version = %s, fields_json = %s::jsonb,
+                    updated_at = %s, updated_by = %s
+                WHERE id = %s
+                RETURNING id, doc_type_code, version, fields_json, extra_metadata,
+                          is_deprecated, deprecation_reason,
+                          created_at, updated_at, created_by, updated_by, scope_profile_id
+                """,
+                (new_version, fields_json, now, actor_info.actor_id, str(schema_id)),
+            )
+            updated_row = cur.fetchone()
+
+            # changed_fields: 타겟 vs 현재 최신의 키 심볼릭 차이
+            cur.execute(
+                "SELECT fields_json FROM extraction_schema_versions WHERE schema_id = %s AND version = %s",
+                (str(schema_id), current_version),
+            )
+            prev_raw = cur.fetchone()
+            prev_fields_map: dict = {}
+            if prev_raw:
+                p = prev_raw["fields_json"]
+                prev_fields_map = p if isinstance(p, dict) else json.loads(p)
+            changed = sorted(
+                set(prev_fields_map.keys()).symmetric_difference(target_fields_map.keys())
+            )
+
+            # 버전 이력 추가 (rollback 마킹은 change_summary + extra_metadata 로)
+            ver_id = str(uuid4())
+            summary = (
+                change_summary
+                if change_summary and change_summary.strip()
+                else f"v{target_version} 로 되돌리기"
+            )
+            rollback_meta = json.dumps(
+                {"rolled_back_from_version": target_version},
+                ensure_ascii=False,
+            )
+            cur.execute(
+                """
+                INSERT INTO extraction_schema_versions
+                    (id, schema_id, version, fields_json, extra_metadata,
+                     is_deprecated, change_summary, changed_fields, created_at, created_by)
+                VALUES
+                    (%s, %s, %s, %s::jsonb, %s::jsonb,
+                     FALSE, %s, %s::jsonb, %s, %s)
+                """,
+                (
+                    ver_id, str(schema_id), new_version, fields_json, rollback_meta,
+                    summary, json.dumps(changed), now, actor_info.actor_id,
                 ),
             )
 

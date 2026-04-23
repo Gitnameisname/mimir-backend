@@ -598,3 +598,311 @@ class TestExtractionTargetSchema:
         restored = ExtractionTargetSchema.model_validate_json(json_str)
         assert restored.doc_type_code == schema.doc_type_code
         assert "responsible_dept" in restored.fields
+
+
+# ---------------------------------------------------------------------------
+# TestDefaultValueCompatibility — P3 후속-A
+#   default_value ↔ field_type 호환성 검증 (서버측 Pydantic 계층).
+# ---------------------------------------------------------------------------
+
+class TestDefaultValueCompatibility:
+    """default_value 가 field_type 과 호환되지 않으면 거절되어야 함.
+
+    프론트 DefaultValueWidget 이 UI 경고를 띄우지만 우회 가능 (JSON 모드, API 직접 호출).
+    서버에서 model_validator 로 방어한다.
+    """
+
+    # --- none allowed across all types ------------------------------------
+
+    def test_none_is_always_allowed(self):
+        for ft in ("string", "number", "boolean", "date", "array"):
+            f = ExtractionFieldDef(
+                field_name="f",
+                field_type=ft,
+                required=False,
+                description="설명",
+                default_value=None,
+            )
+            assert f.default_value is None
+
+    # --- string -----------------------------------------------------------
+
+    def test_string_accepts_string_default(self):
+        f = ExtractionFieldDef(
+            field_name="currency",
+            field_type="string",
+            required=False,
+            description="통화",
+            default_value="KRW",
+        )
+        assert f.default_value == "KRW"
+
+    def test_string_rejects_int_default(self):
+        with pytest.raises(ValidationError, match="문자열이어야"):
+            ExtractionFieldDef(
+                field_name="currency",
+                field_type="string",
+                required=False,
+                description="통화",
+                default_value=1234,
+            )
+
+    def test_string_rejects_bool_default(self):
+        with pytest.raises(ValidationError, match="문자열이어야"):
+            ExtractionFieldDef(
+                field_name="currency",
+                field_type="string",
+                required=False,
+                description="통화",
+                default_value=True,
+            )
+
+    # --- number -----------------------------------------------------------
+
+    def test_number_accepts_int(self):
+        f = ExtractionFieldDef(
+            field_name="amount",
+            field_type="number",
+            required=False,
+            description="금액",
+            default_value=42,
+        )
+        assert f.default_value == 42
+
+    def test_number_accepts_float(self):
+        f = ExtractionFieldDef(
+            field_name="ratio",
+            field_type="number",
+            required=False,
+            description="비율",
+            default_value=3.14,
+        )
+        assert f.default_value == 3.14
+
+    def test_number_rejects_string(self):
+        with pytest.raises(ValidationError, match="숫자여야"):
+            ExtractionFieldDef(
+                field_name="amount",
+                field_type="number",
+                required=False,
+                description="금액",
+                default_value="42",
+            )
+
+    def test_number_rejects_bool(self):
+        # bool 은 int 의 서브클래스지만 number 로는 거절해야 함.
+        with pytest.raises(ValidationError, match="숫자여야"):
+            ExtractionFieldDef(
+                field_name="amount",
+                field_type="number",
+                required=False,
+                description="금액",
+                default_value=True,
+            )
+
+    def test_number_default_below_min_rejected(self):
+        with pytest.raises(ValidationError, match="min_value"):
+            ExtractionFieldDef(
+                field_name="amount",
+                field_type="number",
+                required=False,
+                description="금액",
+                min_value=0.0,
+                max_value=100.0,
+                default_value=-1,
+            )
+
+    def test_number_default_above_max_rejected(self):
+        with pytest.raises(ValidationError, match="max_value"):
+            ExtractionFieldDef(
+                field_name="amount",
+                field_type="number",
+                required=False,
+                description="금액",
+                min_value=0.0,
+                max_value=100.0,
+                default_value=999,
+            )
+
+    # --- boolean ----------------------------------------------------------
+
+    def test_boolean_accepts_true(self):
+        f = ExtractionFieldDef(
+            field_name="is_active",
+            field_type="boolean",
+            required=False,
+            description="활성 여부",
+            default_value=True,
+        )
+        assert f.default_value is True
+
+    def test_boolean_accepts_false(self):
+        f = ExtractionFieldDef(
+            field_name="is_active",
+            field_type="boolean",
+            required=False,
+            description="활성 여부",
+            default_value=False,
+        )
+        assert f.default_value is False
+
+    def test_boolean_rejects_int(self):
+        with pytest.raises(ValidationError, match="bool"):
+            ExtractionFieldDef(
+                field_name="is_active",
+                field_type="boolean",
+                required=False,
+                description="활성 여부",
+                default_value=1,
+            )
+
+    def test_boolean_rejects_string(self):
+        with pytest.raises(ValidationError, match="bool"):
+            ExtractionFieldDef(
+                field_name="is_active",
+                field_type="boolean",
+                required=False,
+                description="활성 여부",
+                default_value="true",
+            )
+
+    # --- date -------------------------------------------------------------
+
+    def test_date_accepts_matching_format(self):
+        f = ExtractionFieldDef(
+            field_name="signed_on",
+            field_type="date",
+            required=False,
+            description="서명일",
+            date_format="YYYY-MM-DD",
+            default_value="2026-04-21",
+        )
+        assert f.default_value == "2026-04-21"
+
+    def test_date_rejects_non_string(self):
+        with pytest.raises(ValidationError, match="문자열이어야"):
+            ExtractionFieldDef(
+                field_name="signed_on",
+                field_type="date",
+                required=False,
+                description="서명일",
+                date_format="YYYY-MM-DD",
+                default_value=20260421,
+            )
+
+    def test_date_rejects_wrong_format(self):
+        with pytest.raises(ValidationError, match="형식"):
+            ExtractionFieldDef(
+                field_name="signed_on",
+                field_type="date",
+                required=False,
+                description="서명일",
+                date_format="YYYY-MM-DD",
+                default_value="04/21/2026",
+            )
+
+    # --- enum -------------------------------------------------------------
+
+    def test_enum_accepts_member(self):
+        f = ExtractionFieldDef(
+            field_name="status",
+            field_type="enum",
+            required=False,
+            description="상태",
+            enum_values=["draft", "active", "archived"],
+            default_value="active",
+        )
+        assert f.default_value == "active"
+
+    def test_enum_rejects_non_member(self):
+        with pytest.raises(ValidationError, match="enum_values 에 없음"):
+            ExtractionFieldDef(
+                field_name="status",
+                field_type="enum",
+                required=False,
+                description="상태",
+                enum_values=["draft", "active", "archived"],
+                default_value="deleted",
+            )
+
+    def test_enum_rejects_non_string(self):
+        with pytest.raises(ValidationError, match="문자열이어야"):
+            ExtractionFieldDef(
+                field_name="status",
+                field_type="enum",
+                required=False,
+                description="상태",
+                enum_values=["draft", "active"],
+                default_value=1,
+            )
+
+    # --- array ------------------------------------------------------------
+
+    def test_array_accepts_list(self):
+        f = ExtractionFieldDef(
+            field_name="tags",
+            field_type="array",
+            required=False,
+            description="태그 목록",
+            default_value=["legal", "finance"],
+        )
+        assert f.default_value == ["legal", "finance"]
+
+    def test_array_rejects_dict(self):
+        with pytest.raises(ValidationError, match="리스트여야"):
+            ExtractionFieldDef(
+                field_name="tags",
+                field_type="array",
+                required=False,
+                description="태그 목록",
+                default_value={"a": 1},
+            )
+
+    def test_array_rejects_string(self):
+        with pytest.raises(ValidationError, match="리스트여야"):
+            ExtractionFieldDef(
+                field_name="tags",
+                field_type="array",
+                required=False,
+                description="태그 목록",
+                default_value="legal,finance",
+            )
+
+    # --- object -----------------------------------------------------------
+
+    def test_object_accepts_dict_default(self):
+        # object 는 nested_schema 가 필수이므로 함께 지정.
+        f = ExtractionFieldDef(
+            field_name="party",
+            field_type="object",
+            required=False,
+            description="당사자",
+            nested_schema={
+                "name": ExtractionFieldDef(
+                    field_name="name",
+                    field_type="string",
+                    required=True,
+                    description="이름",
+                )
+            },
+            default_value={"name": "Acme"},
+        )
+        assert f.default_value == {"name": "Acme"}
+
+    def test_object_rejects_list_default(self):
+        with pytest.raises(ValidationError, match="객체"):
+            ExtractionFieldDef(
+                field_name="party",
+                field_type="object",
+                required=False,
+                description="당사자",
+                nested_schema={
+                    "name": ExtractionFieldDef(
+                        field_name="name",
+                        field_type="string",
+                        required=True,
+                        description="이름",
+                    )
+                },
+                default_value=["Acme"],
+            )

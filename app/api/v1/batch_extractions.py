@@ -28,7 +28,7 @@ from app.api.auth.dependencies import resolve_current_actor
 from app.api.auth.models import ActorContext
 from app.api.responses import success_response
 from app.audit.emitter import audit_emitter
-from app.db.connection import get_db
+from app.db.connection import db_dependency, get_db
 from app.models.batch_extraction import (
     BatchJobStatus,
     BatchRetryRequest,
@@ -83,7 +83,7 @@ def start_batch_retry(
     req: BatchRetryRequest,
     background_tasks: BackgroundTasks,
     actor: ActorContext = Depends(resolve_current_actor),
-    conn=Depends(get_db),
+    conn=Depends(db_dependency),
 ):
     """스키마 변경 후 기존 승인 추출을 일괄 재실행한다."""
     if getattr(actor, "role", None) not in _WRITE_ROLES:
@@ -121,10 +121,10 @@ def start_batch_retry(
         llm_provider=_get_llm_provider(),
     )
 
-    audit_emitter.emit(
+    audit_emitter.emit_for_actor(
         event_type="extraction.batch_retry.started",
-        actor_id=actor_id,
-        actor_type=actor.actor_type or "user",
+        action="extraction.batch_retry.start",
+        actor=actor,
         resource_type="batch_extraction_job",
         resource_id=str(job.id),
         metadata={
@@ -150,7 +150,7 @@ def start_sample_retry(
     req: SampleRetryRequest,
     background_tasks: BackgroundTasks,
     actor: ActorContext = Depends(resolve_current_actor),
-    conn=Depends(get_db),
+    conn=Depends(db_dependency),
 ):
     """새 모델 배포 후 N개 샘플 문서로 성능을 검증한다."""
     if getattr(actor, "role", None) not in _WRITE_ROLES:
@@ -185,10 +185,10 @@ def start_sample_retry(
         llm_provider=_get_llm_provider(),
     )
 
-    audit_emitter.emit(
+    audit_emitter.emit_for_actor(
         event_type="extraction.sample_retry.started",
-        actor_id=actor_id,
-        actor_type=actor.actor_type or "user",
+        action="extraction.sample_retry.start",
+        actor=actor,
         resource_type="batch_extraction_job",
         resource_id=str(job.id),
         metadata={
@@ -211,7 +211,7 @@ def start_sample_retry(
 def get_batch_job(
     job_id: UUID,
     actor: ActorContext = Depends(resolve_current_actor),
-    conn=Depends(get_db),
+    conn=Depends(db_dependency),
 ):
     repo = BatchExtractionJobRepository(conn)
     job = repo.get_by_id(job_id)
@@ -240,7 +240,7 @@ def cancel_batch_job(
     job_id: UUID,
     req: CancelBatchRequest,
     actor: ActorContext = Depends(resolve_current_actor),
-    conn=Depends(get_db),
+    conn=Depends(db_dependency),
 ):
     repo = BatchExtractionJobRepository(conn)
     job = repo.get_by_id(job_id)
@@ -262,10 +262,10 @@ def cancel_batch_job(
         raise HTTPException(409, "취소 요청에 실패했습니다.")
     conn.commit()
 
-    audit_emitter.emit(
+    audit_emitter.emit_for_actor(
         event_type="extraction.batch_retry.cancel_requested",
-        actor_id=_actor_id(actor),
-        actor_type=actor.actor_type or "user",
+        action="extraction.batch_retry.cancel",
+        actor=actor,
         resource_type="batch_extraction_job",
         resource_id=str(job_id),
         metadata={"reason": req.reason},

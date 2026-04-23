@@ -35,7 +35,7 @@ from app.api.auth.dependencies import resolve_current_actor
 from app.api.auth.models import ActorContext, ActorType
 from app.api.responses import SuccessResponse, list_response, success_response
 from app.audit.emitter import audit_emitter
-from app.db.connection import get_db
+from app.db.connection import db_dependency, get_db
 from app.models.approved_extraction import (
     ApproveExtractionRequest,
     ApprovedExtractionResponse,
@@ -558,7 +558,7 @@ from app.services.extraction.span_calculator import SpanVisualizationConverter  
 def get_extraction_spans(
     extraction_id: UUID,
     actor: ActorContext = Depends(resolve_current_actor),
-    conn=Depends(get_db),
+    conn=Depends(db_dependency),
 ):
     cand_repo = ExtractionCandidateRepository(conn)
     candidate = cand_repo.get_by_id(extraction_id)
@@ -600,7 +600,7 @@ def get_extraction_spans(
 def get_extraction_highlights(
     extraction_id: UUID,
     actor: ActorContext = Depends(resolve_current_actor),
-    conn=Depends(get_db),
+    conn=Depends(db_dependency),
 ):
     cand_repo = ExtractionCandidateRepository(conn)
     candidate = cand_repo.get_by_id(extraction_id)
@@ -666,7 +666,7 @@ def verify_extraction(
     extraction_id: UUID,
     req: VerifyExtractionRequest,
     actor: ActorContext = Depends(resolve_current_actor),
-    conn=Depends(get_db),
+    conn=Depends(db_dependency),
 ):
     cand_repo = ExtractionCandidateRepository(conn)
     candidate = cand_repo.get_by_id(extraction_id)
@@ -701,10 +701,10 @@ def verify_extraction(
     saved_vr = vr_repo.create(vr)
     conn.commit()
 
-    audit_emitter.emit(
+    audit_emitter.emit_for_actor(
         event_type="extraction.verified",
-        actor_id=actor_id,
-        actor_type=actor.actor_type or "user",
+        action="extraction.verify",
+        actor=actor,
         resource_type="extraction_candidate",
         resource_id=str(extraction_id),
         metadata={"match_status": vr.match_status.value, "field_accuracy": vr.field_accuracy},
@@ -724,7 +724,7 @@ def verify_extraction(
 def get_extraction_audit(
     extraction_id: UUID,
     actor: ActorContext = Depends(resolve_current_actor),
-    conn=Depends(get_db),
+    conn=Depends(db_dependency),
 ):
     cand_repo = ExtractionCandidateRepository(conn)
     candidate = cand_repo.get_by_id(extraction_id)
@@ -768,7 +768,7 @@ def get_verification_results(
     extraction_id: UUID,
     limit: int = Query(default=20, ge=1, le=100),
     actor: ActorContext = Depends(resolve_current_actor),
-    conn=Depends(get_db),
+    conn=Depends(db_dependency),
 ):
     cand_repo = ExtractionCandidateRepository(conn)
     candidate = cand_repo.get_by_id(extraction_id)

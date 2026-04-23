@@ -1409,12 +1409,32 @@ def delete_role(role_id: str, _=Depends(require_admin_access)):
 # P0 쓰기 API — DocumentType 관리 (POST/PATCH/DELETE)
 # ===========================================================================
 
+_DOC_TYPE_CODE_RE = re.compile(r"^[A-Z][A-Z0-9_-]*$")
+
+
 class CreateDocumentTypeBody(BaseModel):
     type_code: str
     display_name: str
     description: Optional[str] = None
     schema_fields: list[dict[str, Any]] = []
     plugin_config: dict[str, Any] = {}
+
+    @field_validator("type_code")
+    @classmethod
+    def _validate_type_code(cls, v: str) -> str:
+        # P7-1-b: document_types.type_code 는 PK 로 사용되고 extraction_schemas 등
+        # 다수 테이블이 FK 로 참조한다. 소문자가 섞여 저장되면 "동일 의미, 다른 값"
+        # 문제를 유발하므로 대문자로 정규화하고 패턴을 강제한다. 프론트
+        # CreateDocTypeModal 이 이미 .toUpperCase() 하지만 다른 API 소비자(스크립트,
+        # MCP 에이전트) 를 위한 defense in depth.
+        v = v.strip().upper()
+        if not _DOC_TYPE_CODE_RE.match(v):
+            raise ValueError(
+                "type_code 는 영문 대문자로 시작하고 대문자/숫자/하이픈/언더스코어만 허용됨"
+            )
+        if len(v) > 100:
+            raise ValueError("type_code 는 100자 이하여야 함")
+        return v
 
 
 class UpdateDocumentTypeBody(BaseModel):

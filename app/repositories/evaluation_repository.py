@@ -51,7 +51,7 @@ class EvaluationRunRepository:
             )
             row = cur.fetchone()
         logger.info("Created evaluation_run %s", run_id)
-        return self._row_to_dict(cur, row)
+        return self._row_to_dict(row)
 
     def get_by_id(self, run_id: str, scope_id: str) -> Optional[Dict[str, Any]]:
         with self._conn.cursor() as cur:
@@ -69,7 +69,7 @@ class EvaluationRunRepository:
             row = cur.fetchone()
         if not row:
             return None
-        return self._row_to_dict(cur, row)
+        return self._row_to_dict(row)
 
     def list_by_scope(
         self,
@@ -86,8 +86,8 @@ class EvaluationRunRepository:
             params.append(status)
 
         with self._conn.cursor() as cur:
-            cur.execute(f"SELECT COUNT(*) FROM evaluation_runs {where}", params)
-            total = cur.fetchone()[0]
+            cur.execute(f"SELECT COUNT(*) AS total FROM evaluation_runs {where}", params)
+            total = cur.fetchone()["total"]
             cur.execute(
                 f"""
                 SELECT id, batch_id, status, scope_id, actor_id, actor_type,
@@ -100,8 +100,8 @@ class EvaluationRunRepository:
                 [*params, limit, offset],
             )
             rows = cur.fetchall()
-            cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, r)) for r in rows], total
+        # psycopg2 RealDictCursor → 각 row 는 이미 dict-like (RealDictRow).
+        return [dict(r) for r in rows], total
 
     def update_status(self, run_id: str, scope_id: str, new_status: str) -> bool:
         now = datetime.now(timezone.utc)
@@ -163,9 +163,9 @@ class EvaluationRunRepository:
             return cur.rowcount > 0
 
     @staticmethod
-    def _row_to_dict(cur, row) -> Dict[str, Any]:
-        cols = [d[0] for d in cur.description]
-        return dict(zip(cols, row))
+    def _row_to_dict(row) -> Dict[str, Any]:
+        # psycopg2 RealDictCursor → row 는 이미 dict-like (RealDictRow).
+        return dict(row) if row is not None else {}
 
 
 class EvaluationResultRecordRepository:
@@ -232,5 +232,5 @@ class EvaluationResultRecordRepository:
                 (run_id, limit, offset),
             )
             rows = cur.fetchall()
-            cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, r)) for r in rows]
+        # psycopg2 RealDictCursor → 각 row 는 이미 dict-like (RealDictRow).
+        return [dict(r) for r in rows]

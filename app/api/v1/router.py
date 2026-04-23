@@ -35,6 +35,7 @@ from app.api.v1 import golden_sets  # S2 Phase 7 (FG7.1): Golden Set 도메인
 from app.api.v1 import evaluations  # S2 Phase 7 (FG7.2): 평가 실행 API
 from app.api.v1 import extraction_schemas  # S2 Phase 8 (FG8.1): 추출 스키마 CRUD
 from app.api.v1 import extractions  # S2 Phase 8 (FG8.2): 추출 결과 검토 API
+from app.api.v1 import admin_extraction_results  # S2 Phase 8 (B 스코프): 관리자 검토 큐 API
 from app.api.v1 import batch_extractions  # S2 Phase 8 (Task 8-7): 배치 재추출 API
 from app.api.v1 import extraction_evaluations  # S2 Phase 8 (FG8.3): 추출 품질 평가 API
 
@@ -113,6 +114,14 @@ v1_router.include_router(extraction_schemas.router, prefix="/extraction-schemas"
 
 # S2 Phase 8 (FG8.2): 추출 결과 검토 API (pending 큐 → approve/modify/reject)
 v1_router.include_router(extractions.router, prefix="/extractions", tags=["extractions"])
+
+# S2 Phase 8 (B 스코프, 2026-04-22): 관리자 검토 큐 전용 API
+# /admin/extraction-results 경로로 프론트 `/admin/extraction-queue` 가 직접 호출.
+v1_router.include_router(
+    admin_extraction_results.router,
+    prefix="/admin/extraction-results",
+    tags=["admin", "extractions"],
+)
 
 # S2 Phase 8 (Task 8-7): 배치 재추출 API
 v1_router.include_router(batch_extractions.router, prefix="/extractions", tags=["extractions"])

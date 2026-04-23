@@ -24,7 +24,7 @@ from app.api.auth.dependencies import resolve_current_actor
 from app.api.auth.models import ActorContext
 from app.api.responses import list_response, success_response
 from app.audit.emitter import audit_emitter
-from app.db.connection import get_db
+from app.db.connection import db_dependency
 from app.models.extraction_evaluation import (
     GoldenExtractionItem,
     GoldenExtractionSet,
@@ -76,7 +76,7 @@ def _scope_id(actor: ActorContext) -> Optional[UUID]:
 def run_evaluation(
     req: RunEvaluationRequest,
     actor: ActorContext = Depends(resolve_current_actor),
-    conn=Depends(get_db),
+    conn=Depends(db_dependency),
 ):
     """Golden Set 기준 추출 품질을 평가한다."""
     if getattr(actor, "role", None) not in _WRITE_ROLES:
@@ -127,10 +127,10 @@ def run_evaluation(
         conn.commit()
         saved_results.append(saved)
 
-    audit_emitter.emit(
+    audit_emitter.emit_for_actor(
         event_type="extraction.evaluation.run",
-        actor_id=actor_id,
-        actor_type=actor.actor_type or "user",
+        action="extraction.evaluation.run",
+        actor=actor,
         resource_type="golden_extraction_set",
         resource_id=str(req.golden_set_id),
         metadata={"item_count": len(items), "result_count": len(saved_results)},
@@ -154,7 +154,7 @@ def run_evaluation(
 def get_evaluation(
     eval_id: UUID,
     actor: ActorContext = Depends(resolve_current_actor),
-    conn=Depends(get_db),
+    conn=Depends(db_dependency),
 ):
     repo = ExtractionEvaluationRepository(conn)
     result = repo.get_by_id(eval_id)
@@ -182,7 +182,7 @@ def compare_evaluations(
     eval_id: UUID,
     compare_with: UUID = Query(..., description="비교 대상 evaluation ID"),
     actor: ActorContext = Depends(resolve_current_actor),
-    conn=Depends(get_db),
+    conn=Depends(db_dependency),
 ):
     repo = ExtractionEvaluationRepository(conn)
     eval_a = repo.get_by_id(eval_id)
@@ -232,7 +232,7 @@ def compare_evaluations(
 def quality_gate_check(
     req: QualityGateCheckRequest,
     actor: ActorContext = Depends(resolve_current_actor),
-    conn=Depends(get_db),
+    conn=Depends(db_dependency),
 ):
     repo = ExtractionEvaluationRepository(conn)
     result = repo.get_by_id(req.evaluation_id)
@@ -255,10 +255,10 @@ def quality_gate_check(
         overall_score_threshold=req.overall_score_threshold,
     )
 
-    audit_emitter.emit(
+    audit_emitter.emit_for_actor(
         event_type="extraction.quality_gate.checked",
-        actor_id=_actor_id(actor),
-        actor_type=actor.actor_type or "user",
+        action="extraction.quality_gate.check",
+        actor=actor,
         resource_type="extraction_evaluation",
         resource_id=str(req.evaluation_id),
         metadata={"passed": gate_result.passed, "failures": gate_result.failures},
@@ -279,7 +279,7 @@ def quality_gate_check(
 def create_golden_set(
     gset: GoldenExtractionSet,
     actor: ActorContext = Depends(resolve_current_actor),
-    conn=Depends(get_db),
+    conn=Depends(db_dependency),
 ):
     if getattr(actor, "role", None) not in _WRITE_ROLES:
         raise HTTPException(403, "Golden Set 생성 권한이 없습니다.")
@@ -292,10 +292,10 @@ def create_golden_set(
     saved = repo.create(gset)
     conn.commit()
 
-    audit_emitter.emit(
+    audit_emitter.emit_for_actor(
         event_type="extraction.golden_set.created",
-        actor_id=_actor_id(actor),
-        actor_type=actor.actor_type or "user",
+        action="extraction.golden_set.create",
+        actor=actor,
         resource_type="golden_extraction_set",
         resource_id=str(saved.id),
         metadata={"name": saved.name, "document_type": saved.document_type},
@@ -311,7 +311,7 @@ def create_golden_set(
 def get_golden_set(
     set_id: UUID,
     actor: ActorContext = Depends(resolve_current_actor),
-    conn=Depends(get_db),
+    conn=Depends(db_dependency),
 ):
     repo = GoldenExtractionSetRepository(conn)
     gset = repo.get_by_id(set_id)

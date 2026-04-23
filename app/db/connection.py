@@ -85,12 +85,19 @@ def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
     return _pool
 
 
-@contextmanager
-def get_db() -> Generator[psycopg2.extensions.connection, None, None]:
-    """DB 연결 컨텍스트 매니저.
+def _db_session() -> Generator[psycopg2.extensions.connection, None, None]:
+    """DB 연결 순수 generator — 공용 context manager 와 FastAPI 의존성 양쪽에서 재사용.
 
-    연결 풀에서 연결을 가져와 사용 후 반환한다.
-    예외 발생 시 rollback, 정상 종료 시 commit.
+    Python 3.13 + FastAPI 조합에서 `@contextmanager` 로 데코레이트된 함수를
+    `Depends(...)` 에 직접 넘기면 FastAPI 의 `solve_generator` 가 generator 가 아닌
+    것으로 판정해 `contextmanager(call)(**sub_values)` 로 한 번 더 감싸고, 이때
+    `outer.gen = inner_CM` 구조가 되어 예외 전파 시
+    `AttributeError: '_GeneratorContextManager' object has no attribute 'throw'`
+    로 터진다. 따라서 내부 구현은 순수 generator 로 두고, 공용 API 는
+    `@contextmanager` 로, FastAPI 의존성은 **순수 generator 함수** 로 각각 export 한다.
+
+    정책: 연결 풀에서 연결을 가져와 사용 후 반환. 예외 발생 시 rollback,
+    정상 종료 시 commit.
     """
     pool = _get_pool()
     conn = pool.getconn()
@@ -102,6 +109,20 @@ def get_db() -> Generator[psycopg2.extensions.connection, None, None]:
         raise
     finally:
         pool.putconn(conn)
+
+
+# 공용 context manager — `with get_db() as conn:` 형태의 모든 기존 호출부 호환.
+get_db = contextmanager(_db_session)
+
+
+def db_dependency() -> Generator[psycopg2.extensions.connection, None, None]:
+    """FastAPI 의존성 — 순수 generator 함수 (`yield` 포함).
+
+    `inspect.isgeneratorfunction(db_dependency) is True` 이므로 FastAPI 가
+    `contextmanager_in_threadpool(contextmanager(call)(...))` 경로로 올바르게
+    처리한다. 라우터는 `conn=Depends(db_dependency)` 로 주입받는다.
+    """
+    yield from _db_session()
 
 
 # versions 테이블 DDL

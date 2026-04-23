@@ -321,6 +321,124 @@ class ExtractionCandidateRepository:
         return [self._row_to_candidate(r) for r in rows]
 
     # ------------------------------------------------------------------
+    # Admin queue 전용 조회 (documents join + 필터)
+    # ------------------------------------------------------------------
+
+    def list_for_admin_queue(
+        self,
+        *,
+        statuses: Optional[List[ExtractionStatus]] = None,
+        document_type: Optional[str] = None,
+        scope_profile_id: Optional[UUID] = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> tuple[List[dict], int]:
+        """관리자 검토 큐 전용 목록 조회.
+
+        `documents` 테이블과 LEFT JOIN 해 `document_title`/`document_summary`
+        를 함께 가져온다. 문서가 삭제/미존재면 title 은 NULL — 라우터에서
+        '(삭제된 문서)' 로 폴백한다.
+
+        반환:
+          (rows, total_count)
+          - rows    : dict 리스트 (raw DB 컬럼 + document_title/summary 추가)
+          - total_count: 동일 필터의 총 건수(페이지네이션 계산용)
+
+        필터:
+          - statuses        : 내부 상태값 리스트. None 이면 전체 상태.
+          - document_type   : extraction_schema_id 필터 (대문자 기대).
+          - scope_profile_id: S2 ⑥ 강제. None 이면 scope 필터 미적용
+                              (관리자 모드에서 글로벌 뷰 허용).
+
+        인덱스:
+          - `idx_extraction_candidates_scope`
+            (scope_profile_id, status, created_at DESC) 로
+            scope + status 조합은 인덱스 타격.
+          - document_type 필터는 `idx_extraction_candidates_schema_id` 사용.
+        """
+        where_parts = ["c.is_soft_deleted = FALSE"]
+        params: list = []
+
+        if statuses:
+            where_parts.append("c.status = ANY(%s)")
+            params.append([s.value for s in statuses])
+
+        if document_type:
+            where_parts.append("c.extraction_schema_id = %s")
+            params.append(document_type)
+
+        if scope_profile_id is not None:
+            where_parts.append("c.scope_profile_id = %s")
+            params.append(str(scope_profile_id))
+
+        where_sql = " AND ".join(where_parts)
+
+        # 두 쿼리를 한 트랜잭션에서 수행 — 일관된 total_count 보장.
+        with self._conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT c.id, c.document_id, c.document_version,
+                       c.extraction_schema_id, c.extraction_schema_version,
+                       c.extracted_fields, c.extraction_model,
+                       c.status, c.reviewed_by, c.reviewed_at,
+                       c.human_feedback, c.human_edits,
+                       c.created_at, c.updated_at, c.actor_type,
+                       c.scope_profile_id,
+                       d.title      AS document_title,
+                       d.summary    AS document_summary,
+                       d.document_type AS document_document_type
+                FROM extraction_candidates AS c
+                LEFT JOIN documents AS d ON d.id = c.document_id
+                WHERE {where_sql}
+                ORDER BY c.created_at DESC
+                LIMIT %s OFFSET %s
+                """,
+                params + [limit, offset],
+            )
+            rows = cur.fetchall()
+
+            cur.execute(
+                f"""
+                SELECT COUNT(*) AS total
+                FROM extraction_candidates AS c
+                WHERE {where_sql}
+                """,
+                params,
+            )
+            count_row = cur.fetchone()
+            total = count_row["total"] if count_row else 0
+
+        return ([dict(r) for r in rows], int(total))
+
+    def get_for_admin_detail(self, candidate_id: UUID) -> Optional[dict]:
+        """관리자 상세 조회 — documents join 포함.
+
+        soft-deleted 캔디데이트는 제외. 문서 자체가 삭제되어도 캔디데이트는
+        유효하므로 LEFT JOIN 으로 title 이 NULL 일 수 있음.
+        """
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT c.id, c.document_id, c.document_version,
+                       c.extraction_schema_id, c.extraction_schema_version,
+                       c.extracted_fields, c.extraction_model,
+                       c.status, c.reviewed_by, c.reviewed_at,
+                       c.human_feedback, c.human_edits,
+                       c.created_at, c.updated_at, c.actor_type,
+                       c.scope_profile_id,
+                       d.title      AS document_title,
+                       d.summary    AS document_summary,
+                       d.document_type AS document_document_type
+                FROM extraction_candidates AS c
+                LEFT JOIN documents AS d ON d.id = c.document_id
+                WHERE c.id = %s AND c.is_soft_deleted = FALSE
+                """,
+                (str(candidate_id),),
+            )
+            row = cur.fetchone()
+        return dict(row) if row else None
+
+    # ------------------------------------------------------------------
     # Update status
     # ------------------------------------------------------------------
 

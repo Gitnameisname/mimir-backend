@@ -173,6 +173,87 @@ class ExtractionFieldDef(BaseModel):
 
         return self
 
+    @model_validator(mode="after")
+    def _validate_default_value(self) -> "ExtractionFieldDef":
+        """default_value 가 field_type 과 호환되는지 검증.
+
+        - None 은 항상 허용 (기본값 미지정).
+        - bool 은 Python 에서 int 의 서브클래스이므로 number 검증에서 제외.
+        - array 타입에 원소별 타입 검증은 하지 않음(일반 리스트만 확인).
+        - object 타입은 dict 여부만 확인(nested_schema 재귀 검증은 별도 범위).
+        """
+        if self.default_value is None:
+            return self
+
+        ft = self.field_type
+        dv = self.default_value
+
+        if ft == "string":
+            if not isinstance(dv, str):
+                raise ValueError(
+                    f"string 타입의 default_value 는 문자열이어야 함 (입력 타입: {type(dv).__name__})"
+                )
+
+        elif ft == "number":
+            # bool 은 int 의 서브클래스지만 number 타입과 호환되지 않음.
+            if isinstance(dv, bool) or not isinstance(dv, (int, float)):
+                raise ValueError(
+                    f"number 타입의 default_value 는 숫자여야 함 (입력 타입: {type(dv).__name__})"
+                )
+            # min_value/max_value 범위 검증.
+            if self.min_value is not None and float(dv) < self.min_value:
+                raise ValueError(
+                    f"number 타입의 default_value({dv}) 가 min_value({self.min_value}) 보다 작음"
+                )
+            if self.max_value is not None and float(dv) > self.max_value:
+                raise ValueError(
+                    f"number 타입의 default_value({dv}) 가 max_value({self.max_value}) 보다 큼"
+                )
+
+        elif ft == "boolean":
+            if not isinstance(dv, bool):
+                raise ValueError(
+                    f"boolean 타입의 default_value 는 bool 이어야 함 (입력 타입: {type(dv).__name__})"
+                )
+
+        elif ft == "date":
+            if not isinstance(dv, str):
+                raise ValueError(
+                    f"date 타입의 default_value 는 형식에 맞는 문자열이어야 함 (입력 타입: {type(dv).__name__})"
+                )
+            fmt = self.date_format or "YYYY-MM-DD"
+            py_fmt = fmt.replace("YYYY", "%Y").replace("MM", "%m").replace("DD", "%d")
+            try:
+                datetime.strptime(dv, py_fmt)
+            except ValueError:
+                raise ValueError(
+                    f"date 타입의 default_value '{dv}' 가 형식 '{fmt}' 과 맞지 않음"
+                )
+
+        elif ft == "enum":
+            if not isinstance(dv, str):
+                raise ValueError(
+                    f"enum 타입의 default_value 는 문자열이어야 함 (입력 타입: {type(dv).__name__})"
+                )
+            if self.enum_values and dv not in self.enum_values:
+                raise ValueError(
+                    f"enum 타입의 default_value '{dv}' 가 enum_values 에 없음"
+                )
+
+        elif ft == "array":
+            if not isinstance(dv, list):
+                raise ValueError(
+                    f"array 타입의 default_value 는 리스트여야 함 (입력 타입: {type(dv).__name__})"
+                )
+
+        elif ft == "object":
+            if not isinstance(dv, dict):
+                raise ValueError(
+                    f"object 타입의 default_value 는 객체(dict)여야 함 (입력 타입: {type(dv).__name__})"
+                )
+
+        return self
+
 
 # ---------------------------------------------------------------------------
 # ExtractionTargetSchema
