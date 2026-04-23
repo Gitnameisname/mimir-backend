@@ -45,3 +45,8 @@ pytest-asyncio==0.26.0
 bandit==1.8.3
 ruff==0.11.5
 locust==2.34.0
+
+# ---- S3 Phase 0 / FG 0-1 (2026-04-23): 실 DB 통합 테스트 ----
+# testcontainers 는 로컬 개발자가 `pytest tests/integration/` 실행 시 PG/Valkey 컨테이너를 자동 기동하도록 한다.
+# CI 는 GitHub Actions `services:` 블록을 사용하므로 testcontainers 를 쓰지 않지만, 두 경로 모두 동일 conftest 를 공유한다.
+testcontainers[postgres]>=4.7,<5.0
