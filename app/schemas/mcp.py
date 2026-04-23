@@ -240,7 +240,51 @@ TOOL_SCHEMAS: list[dict] = [
             "required": ["document_id", "version_id", "node_id", "content_hash"],
         },
     },
+    {
+        # FG 0-5 (2026-04-23): 에이전트가 RAG 답변 부재 원인을 스스로 진단할 수 있게
+        # 문서 벡터화 상태를 읽기 전용으로 노출. 재벡터화 실행은 Tool 에 노출하지 않는다
+        # (운영 안전 — 사람 명시적 클릭만).
+        "name": "mimir.vectorization.status",
+        "description": (
+            "문서의 벡터화 상태를 조회한다. "
+            "에이전트가 RAG 답변을 찾지 못할 때 '해당 문서가 색인됐는지' 를 진단하는 용도. "
+            "읽기 전용. 재벡터화는 사람이 UI 에서 명시적으로 수행."
+        ),
+        "authentication": {
+            "method": "oauth2_client_credentials",
+            "scope_profile_required": True,
+            "delegation": "delegate:search",
+        },
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "document_id": {
+                    "type": "string",
+                    "format": "uuid",
+                    "description": "벡터화 상태를 조회할 문서 ID",
+                },
+            },
+            "required": ["document_id"],
+        },
+    },
 ]
+
+
+# FG 0-5: mimir.vectorization.status Tool 의 Request / Response 스키마
+class VectorizationStatusToolRequest(BaseModel):
+    document_id: str = Field(..., description="문서 UUID")
+
+
+class VectorizationStatusToolResponse(BaseModel):
+    document_id: str
+    status: str
+    latest_published_version_id: Optional[str] = None
+    indexed_version_id: Optional[str] = None
+    chunk_count: int = 0
+    last_vectorized_at: Optional[str] = None
+    last_error: Optional[str] = None
+    # 에이전트 경로에서는 can_reindex 는 항상 False (재벡터화 Tool 미노출)
+    can_reindex: bool = False
 
 # Mimir Extension 선언 (FG4.3)
 MIMIR_EXTENSIONS: list[dict] = [

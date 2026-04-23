@@ -30,6 +30,8 @@ from app.schemas.mcp import (
     SearchDocumentsData,
     SearchDocumentsRequest,
     SearchResultItem,
+    VectorizationStatusToolRequest,
+    VectorizationStatusToolResponse,
     VerifyCitationData,
     VerifyCitationRequest,
 )
@@ -443,3 +445,99 @@ def _emit_audit(
         )
     except Exception as exc:
         logger.warning("MCP tool 감사 이벤트 기록 실패: %s", exc)
+
+
+# --------------------------------------------------------------------------- #
+# FG 0-5 (2026-04-23): mimir.vectorization.status — 읽기 전용 진단 Tool
+# --------------------------------------------------------------------------- #
+
+
+def tool_vectorization_status(
+    request: VectorizationStatusToolRequest,
+    actor: ActorContext,
+    conn,
+) -> VectorizationStatusToolResponse:
+    """FG 0-5: 에이전트가 문서의 벡터화 상태를 조회한다 (읽기 전용).
+
+    재벡터화 실행 권한은 **노출하지 않는다** (운영 안전, task0-5 §4.4).
+    에이전트 관점에선 `can_reindex` 는 항상 False.
+
+    보안 게이트 (보안보고서 F05-01/F05-02 수정, 2026-04-23):
+      - document.read 권한을 라우트와 동일 기준으로 재검증 (IDOR 방어).
+      - last_error 는 내부 호스트 정보 노출을 피하기 위해 **요약 코드만** 노출.
+    """
+    _check_agent_write_blocked(actor)
+
+    # 최소 유효성 — UUID 형식 점검
+    import re
+    _UUID_RE = re.compile(
+        r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        re.IGNORECASE,
+    )
+    if not _UUID_RE.match(request.document_id):
+        raise MCPError(
+            MCPErrorCode.INVALID_PARAMS,
+            "document_id 는 유효한 UUID 여야 합니다.",
+            400,
+        )
+
+    # F05-02 (P1) 수정: document-level authorize 를 MCP Tool 경로에도 적용.
+    try:
+        from app.api.auth import ResourceRef, authorization_service  # noqa: WPS433
+        authorization_service.authorize(
+            actor=actor,
+            action="document.read",
+            resource=ResourceRef(resource_type="document", resource_id=request.document_id),
+            require_authenticated=True,
+        )
+    except Exception as exc:
+        # authorize 가 raise 하는 권한 에러는 MCPError 로 정규화
+        raise MCPError(
+            MCPErrorCode.UNAUTHORIZED,
+            f"문서 조회 권한이 없습니다: {type(exc).__name__}",
+            403,
+        )
+
+    from app.services.vectorization_status_service import get_vectorization_status
+
+    info = get_vectorization_status(
+        conn,
+        request.document_id,
+        actor_user_id=None,
+        actor_role=None,
+        cooldown_remaining_sec=0,
+    )
+    if info is None:
+        raise MCPError(MCPErrorCode.NOT_FOUND, "문서를 찾을 수 없습니다.", 404)
+
+    _emit_audit(
+        event_type="mcp.tool.vectorization_status",
+        action="mcp.vectorization.status",
+        actor=actor,
+        metadata={"document_id": request.document_id, "status": info.status},
+    )
+
+    # F05-01 (P1) 수정: 에이전트에게는 상세 에러 대신 요약 코드만 노출.
+    # 내부 호스트명·스택 등은 Admin 에게만 REST API 경로로 노출 (라우트는 그대로 info.last_error 사용).
+    last_error_code: Optional[str] = None
+    if info.last_error:
+        lower = info.last_error.lower()
+        if "milvus" in lower:
+            last_error_code = "milvus_unreachable"
+        elif "embedding" in lower:
+            last_error_code = "embedding_service_unavailable"
+        elif "timeout" in lower:
+            last_error_code = "timeout"
+        else:
+            last_error_code = "vectorization_failed"
+
+    return VectorizationStatusToolResponse(
+        document_id=info.document_id,
+        status=info.status,
+        latest_published_version_id=info.latest_published_version_id,
+        indexed_version_id=info.indexed_version_id,
+        chunk_count=info.chunk_count,
+        last_vectorized_at=info.last_vectorized_at.isoformat() if info.last_vectorized_at else None,
+        last_error=last_error_code,
+        can_reindex=False,
+    )

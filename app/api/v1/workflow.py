@@ -312,6 +312,22 @@ def _trigger_vectorization_async(document_id: str, version_id: str) -> None:
             _log.info("자동 벡터화 완료: document_id=%s, version_id=%s", document_id, version_id)
         except Exception as exc:
             _log.error("자동 벡터화 실패 (document_id=%s): %s", document_id, exc)
+            # FG 0-5 (2026-04-23): 실패 감사 이벤트 기록.
+            # 상태 API `GET /vectorization/documents/{id}/status` 가 이 레코드를 읽어 `failed` 로 판정.
+            try:
+                from app.audit.emitter import audit_emitter  # noqa: WPS433
+                audit_emitter.emit(
+                    event_type="vectorization.failed",
+                    action="vectorization.auto_trigger",
+                    actor_id=None,
+                    actor_type="system",
+                    resource_type="document",
+                    resource_id=document_id,
+                    result="failed",
+                    reason=str(exc)[:400],
+                )
+            except Exception as audit_exc:
+                _log.debug("audit emit (vectorization.failed) failed: %s", audit_exc)
 
     try:
         _VECTORIZATION_EXECUTOR.submit(_run)

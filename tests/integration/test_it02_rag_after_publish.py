@@ -102,3 +102,24 @@ def test_it02_publish_triggers_vectorization_and_chunks_are_indexed(
         assert "answer" in data or "text" in data or "content" in data, (
             f"RAG 응답에 answer 필드 없음: keys={list(data.keys())}"
         )
+
+    # FG 0-5 (2026-04-23): 벡터화 완료 후 /status 엔드포인트가 indexed 로 수렴
+    status_resp = client.get(
+        f"/api/v1/vectorization/documents/{doc_id}/status",
+        headers=auth_author_header,
+    )
+    assert status_resp.status_code == 200, (
+        f"FG 0-5 status 엔드포인트 비정상: {status_resp.status_code} / {status_resp.text[:200]}"
+    )
+    status_body = status_resp.json().get("data", {})
+    assert status_body.get("document_id") == doc_id
+    assert status_body["status"] in ("indexed", "stale", "pending"), (
+        f"FG 0-5 예상치 못한 status: {status_body.get('status')}"
+    )
+    # indexed 가 아닌 경우에도 필수 필드는 존재해야 함
+    for key in ("status", "chunk_count", "can_reindex", "reindex_cooldown_sec"):
+        assert key in status_body, f"status 응답에 {key} 누락"
+    # AUTHOR 가 문서 작성자이므로 can_reindex=True 기대
+    assert status_body["can_reindex"] is True, (
+        "FG 0-5: 문서 작성자(AUTHOR) 에게 can_reindex=true 가 아님"
+    )

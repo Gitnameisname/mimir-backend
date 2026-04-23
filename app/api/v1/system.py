@@ -157,11 +157,57 @@ def _build_capabilities() -> dict:
 @router.get(
     "/health",
     summary="헬스체크",
-    description="서비스 가용 여부를 확인한다.",
+    description=(
+        "서비스 가용 여부를 확인한다.\n\n"
+        "**서브체크 (S3 P0 FG 0-2)**: `embedding_dim` 블록은 `EMBEDDING_DIM` 설정값과 "
+        "`document_chunks.embedding` 컬럼 차원(pgvector) / Milvus collection 차원의 일치 여부를 포함한다.\n\n"
+        "- `embedding_dim.match = true` : config·DB 모두 일치\n"
+        "- `embedding_dim.match = false`: 불일치 (degraded 원인)\n"
+        "- `embedding_dim.match = null` : 컬럼 부재 (현재 Milvus 중심 아키텍처 정합)\n\n"
+        "불일치 감지 시 전체 `healthy = false`, `degraded = true` 로 반환된다 (BUG-04 재발 감지)."
+    ),
     response_model=SuccessResponse,
 )
 def health_check() -> SuccessResponse:
-    return success_response(data={"healthy": True})
+    """Tier 1 헬스체크 — DB 도달 가능 시 embedding_dim 서브체크 포함.
+
+    DB 도달 불가 시에도 본 엔드포인트는 200 을 반환한다 (앱 프로세스 자체 생존 확인용).
+    embedding_dim 세부는 best-effort 로 채워지며 서비스 실패로 연결되지 않는다.
+    """
+    # S3 P0 FG 0-2: embedding_dim 서브체크 (best-effort)
+    subcheck: dict | None = None
+    healthy = True
+    degraded = False
+
+    try:
+        from app.db import get_db  # noqa: WPS433
+        from app.db import embedding_dim_check as _dim_check_mod  # noqa: WPS433
+
+        # healthcheck 는 빠르게 반환되어야 하므로 짧은 read-only 트랜잭션.
+        # 모듈 속성 접근으로 호출 — pytest monkeypatch 로 `check_embedding_dim` 대체 가능.
+        with get_db() as conn:
+            conn.rollback()  # 트랜잭션 상태 정리 — read-only
+            result = _dim_check_mod.check_embedding_dim(conn, check_milvus=True)
+            subcheck = result.to_dict()
+            if not result.ok:
+                healthy = False
+                degraded = True
+            # Milvus 불일치도 degraded 원인
+            if result.milvus_match is False:
+                degraded = True
+                healthy = False
+    except Exception as exc:  # pragma: no cover - DB down
+        # DB 접속 실패는 health 에 영향을 주지만, embedding_dim 서브체크 자체 실패는 degrade 로만.
+        logger.warning("embedding_dim 서브체크 실패 (무시): %s", exc)
+        subcheck = {"error": str(exc), "match": None}
+
+    data: dict = {"healthy": healthy}
+    if degraded:
+        data["degraded"] = True
+    if subcheck is not None:
+        data["embedding_dim"] = subcheck
+
+    return success_response(data=data)
 
 
 @router.get(

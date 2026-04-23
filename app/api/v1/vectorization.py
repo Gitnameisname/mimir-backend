@@ -29,7 +29,7 @@ import re
 import uuid
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
 _UUID_RE = re.compile(
@@ -51,8 +51,14 @@ from app.api.auth.models import ActorContext
 from app.api.context import get_request_ids
 from app.api.rate_limit import limiter
 from app.api.responses import SuccessResponse, success_response
+from app.audit.emitter import audit_emitter
 from app.db import get_db
+from app.services.vectorization_cooldown import try_acquire as _cooldown_try_acquire, peek_remaining as _cooldown_peek
 from app.services.vectorization_service import vectorization_pipeline
+from app.services.vectorization_status_service import (
+    can_user_reindex,
+    get_vectorization_status,
+)
 
 # 시맨틱 검색 rate limit: 임베딩 API 비용 DoS 방어
 _SEMANTIC_SEARCH_LIMIT = "30/minute"
@@ -82,25 +88,84 @@ def _require_admin(actor: ActorContext, request: Request) -> None:
 
 
 # ---------------------------------------------------------------------------
+# FG 0-5 (2026-04-23): Admin OR 작성자 권한 확인
+# ---------------------------------------------------------------------------
+
+def _require_admin_or_creator(
+    actor: ActorContext,
+    conn,
+    document_id: str,
+) -> None:
+    """Admin 이거나 `documents.created_by == actor.user_id` 이면 통과.
+
+    그 외에는 HTTPException(403). documents 부재 시 404.
+    """
+    if not getattr(actor, "is_authenticated", False):
+        raise HTTPException(status_code=401, detail="인증이 필요합니다.")
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT created_by FROM documents WHERE id = %s::uuid",
+            (document_id,),
+        )
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="문서를 찾을 수 없습니다.")
+    created_by = row.get("created_by") if isinstance(row, dict) else row[0]
+
+    actor_user_id = getattr(actor, "user_id", None) or getattr(actor, "actor_id", None)
+    actor_role = getattr(actor, "role", None)
+    if not can_user_reindex(
+        actor_user_id=str(actor_user_id) if actor_user_id else None,
+        actor_role=str(actor_role) if actor_role else None,
+        document_created_by=str(created_by) if created_by else None,
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="재벡터화 권한이 없습니다. Admin 또는 문서 작성자만 실행할 수 있습니다.",
+        )
+
+
+# ---------------------------------------------------------------------------
 # POST /vectorization/documents/{document_id} — 단건 문서 수동 재색인
 # ---------------------------------------------------------------------------
 
 @router.post(
     "/documents/{document_id}",
-    summary="단건 문서 수동 재색인",
+    summary="단건 문서 수동 재색인 (Admin 또는 작성자)",
+    description=(
+        "문서를 수동으로 재벡터화한다.\n\n"
+        "**권한 (S3 P0 FG 0-5 확장, 2026-04-23)**: Admin(ADMIN/ORG_ADMIN/SUPER_ADMIN) "
+        "또는 `documents.created_by == actor.user_id` 인 문서 작성자.\n\n"
+        "**쿨다운**: 문서+actor 당 10초. 이내 재요청 시 429 + Retry-After.\n\n"
+        "**감사 로그**: `vectorization.reindex_requested` 이벤트를 `actor_type` 과 함께 기록."
+    ),
     response_model=SuccessResponse,
     tags=["vectorization"],
 )
 def reindex_document(
     document_id: str,
     request: Request,
+    response: Response,
     actor: ActorContext = Depends(resolve_current_actor),
 ) -> SuccessResponse:
-    _require_admin(actor, request)
     _validate_uuid(document_id, "document_id")
     request_id, trace_id = get_request_ids(request)
 
     with get_db() as conn:
+        # FG 0-5: Admin 또는 작성자만 통과
+        _require_admin_or_creator(actor, conn, document_id)
+
+        # FG 0-5: 쿨다운 — 문서+actor 당 10초
+        actor_user_id = getattr(actor, "user_id", None) or getattr(actor, "actor_id", None)
+        cool = _cooldown_try_acquire(document_id, str(actor_user_id) if actor_user_id else None)
+        if not cool.acquired:
+            response.headers["Retry-After"] = str(max(1, cool.remaining_sec))
+            raise HTTPException(
+                status_code=429,
+                detail=f"재벡터화 쿨다운 중입니다. {cool.remaining_sec}초 후 다시 시도하세요.",
+            )
+
         # Published 버전 확인
         with conn.cursor() as cur:
             cur.execute(
@@ -112,7 +177,7 @@ def reindex_document(
         if not row:
             raise HTTPException(status_code=404, detail="문서를 찾을 수 없습니다.")
 
-        version_id = row.get("current_published_version_id")
+        version_id = row.get("current_published_version_id") if isinstance(row, dict) else row[0]
         if not version_id:
             raise HTTPException(status_code=422, detail="Published 버전이 없어 벡터화할 수 없습니다.")
 
@@ -124,6 +189,29 @@ def reindex_document(
             job_id=job_id,
         )
 
+    # FG 0-5: 감사 이벤트 (actor_type 명시 — S2 원칙 ⑤)
+    try:
+        _actor_type_raw = getattr(actor, "actor_type", None)
+        actor_type_str = (
+            getattr(_actor_type_raw, "value", None)
+            or (str(_actor_type_raw).lower() if _actor_type_raw else "user")
+        )
+        # emitter 의 Literal ["user","agent","system"] 에 정규화
+        if actor_type_str not in ("user", "agent", "system"):
+            actor_type_str = "agent" if actor_type_str in ("service",) else "user"
+        audit_emitter.emit(
+            event_type="vectorization.reindex_requested",
+            action="vectorization.reindex",
+            actor_id=str(actor_user_id) if actor_user_id else None,
+            actor_type=actor_type_str,
+            resource_type="document",
+            resource_id=document_id,
+            result="success" if not result.error else "failed",
+            request_id=request_id,
+        )
+    except Exception as exc:
+        logger.debug("audit emit failed (non-blocking): %s", exc)
+
     return success_response(
         data={
             "document_id": document_id,
@@ -134,6 +222,70 @@ def reindex_document(
             "model": result.model,
             "error": result.error,
         },
+        request_id=request_id,
+        trace_id=trace_id,
+    )
+
+
+# ---------------------------------------------------------------------------
+# FG 0-5: GET /vectorization/documents/{document_id}/status — 벡터화 상태 조회
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/documents/{document_id}/status",
+    summary="문서별 벡터화 상태 조회 (FG 0-5, 2026-04-23)",
+    description=(
+        "문서의 현재 벡터화 상태를 반환한다.\n\n"
+        "**status 값**: `indexed | pending | in_progress | failed | stale | not_applicable`\n\n"
+        "**권한**: 문서 조회 권한이 있는 인증된 사용자.\n\n"
+        "**폐쇄망 호환 (S2 ⑦)**: Milvus / 임베딩 서비스 off 상태에서도 DB 만으로 상태 조회 정상.\n\n"
+        "본 엔드포인트는 **읽기 전용** 이며, 재벡터화는 `POST /vectorization/documents/{id}` 를 사용한다."
+    ),
+    response_model=SuccessResponse,
+    tags=["vectorization"],
+)
+def get_document_vectorization_status(
+    document_id: str,
+    request: Request,
+    actor: ActorContext = Depends(resolve_current_actor),
+) -> SuccessResponse:
+    """FG 0-5: 문서 벡터화 상태 + can_reindex 판정 + 쿨다운 잔여 초."""
+    _validate_uuid(document_id, "document_id")
+
+    # 인증만 확인. 문서 조회 권한은 Scope Profile + authorization_service 의
+    # document.read 정책에 위임 (기존 문서 조회 경로와 동일 기준 권장).
+    if not getattr(actor, "is_authenticated", False):
+        raise HTTPException(status_code=401, detail="인증이 필요합니다.")
+
+    authorization_service.authorize(
+        actor=actor,
+        action="document.read",
+        resource=ResourceRef(resource_type="document", resource_id=document_id),
+        require_authenticated=True,
+    )
+
+    request_id, trace_id = get_request_ids(request)
+
+    actor_user_id = getattr(actor, "user_id", None) or getattr(actor, "actor_id", None)
+    actor_role = getattr(actor, "role", None)
+
+    with get_db() as conn:
+        info = get_vectorization_status(
+            conn,
+            document_id,
+            actor_user_id=str(actor_user_id) if actor_user_id else None,
+            actor_role=str(actor_role) if actor_role else None,
+            cooldown_remaining_sec=_cooldown_peek(
+                document_id,
+                str(actor_user_id) if actor_user_id else None,
+            ),
+        )
+
+    if info is None:
+        raise HTTPException(status_code=404, detail="문서를 찾을 수 없습니다.")
+
+    return success_response(
+        data=info.to_dict(),
         request_id=request_id,
         trace_id=trace_id,
     )

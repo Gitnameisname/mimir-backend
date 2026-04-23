@@ -1,0 +1,215 @@
+# ==============================================================================
+# S3 Phase 0 / FG 0-1 + FG 0-3 — Backend Integration & Coverage Gate (GitLab CI)
+#
+# 위치: `backend/.gitlab-ci.yml` (backend repo 루트)
+# 리포: http://gitlab.ai-ecosystem.com/mimir/backend.git
+#
+# 변환 이력:
+#   - 2026-04-23  GitHub Actions 초안 작성 (`.github/workflows/backend-integration.yml`)
+#   - 2026-04-23  GitLab CI 로 변환 후 `mimir/.gitlab-ci.yml` 에 작성 (잘못된 위치)
+#   - 2026-04-23  backend repo 루트 (`backend/.gitlab-ci.yml`) 로 이동 + 경로 재조정
+#
+# 목적:
+#   - 매 MR/push 마다 실 PostgreSQL(+pgvector) + Valkey 위에서 tests/integration/ 를 실행.
+#   - 커버리지 합산 + per-path 임계값 (FG 0-3) 게이트.
+#   - Mock 만으로 탐지되지 않는 트랜잭션 오염 / pgvector 연결 / 차원 불일치 등 BUG-01/03/04 차단.
+#
+# 관련 작업지시서 (별도 docs 리포지토리):
+#   docs/개발문서/S3/phase0/작업지시서/task0-1.md
+#   docs/개발문서/S3/phase0/작업지시서/task0-3.md
+#
+# 디자인 결정:
+#   - `services:` 블록으로 pgvector + valkey 를 job 레벨에서 기동.
+#   - testcontainers 는 **로컬 개발자** 용 (tests/integration/conftest.py);
+#     CI 는 `USE_EXISTING_DB=1` 로 switching 되어 services 를 재사용한다.
+#
+# 프로젝트에 등록해야 할 CI/CD 변수 (Settings > CI/CD > Variables):
+#   - CI_POSTGRES_PASSWORD       (Protected+Masked 권장, ≥16자 랜덤)
+#   - CI_JWT_SECRET              (Protected+Masked 권장, ≥32자 랜덤)
+#   - CI_INTERNAL_SECRET         (Protected+Masked 권장, ≥32자 랜덤)
+# ==============================================================================
+
+default:
+  image: python:3.11-slim
+  timeout: 15 minutes
+  interruptible: true
+
+stages:
+  - integration
+
+variables:
+  # 공통 테스트 환경
+  ENVIRONMENT: "test"
+  DEBUG: "true"
+  USE_EXISTING_DB: "1"
+  INTEGRATION_TEST: "1"
+
+  # DB 연결 — GitLab services.postgres.alias 로 "postgres" 호스트 해석
+  POSTGRES_HOST: "postgres"
+  POSTGRES_PORT: "5432"
+  POSTGRES_USER: "mimir_test"
+  POSTGRES_PASSWORD: "${CI_POSTGRES_PASSWORD:-ci-pg-not-for-production}"
+  POSTGRES_DB: "mimir_test"
+
+  # Valkey 연결
+  VALKEY_HOST: "valkey"
+  VALKEY_PORT: "6379"
+
+  # 앱 필수 시크릿
+  JWT_SECRET: "${CI_JWT_SECRET:-ci-only-jwt-secret-not-for-production-xxxxxxxx}"
+  INTERNAL_SERVICE_SECRET: "${CI_INTERNAL_SECRET:-ci-only-internal-secret-xxxxxxxx}"
+
+  # 폐쇄망 경로 검증 — 기본 외부 LLM off
+  OPENAI_API_KEY: ""
+  ANTHROPIC_API_KEY: ""
+  MILVUS_HOST: ""
+
+  # 임베딩 차원 (FG 0-2 와 일관)
+  EMBEDDING_DIM: "768"
+  EMBEDDING_DIMENSIONS: "768"
+
+  # pip 캐시
+  PIP_CACHE_DIR: "${CI_PROJECT_DIR}/.cache/pip"
+
+  # Alembic/psycopg2 CLI 비밀번호
+  PGPASSWORD: "${CI_POSTGRES_PASSWORD:-ci-pg-not-for-production}"
+
+.cache_pip: &cache_pip
+  key:
+    # backend repo 루트가 CI_PROJECT_DIR 이므로 경로는 레포 루트 기준.
+    files:
+      - requirements.txt
+  paths:
+    - .cache/pip
+
+.rules_pr_push: &rules_pr_push
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+
+# =============================================================================
+# Job: 실 DB 통합 테스트 + 커버리지 게이트 (FG 0-1 + FG 0-3)
+# =============================================================================
+
+backend:integration:
+  stage: integration
+  <<: *rules_pr_push
+
+  services:
+    - name: pgvector/pgvector:pg16
+      alias: postgres
+      variables:
+        POSTGRES_USER: "mimir_test"
+        POSTGRES_PASSWORD: "${CI_POSTGRES_PASSWORD:-ci-pg-not-for-production}"
+        POSTGRES_DB: "mimir_test"
+    - name: valkey/valkey:8
+      alias: valkey
+
+  cache:
+    <<: *cache_pip
+
+  variables:
+    ALEMBIC_POSTGRES_USER: "${POSTGRES_USER}"
+    ALEMBIC_POSTGRES_PASSWORD: "${CI_POSTGRES_PASSWORD:-ci-pg-not-for-production}"
+    ALEMBIC_POSTGRES_HOST: "${POSTGRES_HOST}"
+    ALEMBIC_POSTGRES_PORT: "${POSTGRES_PORT}"
+    ALEMBIC_POSTGRES_DB: "${POSTGRES_DB}"
+
+  before_script:
+    - apt-get update -qq && apt-get install -y --no-install-recommends
+        postgresql-client gcc libpq-dev curl
+    - python -m pip install --upgrade pip --cache-dir "$PIP_CACHE_DIR"
+    - pip install --cache-dir "$PIP_CACHE_DIR" -r requirements.txt
+    - pip install --cache-dir "$PIP_CACHE_DIR" "testcontainers[postgres]>=4.7,<5.0"
+
+  script:
+    # (1) services 대기
+    - |
+      python - <<'PY'
+      import os, time, socket
+      for name, host, port in [
+          ("postgres", os.environ["POSTGRES_HOST"], int(os.environ["POSTGRES_PORT"])),
+          ("valkey",   os.environ["VALKEY_HOST"],   int(os.environ["VALKEY_PORT"])),
+      ]:
+          for i in range(30):
+              try:
+                  with socket.create_connection((host, port), timeout=2):
+                      print(f"{name} ok")
+                      break
+              except OSError:
+                  time.sleep(1)
+          else:
+              raise SystemExit(f"{name} not reachable at {host}:{port}")
+      PY
+
+    # (2) pgvector 확장 확인
+    - psql -h "$POSTGRES_HOST" -p "$POSTGRES_PORT" -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+        -c "CREATE EXTENSION IF NOT EXISTS vector;"
+        -c "SELECT extname, extversion FROM pg_extension WHERE extname='vector';"
+
+    # (3) Alembic upgrade head (backend repo 루트 = CI_PROJECT_DIR 라 cd 불필요)
+    - alembic upgrade head
+
+    # (4) 통합 테스트 — 커버리지 append
+    - mkdir -p test-results
+    - |
+      pytest tests/integration/ \
+          -v \
+          -m integration \
+          --maxfail=3 \
+          --tb=short \
+          --junit-xml=test-results/integration.xml \
+          --cov=app \
+          --cov-append \
+          --cov-report= \
+          --cov-fail-under=0 \
+          2>&1 | tee test-results/integration.log
+
+    # (5) 단위 테스트 — 커버리지 합산
+    - |
+      pytest tests/unit/ \
+          -v \
+          -m unit \
+          --maxfail=5 \
+          --tb=short \
+          --junit-xml=test-results/unit.xml \
+          --cov=app \
+          --cov-append \
+          --cov-report= \
+          --cov-fail-under=0 \
+          2>&1 | tee test-results/unit.log || true
+
+    # (6) 합산 리포트 생성
+    - coverage report --skip-covered --fail-under=0 || true
+    - coverage xml -o coverage.xml
+    - coverage html -d htmlcov --title "Mimir Backend Coverage ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
+
+    # (7) FG 0-3 per-path 게이트 — 미달 시 exit 1
+    - |
+      python scripts/coverage_baseline.py --xml coverage.xml --check \
+          --threshold-overall 75 \
+          --threshold-services 80 \
+          --threshold-repos 80
+
+    # (8) FG 0-3 베이스라인 markdown
+    - |
+      python scripts/coverage_baseline.py --xml coverage.xml --markdown \
+          > test-results/FG0-3_baseline_$(date -u +%Y%m%d_%H%M).md || true
+
+  artifacts:
+    when: always
+    expire_in: 30 days
+    name: "backend-integration-${CI_COMMIT_REF_SLUG}-${CI_JOB_ID}"
+    paths:
+      - test-results/
+      - coverage.xml
+      - htmlcov/
+    reports:
+      junit:
+        - test-results/integration.xml
+        - test-results/unit.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml

@@ -35,7 +35,12 @@ from app.db.connection import get_db
 from app.mcp.errors import MCPError
 from app.mcp.prompts import list_mcp_prompts
 from app.mcp.resources import parse_resource_uri
-from app.mcp.tools import tool_fetch_node, tool_search_documents, tool_verify_citation
+from app.mcp.tools import (
+    tool_fetch_node,
+    tool_search_documents,
+    tool_vectorization_status,
+    tool_verify_citation,
+)
 from app.schemas.mcp import (
     MIMIR_EXTENSIONS,
     TOOL_SCHEMAS,
@@ -263,6 +268,11 @@ def _dispatch_tool(tool_name: str, body: dict, actor: ActorContext, conn) -> Any
     if tool_name == "verify_citation":
         req = VerifyCitationRequest(**body)
         return tool_verify_citation(req, actor, conn)
+    # FG 0-5 (2026-04-23): 벡터화 상태 조회 Tool — 읽기 전용
+    if tool_name == "mimir.vectorization.status":
+        from app.schemas.mcp import VectorizationStatusToolRequest
+        req = VectorizationStatusToolRequest(**body)
+        return tool_vectorization_status(req, actor, conn)
     raise ValueError(f"Unknown tool: {tool_name}")
 
 

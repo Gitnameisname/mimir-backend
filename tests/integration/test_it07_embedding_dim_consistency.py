@@ -1,63 +1,56 @@
 """
-IT-07 — `EMBEDDING_DIM` 설정값과 `document_chunks.embedding` 컬럼의 vector 차원이 일치해야 한다.
+IT-07 — `EMBEDDING_DIM` 설정값과 `document_chunks.embedding` 차원 일관성 + FG0-2 revision 가드.
 (BUG-04 재발 방지)
 
-**상태: SKIP until FG 0-2**
-작업지시서 task0-1 §3 에 따라 FG 0-2 (embedding_dim 검증 Alembic revision) 완료 시점에
-활성화된다. 그때까지는 명시적 skip 마커로 수동 확인 유도.
+FG 0-2 (2026-04-23) 완료로 활성화. 검증 정책:
+  - `document_chunks.embedding` 컬럼 부재 → pass (현재 Milvus 중심 아키텍처 기대값)
+  - 컬럼 존재 + 차원 일치 → pass
+  - 컬럼 존재 + 차원 불일치 → fail (BUG-04 재발)
+
+추가로, FG 0-2 Alembic revision (`s3_p0_embedding_dim_check`) 이 head 에 포함됨을 확인한다.
 """
 from __future__ import annotations
-
-import os
 
 import pytest
 
 pytestmark = pytest.mark.integration
 
 
-@pytest.mark.skip(reason="pending FG 0-2 (embedding_dim config↔DB auto-validate revision)")
-def test_it07_embedding_dim_matches_document_chunks_vector_dim(db_conn):
-    """설정 EMBEDDING_DIM 과 document_chunks.embedding 컬럼 차원이 동일해야 한다."""
-    from app.config import settings
+def test_it07_embedding_dim_consistency(db_conn):
+    """pgvector 컬럼 있으면 EMBEDDING_DIM 과 차원 일치, 없으면 pass."""
+    from app.db.embedding_dim_check import check_embedding_dim
 
-    configured_dim = int(
-        os.environ.get("EMBEDDING_DIM") or settings.embedding_dim or 0
+    result = check_embedding_dim(db_conn, check_milvus=False)
+    assert result.ok, (
+        f"EMBEDDING_DIM 정합성 위반 (BUG-04 재발): {result.reason} "
+        f"(config={result.config_dim}, db={result.db_dim}, column_type={result.column_type})"
     )
-    assert configured_dim > 0, "EMBEDDING_DIM 설정이 비어 있음"
 
+
+def test_it07_fg02_revision_in_head(db_conn):
+    """FG 0-2 revision 이 alembic_version 헤드에 포함되어 있어야 한다."""
+    db_conn.rollback()
     with db_conn.cursor() as cur:
-        # information_schema.columns 는 vector 타입 차원을 직접 노출하지 않는다.
-        # pg_attribute + pg_type 을 조합해 atttypmod 에서 유추한다.
-        cur.execute(
-            """
-            SELECT a.attname,
-                   format_type(a.atttypid, a.atttypmod) AS formatted_type,
-                   a.atttypmod
-            FROM pg_attribute a
-            JOIN pg_class c ON a.attrelid = c.oid
-            WHERE c.relname = 'document_chunks'
-              AND a.attname = 'embedding'
-              AND a.attnum > 0
-            """
-        )
-        row = cur.fetchone()
-
-    if row is None:
-        pytest.skip(
-            "document_chunks.embedding 컬럼이 없음 — pgvector 미탑재 환경이거나 "
-            "FG 0-2 완료 후 Alembic 이 컬럼을 추가해야 함."
-        )
-
-    # format_type 은 'vector(768)' 형식으로 출력된다.
-    formatted = row["formatted_type"]  # e.g. 'vector(768)'
-    assert "vector" in formatted, f"embedding 컬럼 타입이 vector 가 아님: {formatted}"
-
-    # 차원 파싱
-    import re as _re
-    m = _re.search(r"vector\((\d+)\)", formatted)
-    assert m, f"vector 차원 파싱 실패: {formatted}"
-    db_dim = int(m.group(1))
-
-    assert db_dim == configured_dim, (
-        f"EMBEDDING_DIM({configured_dim}) != document_chunks.embedding 차원({db_dim}) — BUG-04"
+        cur.execute("SELECT version_num FROM alembic_version")
+        rows = cur.fetchall()
+    heads = {r["version_num"] for r in rows}
+    # 멀티헤드일 가능성은 낮지만 방어적으로 set 비교.
+    assert "s3_p0_embedding_dim_check" in heads, (
+        f"FG 0-2 revision 이 migration head 에 없음: {heads}. "
+        "`cd backend && alembic upgrade head` 를 먼저 수행하세요."
     )
+
+
+def test_it07_healthcheck_includes_embedding_dim_block(client):
+    """/system/health 응답에 embedding_dim 블록이 포함된다 (FG 0-2 §4.2)."""
+    resp = client.get("/api/v1/system/health")
+    assert resp.status_code == 200
+    body = resp.json()
+    data = body.get("data", body)
+    assert "embedding_dim" in data, (
+        f"health 응답에 embedding_dim 서브체크 누락: keys={list(data.keys())}"
+    )
+    block = data["embedding_dim"]
+    # 최소 필드 계약
+    for key in ("config", "match", "column_present"):
+        assert key in block, f"embedding_dim 에 {key} 누락: {block}"

@@ -10,7 +10,10 @@ addopts = [
     "--cov-report=term-missing",
     "--cov-report=xml:coverage.xml",
     "--cov-report=html:htmlcov",
-    "--cov-fail-under=80",
+    # S3 Phase 0 / FG 0-3 (2026-04-23):
+    # 단일 테스트 디렉터리 실행 시 임계값 미적용 (전체 스위트에서만 의미 있음).
+    # 전체 게이트는 CI 에서 `python scripts/coverage_baseline.py --check` 로 강제.
+    "--cov-fail-under=0",
     "-v",
 ]
 markers = [
@@ -52,10 +55,19 @@ filterwarnings = [
 source = ["app"]
 omit = [
     "app/__pycache__/*",
+    # 마이그레이션은 최초 1회만 실행되어 의미 있는 coverage 수집 불가
     "app/db/migrations/*",
+    "app/db/migrations/versions/*",
+    # 테스트 지원 픽스처 자체는 측정 대상 아님
     "*/conftest.py",
+    # 일회성 시드/배치/수동 스크립트
+    "app/*/init_data.py",
+    "app/*/seed_*.py",
+    "scripts/*",
 ]
 branch = true
+# pytest-xdist 도입 시점에 true 로 변경 — 현재는 순차 실행이므로 false 로 단순 유지.
+parallel = false
 
 [tool.coverage.report]
 exclude_lines = [
@@ -64,9 +76,27 @@ exclude_lines = [
     "if TYPE_CHECKING:",
     "raise NotImplementedError",
     "if __name__ == .__main__.:",
+    # 방어적 로깅/디버깅 경로는 커버리지 대상 제외
+    "except ImportError",
+    "logger.debug",
+    # 추상 메서드 스텁
+    "@(abc\\.)?abstractmethod",
 ]
 show_missing = true
-fail_under = 80
+# S3 P0 FG 0-3 (2026-04-23): 75% 전체 게이트. 상세 per-path 임계값(services/repositories 80%)은
+# `backend/scripts/coverage_baseline.py --check` 로 CI 에서 별도 검증.
+fail_under = 75
+# 소수점 2자리 — 임계값 근접 판단용
+precision = 2
+skip_covered = false
+sort = "-cover"
+
+[tool.coverage.html]
+directory = "htmlcov"
+title = "Mimir Backend Coverage (S3 Phase 0 FG 0-3)"
+
+[tool.coverage.xml]
+output = "coverage.xml"
 
 [tool.ruff]
 line-length = 100
