@@ -153,13 +153,13 @@ class TestBatchExtractionJobRepository:
 
     def test_is_cancellation_requested_true(self):
         from app.repositories.batch_extraction_repository import BatchExtractionJobRepository
-        conn = self._make_conn(row=(True,))
+        conn = self._make_conn(row={"is_cancellation_requested": True})
         repo = BatchExtractionJobRepository(conn)
         assert repo.is_cancellation_requested(uuid4()) is True
 
     def test_is_cancellation_requested_false(self):
         from app.repositories.batch_extraction_repository import BatchExtractionJobRepository
-        conn = self._make_conn(row=(False,))
+        conn = self._make_conn(row={"is_cancellation_requested": False})
         repo = BatchExtractionJobRepository(conn)
         assert repo.is_cancellation_requested(uuid4()) is False
 

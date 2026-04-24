@@ -152,10 +152,11 @@ class TestAdminCapabilitiesTier3:
         assert isinstance(r.json()["data"]["supported_providers"], list)
 
     def test_cache_control_private(self, client, auth_admin):
-        """Tier 3 Cache-Control은 private."""
+        """Tier 3 Cache-Control은 최소한 private 이상의 제약 (실제 구현은 no-store 로 더 엄격)."""
         r = client.get("/api/v1/admin/system/capabilities", headers=auth_admin)
-        cc = r.headers.get("cache-control", "")
-        assert "private" in cc
+        cc = r.headers.get("cache-control", "").lower()
+        # private 또는 no-store 둘 중 하나 이상 있으면 OK (no-store 는 private 보다 엄격)
+        assert ("private" in cc) or ("no-store" in cc)
 
     # --- pgvector / RAG 조합 검증 (Tier 3에서만 가능) ---
 
@@ -188,13 +189,31 @@ class TestAdminCapabilitiesTier3:
         assert r.json()["data"]["rag_available"] is False
 
     def test_pgvector_true_no_llm_rag_unavailable(self, client, auth_admin):
-        """pgvector=true 이지만 LLM 키 없음 → rag_available=false."""
+        """pgvector=true 이지만 LLM 키 없음 → rag_available=false.
+
+        DB 에 llm_providers 가 이미 등록되어 있을 수 있으므로, `has_llm` 이 DB 경로로도
+        True 가 되지 않도록 llm_providers 조회도 빈 결과로 패치한다.
+        """
         _reset_cap_cache()
         import app.api.v1.system as sys_mod
+        from unittest.mock import MagicMock
+
+        # DB llm_providers 조회를 "결과 없음" 으로 모킹
+        fake_cur = MagicMock()
+        fake_cur.__enter__ = MagicMock(return_value=fake_cur)
+        fake_cur.__exit__ = MagicMock(return_value=False)
+        fake_cur.fetchall = MagicMock(return_value=[])
+        fake_conn = MagicMock()
+        fake_conn.cursor = MagicMock(return_value=fake_cur)
+        fake_ctx = MagicMock()
+        fake_ctx.__enter__ = MagicMock(return_value=fake_conn)
+        fake_ctx.__exit__ = MagicMock(return_value=False)
+
         with patch.dict("os.environ", {"PGVECTOR_ENABLED": "true"}):
             with patch.object(sys_mod.settings, "openai_api_key", ""):
                 with patch.object(sys_mod.settings, "anthropic_api_key", ""):
-                    r = client.get("/api/v1/admin/system/capabilities", headers=auth_admin)
+                    with patch("app.db.connection.get_db", return_value=fake_ctx):
+                        r = client.get("/api/v1/admin/system/capabilities", headers=auth_admin)
         assert r.json()["data"]["rag_available"] is False
 
     def test_pgvector_true_with_openai_rag_available(self, client, auth_admin):

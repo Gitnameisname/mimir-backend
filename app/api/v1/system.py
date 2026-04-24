@@ -116,10 +116,14 @@ def _build_capabilities() -> dict:
     # ── FTS는 PostgreSQL 기반으로 항상 활성 ──
     fts_enabled = True
 
-    # ── RAG = Milvus + default LLM + default embedding 모두 필요 ──
+    # ── pgvector 확장 감지 (PGVECTOR_ENABLED env > pg_extension 조회) ──
+    pgvector_enabled = _detect_pgvector()
+
+    # ── RAG = pgvector + default LLM (embedding 모델은 settings 폴백 허용) ──
+    # chunking_enabled 은 pgvector 기반이므로 pgvector 가 off 이면 chunking 도 off.
     has_llm = (default_llm_model is not None) or bool(settings.openai_api_key or settings.anthropic_api_key)
     has_embed = default_embed_model is not None
-    rag_available = milvus_ok and has_llm and has_embed
+    rag_available = pgvector_enabled and has_llm
 
     # ── 저하 원인 수집 ──
     degraded_reasons: list[str] = []
@@ -138,9 +142,9 @@ def _build_capabilities() -> dict:
 
     return {
         "version": settings.api_version,
-        "pgvector_enabled": False,
+        "pgvector_enabled": pgvector_enabled,
         "rag_available": rag_available,
-        "chunking_enabled": milvus_ok,
+        "chunking_enabled": pgvector_enabled,
         "supported_providers": providers,
         "mcp_spec_version": None,
         # 프론트엔드 SystemCapabilities 필드

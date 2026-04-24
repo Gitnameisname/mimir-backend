@@ -63,11 +63,12 @@ def _build_nested_object_chain(depth: int) -> dict:
 
 class TestDocTypeCode:
     def test_valid_alpha_start(self):
+        # P7-2 에서 doc_type_code 는 대문자로 정규화됨 (upper).
         req = CreateExtractionSchemaRequest(
             doc_type_code="Contract-v1",
             fields={"x": _string_field("x")},
         )
-        assert req.doc_type_code == "Contract-v1"
+        assert req.doc_type_code == "CONTRACT-V1"
 
     def test_rejects_numeric_start(self):
         with pytest.raises(ValidationError):
@@ -91,11 +92,12 @@ class TestDocTypeCode:
             )
 
     def test_strips_leading_trailing_spaces(self):
+        # 공백 제거 + 대문자 정규화 (P7-2).
         req = CreateExtractionSchemaRequest(
             doc_type_code="  contract  ",
             fields={"x": _string_field("x")},
         )
-        assert req.doc_type_code == "contract"
+        assert req.doc_type_code == "CONTRACT"
 
 
 class TestScopeProfileId:

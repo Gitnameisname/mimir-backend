@@ -201,14 +201,14 @@ class TestListPending:
 class TestCountPending:
     def test_count_pending(self, repo, mock_conn):
         cursor = mock_conn.cursor.return_value.__enter__.return_value
-        cursor.fetchone.return_value = (5,)
+        cursor.fetchone.return_value = {"count": 5}
 
         count = repo.count_pending()
         assert count == 5
 
     def test_count_pending_with_scope(self, repo, mock_conn):
         cursor = mock_conn.cursor.return_value.__enter__.return_value
-        cursor.fetchone.return_value = (3,)
+        cursor.fetchone.return_value = {"count": 3}
 
         count = repo.count_pending(scope_profile_id=_SCOPE_ID)
         assert count == 3

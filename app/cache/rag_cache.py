@@ -88,11 +88,23 @@ _lru = _LRUCache()
 # Valkey 우선, 실패 시 LRU fallback
 # ---------------------------------------------------------------------------
 
+def _ns(key: str) -> str:
+    """Valkey 네임스페이스 프리픽스 ("mimir:") 를 붙인다.
+
+    response_cache.invalidate_pattern 이 `mimir:{pattern}` 으로 scan 하므로
+    rag_cache 에서 저장하는 Valkey 키도 동일 네임스페이스로 정규화한다.
+    LRU fallback 에는 영향이 없다 (로컬 프로세스 내).
+    """
+    if key.startswith("mimir:"):
+        return key
+    return f"mimir:{key}"
+
+
 def _get(key: str) -> Optional[Any]:
     if _EXTERNAL_ENABLED:
         try:
             from app.cache.response_cache import get_cached
-            return get_cached(key)
+            return get_cached(_ns(key))
         except Exception as exc:
             logger.debug("Valkey get failed, falling back to LRU: %s", exc)
     return _lru.get(key)
@@ -102,7 +114,7 @@ def _set(key: str, value: Any, ttl: int) -> None:
     if _EXTERNAL_ENABLED:
         try:
             from app.cache.response_cache import set_cached
-            set_cached(key, value, ttl)
+            set_cached(_ns(key), value, ttl)
             return
         except Exception as exc:
             logger.debug("Valkey set failed, falling back to LRU: %s", exc)
@@ -114,7 +126,9 @@ def _del_prefix(prefix: str) -> int:
     if _EXTERNAL_ENABLED:
         try:
             from app.cache.response_cache import invalidate_pattern
-            count += invalidate_pattern(prefix)
+            # Valkey scan_iter 는 glob 패턴을 사용하므로 prefix 에 * 를 붙여야
+            # "prefix*" 로 하위 키를 모두 매칭한다.
+            count += invalidate_pattern(f"{prefix}*")
         except Exception as exc:
             logger.debug("Valkey del_prefix failed, falling back to LRU: %s", exc)
     count += _lru.delete_prefix(prefix)

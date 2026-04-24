@@ -68,7 +68,7 @@ class TestEvaluationRunRepository:
         run_id = str(uuid4())
         now = datetime.now(timezone.utc)
         conn, cur = _mock_conn(
-            fetchone_val=(run_id, "batch1", "queued", "scope1", "user1", "user", 3, now),
+            fetchone_val=dict(zip(cols, (run_id, "batch1", "queued", "scope1", "user1", "user", 3, now))),
             description=cols,
         )
         repo = EvaluationRunRepository(conn)
@@ -98,7 +98,7 @@ class TestEvaluationRunRepository:
         run_id = str(uuid4())
         vals = (run_id, "b", "completed", "s", "u", "user",
                 3, 3, 0, 0.85, 0, 0.0, 0.0, 10.0, None, None, datetime.now(timezone.utc))
-        conn, cur = _mock_conn(fetchone_val=vals, description=cols)
+        conn, cur = _mock_conn(fetchone_val=dict(zip(cols, vals)), description=cols)
         repo = EvaluationRunRepository(conn)
         result = repo.get_by_id(run_id, "s")
         assert result is not None
@@ -113,10 +113,10 @@ class TestEvaluationRunRepository:
         # COUNT(*) returns 2, then list returns 2 rows
         run_id1, run_id2 = str(uuid4()), str(uuid4())
         now = datetime.now(timezone.utc)
-        cur.fetchone.return_value = (2,)
+        cur.fetchone.return_value = {"total": 2}
         cur.fetchall.return_value = [
-            (run_id1, "b1", "completed", "s", "u", "user", 3, 3, 0, 0.8, 1.0, now, now),
-            (run_id2, "b2", "queued",    "s", "u", "user", 5, 0, 0, None, None, now, None),
+            dict(zip(cols, (run_id1, "b1", "completed", "s", "u", "user", 3, 3, 0, 0.8, 1.0, now, now))),
+            dict(zip(cols, (run_id2, "b2", "queued",    "s", "u", "user", 5, 0, 0, None, None, now, None))),
         ]
         repo = EvaluationRunRepository(conn)
         items, total = repo.list_by_scope("s")
@@ -170,8 +170,8 @@ class TestEvaluationResultRecordRepository:
                 "overall_score", "total_latency_ms", "total_tokens", "estimated_cost",
                 "created_at"]
         now = datetime.now(timezone.utc)
-        row = (str(uuid4()), "item-1", "Q?", "A.",
-               0.8, 0.7, 0.6, 0.5, 1.0, 0.0, 0.75, 30.0, 15, 0.003, now)
+        row = dict(zip(cols, (str(uuid4()), "item-1", "Q?", "A.",
+               0.8, 0.7, 0.6, 0.5, 1.0, 0.0, 0.75, 30.0, 15, 0.003, now)))
         conn, cur = _mock_conn(fetchall_val=[row], description=cols)
         repo = EvaluationResultRecordRepository(conn)
         results = repo.list_by_run("run-1")

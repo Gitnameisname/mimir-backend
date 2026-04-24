@@ -419,12 +419,15 @@ class DiffSummaryGenerator:
         self,
         node_diffs: list[NodeDiff],
         nodes_b: list[Node],
+        nodes_a: Optional[list[Node]] = None,
     ) -> DiffSummary:
         """변경 요약 생성.
 
         Args:
             node_diffs: NodeDiffer.diff() 결과 (UNCHANGED 포함 여부 무관)
             nodes_b: 이후 버전 노드 목록 (부모 탐색에 사용)
+            nodes_a: 이전 버전 노드 목록 (DELETED 노드의 부모 탐색 fallback).
+                     None 이면 DELETED 노드의 최상위 섹션을 찾을 수 없을 수 있음.
         """
         counts: dict[ChangeType, int] = {ct: 0 for ct in ChangeType}
         for nd in node_diffs:
@@ -715,8 +718,8 @@ class DiffService:
                 details=[{"field": "nodes", "reason": "DIFF_TOO_LARGE"}],
             )
 
-        # 요약 생성
-        summary = diff_summary_generator.generate(diffs, nodes_b)
+        # 요약 생성 — DELETED 노드 부모 탐색을 위해 nodes_a 도 전달
+        summary = diff_summary_generator.generate(diffs, nodes_b, nodes_a=nodes_a)
 
         result = DiffResult(
             document_id=document_id,
