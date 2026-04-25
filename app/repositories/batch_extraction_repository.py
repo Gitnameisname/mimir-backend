@@ -7,13 +7,15 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import List, Optional
 from uuid import UUID, uuid4
 
 import psycopg2.extras
 
 from app.models.batch_extraction import BatchExtractionJob, BatchJobStatus, ExtractionRetryLog
+from app.utils.time import utcnow
+from app.utils.converters import uuid_str_or_none
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +88,7 @@ class BatchExtractionJobRepository:
             cur.execute(sql, {
                 "schema_id": extraction_schema_id,
                 "schema_ver": extraction_schema_version,
-                "scope": str(scope_profile_id) if scope_profile_id else None,
+                "scope": uuid_str_or_none(scope_profile_id),
                 "total": total_count,
                 "date_from": date_from,
                 "date_to": date_to,
@@ -139,7 +141,7 @@ class BatchExtractionJobRepository:
         new_status: BatchJobStatus,
         error_summary: Optional[str] = None,
     ) -> Optional[BatchExtractionJob]:
-        now = datetime.now(timezone.utc)
+        now = utcnow()
         extra_sets = []
         params: dict = {
             "status": new_status.value,

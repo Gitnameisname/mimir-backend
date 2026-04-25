@@ -25,6 +25,7 @@ import psycopg2.extras
 from app.config import settings
 from app.services.chunking_service import DocumentChunk, chunking_service
 from app.services.embedding_service import EmbeddingProvider, get_embedding_provider
+from app.utils.json_utils import loads_maybe
 
 logger = logging.getLogger(__name__)
 
@@ -85,8 +86,7 @@ def _get_permission_snapshot(
                 return PermissionSnapshot()
 
             metadata = row.get("metadata") or {}
-            if isinstance(metadata, str):
-                metadata = json.loads(metadata)
+            metadata = loads_maybe(metadata)
             org_ids = _extract_acl_values(metadata, _ORG_METADATA_KEYS)
             user_ids = _extract_acl_values(metadata, _USER_METADATA_KEYS)
             user_ids.extend(_normalize_acl_values(row.get("created_by")))

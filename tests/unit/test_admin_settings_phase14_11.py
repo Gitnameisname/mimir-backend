@@ -61,8 +61,17 @@ def run_checks() -> list[tuple[str, bool, str]]:
     check("API-07: 키 형식 검증 (regex)", "^[a-z][a-z0-9_]{0,254}$" in admin_py and "유효하지 않은 키 형식" in admin_py)
     check("API-08: 타입 일치 검증 (_type_signature)", "_type_signature" in admin_py and 'isinstance(v, bool)' in admin_py)
     check("API-09: bool != int 구분 (boolean을 int로 오인 방지)", 'if isinstance(v, bool):\n                return "bool"' in admin_py)
-    check("API-10: 404 — 키/카테고리 없음", "status_code=404" in admin_py and "찾을 수 없습니다" in admin_py)
-    check("API-11: 422 — 타입 불일치", "status_code=422" in admin_py and "값 타입이 일치하지 않습니다" in admin_py)
+    # 도서관 §1.5 BE-G3 (2026-04-25): admin.py 의 raise HTTPException(status_code=N, ...) 가
+    # not_found(...) / unprocessable_entity(...) helper 호출로 마이그레이션됨.
+    # 두 패턴 모두 인지 (raw status_code= 또는 helper 호출 어느 쪽이든 OK).
+    check(
+        "API-10: 404 — 키/카테고리 없음",
+        ("status_code=404" in admin_py or "not_found(" in admin_py) and "찾을 수 없습니다" in admin_py,
+    )
+    check(
+        "API-11: 422 — 타입 불일치",
+        ("status_code=422" in admin_py or "unprocessable_entity(" in admin_py) and "값 타입이 일치하지 않습니다" in admin_py,
+    )
 
     check(
         "SEC-01: 모든 settings 엔드포인트에 require_admin_access",

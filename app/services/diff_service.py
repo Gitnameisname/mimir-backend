@@ -40,6 +40,7 @@ from app.schemas.diff import (
     NodeSnapshot,
     VersionRef,
 )
+from app.utils.json_utils import dumps_ko
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +77,7 @@ def normalize_content(value: Any) -> str:
     if value is None:
         return ""
     if isinstance(value, (dict, list)):
-        return json.dumps(value, sort_keys=True, ensure_ascii=False)
+        return dumps_ko(value, sort_keys=True)
     return str(value).rstrip()
 
 

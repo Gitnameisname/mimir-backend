@@ -16,8 +16,9 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Iterable
+from app.utils.time import utcnow
 
 _FIELD_RANGES = [
     (0, 59),   # minute
@@ -164,7 +165,7 @@ def next_run(expr: str, now: datetime | None = None) -> datetime | None:
     dows = _parse_field(dow_tok, 0, 6)
 
     # Python 3.12+ datetime.utcnow() deprecated — aware UTC 를 naive 로 변환
-    _fallback = datetime.now(timezone.utc).replace(tzinfo=None)
+    _fallback = utcnow().replace(tzinfo=None)
     t = (now or _fallback).replace(second=0, microsecond=0) + timedelta(minutes=1)
     for _ in range(_MAX_ITERATIONS):
         # DOM + DOW: cron 관례 — 둘 다 제한 있으면 OR, 하나만 제한이면 AND

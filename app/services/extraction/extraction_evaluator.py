@@ -4,7 +4,7 @@ ExtractionEvaluator + EvaluationReportGenerator — Phase 8 FG8.3 (task8-10).
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import UUID
 
@@ -21,6 +21,7 @@ from app.services.extraction.diff_calculator import (
     SpanBasedDiffCalculator,
     _levenshtein_similarity,
 )
+from app.utils.time import utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -124,7 +125,7 @@ class ExtractionEvaluator:
             extraction_candidate_id=extraction_candidate_id,
             metrics=metrics,
             field_details=field_details,
-            evaluated_at=datetime.now(timezone.utc),
+            evaluated_at=utcnow(),
             actor_type=actor_type,
             scope_profile_id=scope_profile_id,
         )

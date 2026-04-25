@@ -18,6 +18,7 @@ from typing import Optional
 import redis
 
 from app.config import settings
+from app.utils.strings import normalize_lower
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +27,8 @@ _LOGIN_ATTEMPT_PREFIX = "login_attempts:"
 
 def _key(email: str) -> str:
     """이메일을 기반으로 Valkey 키를 생성한다."""
-    return f"{_LOGIN_ATTEMPT_PREFIX}{email.lower().strip()}"
+    # 도서관 §1.4 BE-G1 (2026-04-25): email 은 str → 결과도 str
+    return f"{_LOGIN_ATTEMPT_PREFIX}{normalize_lower(email) or ''}"
 
 
 def check_login_allowed(valkey: redis.Redis, email: str) -> bool:

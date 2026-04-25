@@ -17,11 +17,12 @@ S2 원칙 ⑦ (폐쇄망 호환):
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Optional
 
 from app.audit.emitter import audit_emitter
 from app.repositories.conversation_repository import ConversationRepository
+from app.utils.time import utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +74,7 @@ class ExpirationBatchJob:
               "errors": [str, ...],
             }
         """
-        started_at = datetime.now(timezone.utc)
+        started_at = utcnow()
         logger.info(
             "expiration_batch_start dry_run=%s limit=%s request_id=%s",
             dry_run, batch_limit, request_id,
@@ -134,7 +135,7 @@ class ExpirationBatchJob:
 
             self._conn.commit()
 
-            elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
+            elapsed = (utcnow() - started_at).total_seconds()
             logger.info(
                 "expiration_batch_complete expired=%s failed=%s elapsed_s=%.2f",
                 expired_count, failed_count, elapsed,

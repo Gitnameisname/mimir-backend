@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.config import settings
+from app.utils.json_utils import dumps_ko
 
 # --------------------------------------------------------------------------- #
 # 민감 필드 마스킹
@@ -104,7 +105,7 @@ class JsonFormatter(logging.Formatter):
         # 민감 필드 마스킹
         sanitized = _sanitize_record(log_entry)
 
-        return json.dumps(sanitized, ensure_ascii=False, default=str)
+        return dumps_ko(sanitized, default=str)
 
 
 # --------------------------------------------------------------------------- #

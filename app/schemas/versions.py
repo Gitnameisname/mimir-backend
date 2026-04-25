@@ -16,6 +16,7 @@ from enum import Enum
 from typing import Any, Optional
 
 from pydantic import BaseModel, Field, field_validator
+from app.utils.json_utils import dumps_ko
 
 _METADATA_MAX_BYTES = 65_536  # 64 KB
 _CONTENT_SNAPSHOT_MAX_BYTES = 10 * 1024 * 1024  # 10 MB
@@ -80,7 +81,7 @@ class VersionCreateRequest(BaseModel):
             return {}
         if not isinstance(v, dict):
             raise ValueError("metadata must be a key-value object (dict)")
-        serialized = json.dumps(v, ensure_ascii=False).encode()
+        serialized = dumps_ko(v).encode()
         if len(serialized) > _METADATA_MAX_BYTES:
             raise ValueError(f"metadata size exceeds {_METADATA_MAX_BYTES // 1024}KB limit")
         return v
@@ -108,13 +109,27 @@ class DraftSaveRequest(BaseModel):
     @field_validator("content_snapshot", mode="before")
     @classmethod
     def validate_content_snapshot(cls, v: Any) -> dict[str, Any]:
+        # Phase 1 FG 1-1: content_snapshot 루트 포맷을 강제한다.
+        #   - 반드시 dict 이고 크기 상한 이내
+        #   - type == "doc" (ProseMirror 표준 루트)
+        #   - content 필드가 list (빈 리스트는 허용 — 빈 문서)
+        # 과도기 호환: 과거 {type:"document"} 루트는 draft_service 에서 변환되므로
+        #   여기서는 받아들이지 않고 500 → 호출자는 구조 교정 후 재전송해야 한다.
         if not isinstance(v, dict):
             raise ValueError("content_snapshot must be a JSON object")
-        serialized = json.dumps(v, ensure_ascii=False).encode()
+        serialized = dumps_ko(v).encode()
         if len(serialized) > _CONTENT_SNAPSHOT_MAX_BYTES:
             raise ValueError(
                 f"content_snapshot size exceeds {_CONTENT_SNAPSHOT_MAX_BYTES // (1024*1024)}MB limit"
             )
+        root_type = v.get("type")
+        if root_type != "doc":
+            raise ValueError(
+                "content_snapshot root must be a ProseMirror doc (type='doc')"
+            )
+        content = v.get("content")
+        if not isinstance(content, list):
+            raise ValueError("content_snapshot.content must be a list of nodes")
         return v
 
 

@@ -8,11 +8,12 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from .citation import CitationDetector
 from .sentence_splitter import SentenceSplitter
+from app.utils.time import utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +23,7 @@ class MetricScore:
     metric_name: str
     score: float
     details: Dict[str, Any] = field(default_factory=dict)
-    computed_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    computed_at: datetime = field(default_factory=lambda: utcnow())
 
     def __post_init__(self) -> None:
         if not (0.0 <= self.score <= 1.0):

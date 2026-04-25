@@ -23,7 +23,7 @@ import hashlib
 import json
 import logging
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any, Optional
 from urllib.parse import urlencode
 
@@ -34,6 +34,8 @@ from app.api.auth.encryption import encrypt_token
 from app.api.auth.refresh_service import refresh_token_service
 from app import config
 from app.repositories.users_repository import users_repository
+from app.utils.strings import normalize_lower
+from app.utils.time import utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -250,7 +252,8 @@ class GitLabOAuthService:
             conn,
             provider="gitlab",
             provider_uid=provider_uid,
-            email=email.lower().strip(),
+            # 도서관 §1.4 BE-G1 (2026-04-25): email 은 str → 결과도 str
+            email=normalize_lower(email) or "",
             display_name=user_info.get("name", email.split("@")[0]),
             avatar_url=user_info.get("picture") or user_info.get("avatar_url"),
             gitlab_tokens=gitlab_tokens,
@@ -365,7 +368,7 @@ class GitLabOAuthService:
 
         token_expires_at = None
         if gitlab_tokens.get("expires_in"):
-            token_expires_at = datetime.now(timezone.utc) + timedelta(
+            token_expires_at = utcnow() + timedelta(
                 seconds=int(gitlab_tokens["expires_in"])
             )
 

@@ -17,6 +17,8 @@ from typing import Any, Optional
 
 import psycopg2.extensions
 
+from app.db.cursor_helpers import fetch_many_as, fetch_one_as
+
 logger = logging.getLogger(__name__)
 
 
@@ -44,52 +46,57 @@ class SettingsRepository:
     # ---------------------------------------------------------------
 
     def list_all(self, conn: psycopg2.extensions.connection) -> list[dict[str, Any]]:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT id, category, key, value, description, updated_by, updated_at
-                FROM system_settings
-                ORDER BY category, key
-                """
-            )
-            return [_row_to_setting(r) for r in cur.fetchall()]
+        # 도서관 §1.8 R4 (2026-04-25): fetch_many_as 위임
+        return fetch_many_as(
+            conn,
+            """
+            SELECT id, category, key, value, description, updated_by, updated_at
+            FROM system_settings
+            ORDER BY category, key
+            """,
+            (),
+            _row_to_setting,
+        )
 
     def list_by_category(
         self, conn: psycopg2.extensions.connection, category: str
     ) -> list[dict[str, Any]]:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT id, category, key, value, description, updated_by, updated_at
-                FROM system_settings
-                WHERE category = %s
-                ORDER BY key
-                """,
-                (category,),
-            )
-            return [_row_to_setting(r) for r in cur.fetchall()]
+        # 도서관 §1.8 R4 (2026-04-25): fetch_many_as 위임
+        return fetch_many_as(
+            conn,
+            """
+            SELECT id, category, key, value, description, updated_by, updated_at
+            FROM system_settings
+            WHERE category = %s
+            ORDER BY key
+            """,
+            (category,),
+            _row_to_setting,
+        )
 
     def get_one(
         self, conn: psycopg2.extensions.connection, category: str, key: str
     ) -> Optional[dict[str, Any]]:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT id, category, key, value, description, updated_by, updated_at
-                FROM system_settings
-                WHERE category = %s AND key = %s
-                """,
-                (category, key),
-            )
-            row = cur.fetchone()
-            return _row_to_setting(row) if row else None
+        # 도서관 §1.8 R4 (2026-04-25): fetch_one_as 위임
+        return fetch_one_as(
+            conn,
+            """
+            SELECT id, category, key, value, description, updated_by, updated_at
+            FROM system_settings
+            WHERE category = %s AND key = %s
+            """,
+            (category, key),
+            _row_to_setting,
+        )
 
     def list_categories(self, conn: psycopg2.extensions.connection) -> list[str]:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT DISTINCT category FROM system_settings ORDER BY category"
-            )
-            return [r["category"] for r in cur.fetchall()]
+        # 도서관 §1.8 R4 (2026-04-25): fetch_many_as 위임 (간단한 mapper)
+        return fetch_many_as(
+            conn,
+            "SELECT DISTINCT category FROM system_settings ORDER BY category",
+            (),
+            lambda r: r["category"],
+        )
 
     # ---------------------------------------------------------------
     # 업데이트

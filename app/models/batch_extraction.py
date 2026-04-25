@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+from app.utils.converters import uuid_str_or_none
 
 
 class BatchJobStatus(str, Enum):
@@ -156,7 +157,7 @@ class BatchExtractionJobResponse(BaseModel):
             estimated_completion_at=_dt(job.estimated_completion_at),
             error_summary=job.error_summary,
             failed_document_ids=job.failed_document_ids,
-            scope_profile_id=str(job.scope_profile_id) if job.scope_profile_id else None,
+            scope_profile_id=uuid_str_or_none(job.scope_profile_id),
             created_by=job.created_by,
             actor_type=job.actor_type,
         )

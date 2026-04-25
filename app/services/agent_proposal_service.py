@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Optional
 
 import psycopg2.extensions
@@ -34,6 +34,7 @@ from app.api.errors.exceptions import (
 from app.audit.emitter import audit_emitter
 from app.domain.workflow.enums import WorkflowStatus
 from app.repositories.versions_repository import versions_repository
+from app.utils.time import utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -91,12 +92,15 @@ class AgentProposalService:
         # 다음 버전 번호 계산
         version_number = versions_repository.get_next_version_number(conn, document_id)
 
-        # content를 nodes 형태로 저장할 snapshot 구성
-        content_snapshot = {"type": "text", "content": content}
+        # Phase 1 FG 1-1: content_snapshot 은 ProseMirror doc 표준 포맷이어야 한다.
+        # 과거 ``{type:"text", content: ...}`` 는 비표준이라 schemas/versions.py
+        # validator 를 통과하지 못한다. snapshot_sync_service 로 표준 변환.
+        from app.services.snapshot_sync_service import prosemirror_from_text
+        content_snapshot = prosemirror_from_text(content)
 
         # Version 생성 (workflow_status = proposed)
         version_id = str(uuid.uuid4())
-        now = datetime.now(timezone.utc)
+        now = utcnow()
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -123,6 +127,23 @@ class AgentProposalService:
                     now,
                 ),
             )
+
+        # Phase 1 FG 1-1: content_snapshot 단일 정본 정책 상 nodes 테이블도
+        # 즉시 파생 동기화한다. (INSERT 직후 FK 유효성 확보 + render_service /
+        # vectorization_service 가 동일 데이터 관측)
+        from app.services.snapshot_sync_service import (
+            rebuild_nodes_from_snapshot,
+            rebuild_tags_for_document,
+        )
+        rebuild_nodes_from_snapshot(conn, version_id, content_snapshot)
+        # S3 Phase 2 FG 2-2 (2026-04-24): 태그 파생 동기화.
+        # agent 제안도 본문에 hashtag / frontmatter 태그가 포함되면 자동 반영.
+        rebuild_tags_for_document(
+            conn,
+            document_id=document_id,
+            snapshot=content_snapshot,
+            metadata=metadata,
+        )
 
         # MCP Task 생성 (비동기 승인 플로우)
         mcp_task_id = self._create_mcp_task(
@@ -204,7 +225,7 @@ class AgentProposalService:
         current_state = self._get_current_workflow_status(conn, document_id)
 
         proposal_id = str(uuid.uuid4())
-        now = datetime.now(timezone.utc)
+        now = utcnow()
 
         # transition_proposals 등록
         with conn.cursor() as cur:
@@ -323,7 +344,7 @@ class AgentProposalService:
         if reviewer_role not in _REVIEWER_ROLES:
             raise ApiPermissionDeniedError("Draft 승인은 REVIEWER/APPROVER/ADMIN 역할이 필요합니다.")
 
-        now = datetime.now(timezone.utc)
+        now = utcnow()
 
         with conn.cursor() as cur:
             cur.execute(
@@ -396,7 +417,7 @@ class AgentProposalService:
         if reviewer_role not in _REVIEWER_ROLES:
             raise ApiPermissionDeniedError("Draft 반려는 REVIEWER/APPROVER/ADMIN 역할이 필요합니다.")
 
-        now = datetime.now(timezone.utc)
+        now = utcnow()
 
         with conn.cursor() as cur:
             cur.execute(
@@ -484,7 +505,7 @@ class AgentProposalService:
                 "proposed 상태만 회수 가능합니다."
             )
 
-        now = datetime.now(timezone.utc)
+        now = utcnow()
         document_id = str(row["document_id"])
 
         with conn.cursor() as cur:
@@ -555,7 +576,7 @@ class AgentProposalService:
             raise ApiPermissionDeniedError("롤백은 REVIEWER/APPROVER/ADMIN 역할이 필요합니다.")
 
         rollback_from = "approved" if original_action == "approve" else "rejected"
-        now = datetime.now(timezone.utc)
+        now = utcnow()
 
         rolled_back: list[str] = []
         skipped: list[str] = []
@@ -636,7 +657,7 @@ class AgentProposalService:
     ) -> str:
         """mcp_tasks 테이블에 Task 레코드를 생성하고 task_id를 반환한다."""
         task_id = str(uuid.uuid4())
-        now = datetime.now(timezone.utc)
+        now = utcnow()
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -663,7 +684,7 @@ class AgentProposalService:
         new_state: str,
     ) -> None:
         """Draft/Proposal 상태 변화를 MCP Task 상태에 동기화한다."""
-        now = datetime.now(timezone.utc)
+        now = utcnow()
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -713,7 +734,7 @@ class AgentProposalService:
         metadata: dict[str, Any],
     ) -> str:
         doc_id = str(uuid.uuid4())
-        now = datetime.now(timezone.utc)
+        now = utcnow()
         with conn.cursor() as cur:
             cur.execute(
                 """

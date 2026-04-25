@@ -30,6 +30,7 @@ import psycopg2.extras
 from app.config import settings
 from app.security.prompt_injection import content_directive_separator
 from app.services.embedding_service import get_embedding_provider
+from app.utils.json_utils import dumps_ko
 
 logger = logging.getLogger(__name__)
 
@@ -908,7 +909,7 @@ class RAGService:
 
 def _sse_data(payload: dict) -> str:
     """SSE data 라인 포맷으로 직렬화."""
-    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+    return f"data: {dumps_ko(payload)}\n\n"
 
 
 def _build_messages(question: str, history: list[dict]) -> list[dict]:

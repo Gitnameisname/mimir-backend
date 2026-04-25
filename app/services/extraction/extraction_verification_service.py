@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 from uuid import UUID
 
@@ -18,6 +18,8 @@ from app.models.extraction_record import (
     VerificationResult,
 )
 from app.services.extraction.diff_calculator import DiffCalculator
+from app.utils.time import utcnow
+from app.utils.converters import uuid_str_or_none
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +63,7 @@ class ExtractionVerificationService:
 
         return VerificationResult(
             extraction_candidate_id=original_record.extraction_candidate_id,
-            verified_at=datetime.now(timezone.utc),
+            verified_at=utcnow(),
             match_status=match_status,
             field_match_count=exact_count,
             field_total_count=total,
@@ -96,7 +98,7 @@ class ExtractionVerificationService:
             "verification_count": len(verification_results),
             "verifications": [
                 {
-                    "id": str(vr.id) if vr.id else None,
+                    "id": uuid_str_or_none(vr.id),
                     "verified_at": vr.verified_at.isoformat(),
                     "match_status": vr.match_status.value,
                     "field_accuracy": vr.field_accuracy,

@@ -160,28 +160,60 @@ def print_priority(packages: list[ModuleCoverage], *, min_lines: int = 50, top: 
 # ---------------------------------------------------------------------------
 
 
+#: 유효한 게이트 키 — CLI `--gates` 에서 사용.
+GATE_KEYS: tuple[str, ...] = ("overall", "services", "repositories")
+
+
 def check_thresholds(
     overall: ModuleCoverage,
     packages: list[ModuleCoverage],
     thresholds: dict[str, float] | None = None,
-) -> list[str]:
-    """미달 항목의 사람 친화 메시지 리스트를 반환. 빈 리스트면 합격."""
+    *,
+    enforced_gates: Iterable[str] | None = None,
+) -> tuple[list[str], list[str]]:
+    """게이트 검증 결과를 ``(failures, warnings)`` 튜플로 반환한다.
+
+    ``enforced_gates`` 가 지정되면 해당 게이트만 엄격(failure) 으로 검사하고,
+    나머지 비엄격 게이트의 미달은 ``warnings`` 로 분리 보고한다.
+
+    기본값(None) 은 기존 동작과 호환 — 모든 게이트를 엄격 검사한다.
+
+    Phase 1 FG 1-1: ``api.v1`` 라우터 커버리지 gap 으로 overall 75% 미달이
+    FG 0-3 종결 시점부터 지속되며 별도 FG 로 분리됐다. Phase 1~2 기간에는
+    ``--gates services,repositories`` 로 primary 게이트만 CI 차단하고
+    overall 은 경고로 받는다.
+    """
     t = {**DEFAULT_THRESHOLDS, **(thresholds or {})}
+    enforced = set(GATE_KEYS) if enforced_gates is None else set(enforced_gates)
+    # 방어: 알 수 없는 게이트 키는 무시 (로그 남기지 않음 — argparse 단에서 검증됨)
+    enforced = enforced & set(GATE_KEYS)
+
+    def _record(gate: str, msg: str) -> None:
+        (failures if gate in enforced else warnings).append(msg)
+
     failures: list[str] = []
+    warnings: list[str] = []
+
     if overall.rate < t["overall"]:
-        failures.append(f"overall {overall.rate:.2f}% < {t['overall']:.2f}%")
+        _record("overall", f"overall {overall.rate:.2f}% < {t['overall']:.2f}%")
 
     services = sum_prefix(packages, "services")
     if services.lines_valid > 0 and services.rate < t["services"]:
-        failures.append(f"app/services/ {services.rate:.2f}% < {t['services']:.2f}% "
-                        f"(covered={services.lines_covered}/valid={services.lines_valid})")
+        _record(
+            "services",
+            f"app/services/ {services.rate:.2f}% < {t['services']:.2f}% "
+            f"(covered={services.lines_covered}/valid={services.lines_valid})",
+        )
 
     repos = sum_prefix(packages, "repositories")
     if repos.lines_valid > 0 and repos.rate < t["repositories"]:
-        failures.append(f"app/repositories/ {repos.rate:.2f}% < {t['repositories']:.2f}% "
-                        f"(covered={repos.lines_covered}/valid={repos.lines_valid})")
+        _record(
+            "repositories",
+            f"app/repositories/ {repos.rate:.2f}% < {t['repositories']:.2f}% "
+            f"(covered={repos.lines_covered}/valid={repos.lines_valid})",
+        )
 
-    return failures
+    return failures, warnings
 
 
 # ---------------------------------------------------------------------------
@@ -257,7 +289,31 @@ def main(argv: list[str] | None = None) -> int:
                         help="services 임계값 (default 80)")
     parser.add_argument("--threshold-repos", type=float, default=None,
                         help="repositories 임계값 (default 80)")
+    parser.add_argument(
+        "--gates",
+        type=str,
+        default=None,
+        help=(
+            "엄격 검사할 게이트 쉼표 구분 목록. "
+            "유효값: overall,services,repositories. "
+            "예: '--gates services,repositories' 는 overall 미달을 warning 으로 분리 보고 (exit 0). "
+            "미지정 시 기존 동작 — 세 게이트 모두 엄격."
+        ),
+    )
     args = parser.parse_args(argv)
+
+    # --gates 파싱/검증
+    enforced_gates: list[str] | None = None
+    if args.gates is not None:
+        parts = [p.strip() for p in args.gates.split(",") if p.strip()]
+        unknown = [p for p in parts if p not in GATE_KEYS]
+        if unknown:
+            print(
+                f"[ERR] --gates 에 알 수 없는 키: {unknown}. 유효값: {list(GATE_KEYS)}",
+                file=sys.stderr,
+            )
+            return 2
+        enforced_gates = parts
 
     if not args.xml.exists():
         print(f"[ERR] coverage.xml not found: {args.xml}", file=sys.stderr)
@@ -282,7 +338,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.threshold_repos is not None:
             thresholds["repositories"] = args.threshold_repos
 
-        failures = check_thresholds(overall, packages, thresholds)
+        failures, warnings = check_thresholds(
+            overall, packages, thresholds, enforced_gates=enforced_gates,
+        )
+        if warnings:
+            print()
+            print("[WARN] 커버리지 임계값 미달 (비엄격 게이트 — exit 0):", file=sys.stderr)
+            for w in warnings:
+                print(f"  - {w}", file=sys.stderr)
         if failures:
             print()
             print("[FAIL] 커버리지 임계값 미달:", file=sys.stderr)
@@ -290,7 +353,10 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  - {f}", file=sys.stderr)
             return 1
         print()
-        print("[OK] 모든 임계값 충족")
+        if warnings:
+            print("[OK] 엄격 게이트 모두 충족 (비엄격 게이트 warning 포함)")
+        else:
+            print("[OK] 모든 임계값 충족")
     return 0
 
 

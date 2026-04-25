@@ -44,6 +44,9 @@ from app.schemas.agent import (
     ScopeProfileUpdate,
 )
 from app.services.filter_expression import parse_filter_expression
+from app.utils.http_errors import not_found, unprocessable_entity
+from app.utils.converters import uuid_str_or_none
+from app.repositories.pagination import paginate_page
 
 logger = logging.getLogger(__name__)
 
@@ -178,7 +181,7 @@ def get_scope_profile(
         repo = ScopeProfileRepository(conn)
         profile = repo.get_by_id(profile_id)
     if not profile:
-        raise HTTPException(status_code=404, detail="Scope Profile을 찾을 수 없습니다.")
+        raise not_found("Scope Profile을 찾을 수 없습니다.")
     return _profile_response(profile)
 
 
@@ -198,7 +201,7 @@ def update_scope_profile(
         repo = ScopeProfileRepository(conn)
         profile = repo.update(profile_id, name=body.name, description=body.description)
     if not profile:
-        raise HTTPException(status_code=404, detail="Scope Profile을 찾을 수 없습니다.")
+        raise not_found("Scope Profile을 찾을 수 없습니다.")
     audit_emitter.emit(
         event_type="scope_profile.updated",
         action="scope_profile.update",
@@ -227,7 +230,7 @@ def delete_scope_profile(
         repo = ScopeProfileRepository(conn)
         deleted = repo.delete(profile_id)
     if not deleted:
-        raise HTTPException(status_code=404, detail="Scope Profile을 찾을 수 없습니다.")
+        raise not_found("Scope Profile을 찾을 수 없습니다.")
     audit_emitter.emit(
         event_type="scope_profile.deleted",
         action="scope_profile.delete",
@@ -256,13 +259,13 @@ def upsert_scope_definition(
     try:
         parse_filter_expression(body.acl_filter)
     except ValueError as exc:
-        raise HTTPException(status_code=422, detail=f"acl_filter 오류: {exc}")
+        raise unprocessable_entity(f"acl_filter 오류: {exc}")
 
     with get_db() as conn:
         sp_repo = ScopeProfileRepository(conn)
         profile = sp_repo.get_by_id(profile_id)
         if not profile:
-            raise HTTPException(status_code=404, detail="Scope Profile을 찾을 수 없습니다.")
+            raise not_found("Scope Profile을 찾을 수 없습니다.")
         sd = sp_repo.add_definition(
             profile_id,
             scope_name=body.scope_name,
@@ -294,7 +297,7 @@ def delete_scope_definition(
         repo = ScopeProfileRepository(conn)
         deleted = repo.delete_definition(profile_id, scope_name)
     if not deleted:
-        raise HTTPException(status_code=404, detail="Scope Definition을 찾을 수 없습니다.")
+        raise not_found("Scope Definition을 찾을 수 없습니다.")
 
 
 # ===========================================================================
@@ -372,7 +375,7 @@ def get_agent(
         repo = AgentRepository(conn)
         agent = repo.get_by_id(agent_id)
     if not agent:
-        raise HTTPException(status_code=404, detail="에이전트를 찾을 수 없습니다.")
+        raise not_found("에이전트를 찾을 수 없습니다.")
     return _agent_response(agent)
 
 
@@ -396,7 +399,7 @@ def update_agent(
             scope_profile_id=body.scope_profile_id,
         )
     if not agent:
-        raise HTTPException(status_code=404, detail="에이전트를 찾을 수 없습니다.")
+        raise not_found("에이전트를 찾을 수 없습니다.")
     audit_emitter.emit(
         event_type="agent.updated",
         action="agent.update",
@@ -423,7 +426,7 @@ def delete_agent(
         repo = AgentRepository(conn)
         deleted = repo.delete(agent_id)
     if not deleted:
-        raise HTTPException(status_code=404, detail="에이전트를 찾을 수 없습니다.")
+        raise not_found("에이전트를 찾을 수 없습니다.")
     audit_emitter.emit(
         event_type="agent.deleted",
         action="agent.delete",
@@ -454,7 +457,7 @@ async def activate_kill_switch(
         repo = AgentRepository(conn)
         agent = repo.enable_kill_switch(agent_id, reason=body.reason)
     if not agent:
-        raise HTTPException(status_code=404, detail="에이전트를 찾을 수 없습니다.")
+        raise not_found("에이전트를 찾을 수 없습니다.")
     audit_emitter.emit(
         event_type="agent.kill_switch_activated",
         action="agent.kill_switch.activate",
@@ -488,7 +491,7 @@ def deactivate_kill_switch(
         repo = AgentRepository(conn)
         agent = repo.disable_kill_switch(agent_id)
     if not agent:
-        raise HTTPException(status_code=404, detail="에이전트를 찾을 수 없습니다.")
+        raise not_found("에이전트를 찾을 수 없습니다.")
     audit_emitter.emit(
         event_type="agent.kill_switch_deactivated",
         action="agent.kill_switch.deactivate",
@@ -590,7 +593,7 @@ def get_agent_audit(
         params.append(end_date)
 
     where = " AND ".join(conditions)
-    offset = (page - 1) * page_size
+    page, page_size, offset = paginate_page(page, page_size)
 
     with get_db() as conn:
         with conn.cursor() as cur:
@@ -711,7 +714,7 @@ def get_agent_statistics(
         withdrawn_count=withdrawn_count,
         approval_rate=approval_rate,
         average_review_time_minutes=avg_review_minutes,
-        last_activity=last_activity.isoformat() if last_activity and hasattr(last_activity, "isoformat") else str(last_activity) if last_activity else None,
+        last_activity=last_activity.isoformat() if last_activity and hasattr(last_activity, "isoformat") else uuid_str_or_none(last_activity),
         rejection_reasons=rejection_reasons,
     )
 

@@ -320,15 +320,20 @@ class TestCitationServiceVerify:
         assert resp.verified is True
         assert resp.modified is False
 
-    @pytest.mark.skip(reason="FG0-3 S14-fix: Citation content_hash 64자 SHA-256 생성 필요 — 후속 세션")
     def test_hash_mismatch_returns_modified_true(self):
+        """Phase 1 FG 1-3 (skip 복구). content_hash 는 64자 hex 여야 CitationService
+        입력 규약과 호환된다. 실 chunk 의 sha256 과 다른 임의 64자 hex 를 넘기면
+        verified=False + modified=True 로 검출돼야 한다.
+        """
         from app.services.retrieval.citation_service import CitationService
 
         conn, _ = _make_conn(fetchone_value=_chunk_row("다른 본문"))
         svc = CitationService(conn)
+        stale_hash = "deadbeef" * 8  # 8*8 = 64 chars, valid lowercase hex
+        assert len(stale_hash) == 64
         resp = svc.verify(
             document_id=DOC_UUID, version_id=VER_UUID, node_id=NODE_UUID,
-            content_hash="stale-hash" * 8,   # 64자 대충
+            content_hash=stale_hash,
             actor_role="VIEWER",
         )
         assert resp is not None

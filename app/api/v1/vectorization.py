@@ -41,10 +41,7 @@ _MAX_QUERY_LEN = 500  # 임베딩 비용 방어: 500자 이상 쿼리 차단
 
 def _validate_uuid(value: str, field: str) -> None:
     if not _UUID_RE.match(value):
-        raise HTTPException(
-            status_code=400,
-            detail=f"{field}이(가) 유효한 UUID 형식이 아닙니다.",
-        )
+        raise bad_request(f"{field}이(가) 유효한 UUID 형식이 아닙니다.")
 
 from app.api.auth import ResourceRef, authorization_service, resolve_current_actor
 from app.api.auth.models import ActorContext
@@ -59,6 +56,9 @@ from app.services.vectorization_status_service import (
     can_user_reindex,
     get_vectorization_status,
 )
+from app.utils.http_errors import bad_request, not_found, unprocessable_entity
+from app.utils.converters import uuid_str_or_none
+from app.repositories.pagination import paginate_page
 
 # 시맨틱 검색 rate limit: 임베딩 API 비용 DoS 방어
 _SEMANTIC_SEARCH_LIMIT = "30/minute"
@@ -110,15 +110,15 @@ def _require_admin_or_creator(
         )
         row = cur.fetchone()
     if not row:
-        raise HTTPException(status_code=404, detail="문서를 찾을 수 없습니다.")
+        raise not_found("문서를 찾을 수 없습니다.")
     created_by = row.get("created_by") if isinstance(row, dict) else row[0]
 
     actor_user_id = getattr(actor, "user_id", None) or getattr(actor, "actor_id", None)
     actor_role = getattr(actor, "role", None)
     if not can_user_reindex(
-        actor_user_id=str(actor_user_id) if actor_user_id else None,
-        actor_role=str(actor_role) if actor_role else None,
-        document_created_by=str(created_by) if created_by else None,
+        actor_user_id=uuid_str_or_none(actor_user_id),
+        actor_role=uuid_str_or_none(actor_role),
+        document_created_by=uuid_str_or_none(created_by),
     ):
         raise HTTPException(
             status_code=403,
@@ -158,7 +158,7 @@ def reindex_document(
 
         # FG 0-5: 쿨다운 — 문서+actor 당 10초
         actor_user_id = getattr(actor, "user_id", None) or getattr(actor, "actor_id", None)
-        cool = _cooldown_try_acquire(document_id, str(actor_user_id) if actor_user_id else None)
+        cool = _cooldown_try_acquire(document_id, uuid_str_or_none(actor_user_id))
         if not cool.acquired:
             response.headers["Retry-After"] = str(max(1, cool.remaining_sec))
             raise HTTPException(
@@ -175,11 +175,11 @@ def reindex_document(
             row = cur.fetchone()
 
         if not row:
-            raise HTTPException(status_code=404, detail="문서를 찾을 수 없습니다.")
+            raise not_found("문서를 찾을 수 없습니다.")
 
         version_id = row.get("current_published_version_id") if isinstance(row, dict) else row[0]
         if not version_id:
-            raise HTTPException(status_code=422, detail="Published 버전이 없어 벡터화할 수 없습니다.")
+            raise unprocessable_entity("Published 버전이 없어 벡터화할 수 없습니다.")
 
         job_id = str(uuid.uuid4())
         result = vectorization_pipeline.vectorize_version(
@@ -202,7 +202,7 @@ def reindex_document(
         audit_emitter.emit(
             event_type="vectorization.reindex_requested",
             action="vectorization.reindex",
-            actor_id=str(actor_user_id) if actor_user_id else None,
+            actor_id=uuid_str_or_none(actor_user_id),
             actor_type=actor_type_str,
             resource_type="document",
             resource_id=document_id,
@@ -273,16 +273,16 @@ def get_document_vectorization_status(
         info = get_vectorization_status(
             conn,
             document_id,
-            actor_user_id=str(actor_user_id) if actor_user_id else None,
-            actor_role=str(actor_role) if actor_role else None,
+            actor_user_id=uuid_str_or_none(actor_user_id),
+            actor_role=uuid_str_or_none(actor_role),
             cooldown_remaining_sec=_cooldown_peek(
                 document_id,
-                str(actor_user_id) if actor_user_id else None,
+                uuid_str_or_none(actor_user_id),
             ),
         )
 
     if info is None:
-        raise HTTPException(status_code=404, detail="문서를 찾을 수 없습니다.")
+        raise not_found("문서를 찾을 수 없습니다.")
 
     return success_response(
         data=info.to_dict(),
@@ -507,7 +507,7 @@ def list_chunks(
             conditions.append("embedding IS NULL")
 
     where = " AND ".join(conditions)
-    offset = (page - 1) * limit
+    page, limit, offset = paginate_page(page, limit)
 
     with get_db() as conn:
         with conn.cursor() as cur:
@@ -605,7 +605,7 @@ def get_token_usage(
     _require_admin(actor, request)
     request_id, trace_id = get_request_ids(request)
 
-    offset = (page - 1) * limit
+    page, limit, offset = paginate_page(page, limit)
 
     with get_db() as conn:
         with conn.cursor() as cur:
@@ -675,7 +675,7 @@ def semantic_search(
     actor_role = getattr(actor, "role", None)
 
     if not body.q or not body.q.strip():
-        raise HTTPException(status_code=400, detail="검색어를 입력해주세요.")
+        raise bad_request("검색어를 입력해주세요.")
 
     with get_db() as conn:
         results = vectorization_pipeline.semantic_search(

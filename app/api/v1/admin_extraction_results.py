@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import List, Optional
 from uuid import UUID
 
@@ -60,6 +60,10 @@ from app.schemas.admin_extraction_results import (
     ExtractionResultSummary,
     map_status_to_external,
 )
+from app.utils.time import utcnow
+from app.utils.http_errors import conflict, not_found, unprocessable_entity
+from app.utils.converters import uuid_str_or_none
+from app.repositories.pagination import paginate_page
 
 logger = logging.getLogger(__name__)
 
@@ -112,10 +116,7 @@ def _parse_scope(raw: Optional[str]) -> Optional[UUID]:
     try:
         return UUID(raw)
     except ValueError:
-        raise HTTPException(
-            status_code=422,
-            detail="scope_profile_id 가 유효한 UUID 가 아닙니다.",
-        )
+        raise unprocessable_entity("scope_profile_id 가 유효한 UUID 가 아닙니다.")
 
 
 def _normalize_document_type(raw: Optional[str]) -> Optional[str]:
@@ -123,13 +124,8 @@ def _normalize_document_type(raw: Optional[str]) -> Optional[str]:
         return None
     value = raw.strip().upper()
     if not _DOC_TYPE_RE.match(value):
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"document_type (='{raw}') 가 형식에 맞지 않습니다. "
-                "영문자로 시작해 영문/숫자/하이픈/언더스코어만 허용됩니다."
-            ),
-        )
+        raise unprocessable_entity(f"document_type (='{raw}') 가 형식에 맞지 않습니다. "
+                "영문자로 시작해 영문/숫자/하이픈/언더스코어만 허용됩니다.")
     return value
 
 
@@ -145,13 +141,8 @@ def _parse_status_filter(raw: Optional[str]) -> Optional[List[ExtractionStatus]]
     if raw is None or raw == "":
         return None
     if raw not in _VALID_EXTERNAL_STATUS:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"status='{raw}' 는 허용되지 않습니다. "
-                f"허용값: {sorted(_VALID_EXTERNAL_STATUS)}"
-            ),
-        )
+        raise unprocessable_entity(f"status='{raw}' 는 허용되지 않습니다. "
+                f"허용값: {sorted(_VALID_EXTERNAL_STATUS)}")
     if raw == "pending_review":
         return [ExtractionStatus.PENDING]
     if raw == "approved":
@@ -233,7 +224,7 @@ def list_extraction_results(
     doc_type = _normalize_document_type(document_type)
     scope_uuid = _parse_scope(scope_profile_id)
 
-    offset = (page - 1) * page_size
+    page, page_size, offset = paginate_page(page, page_size)
 
     with get_db() as conn:
         repo = ExtractionCandidateRepository(conn)
@@ -281,14 +272,14 @@ def get_extraction_result(
         row = repo.get_for_admin_detail(extraction_id)
 
     if not row:
-        raise HTTPException(status_code=404, detail="추출 결과를 찾을 수 없습니다.")
+        raise not_found("추출 결과를 찾을 수 없습니다.")
 
     # scope 가 제공된 경우 교차 열람 차단.
     if scope_uuid is not None:
         candidate_scope = row.get("scope_profile_id")
         if candidate_scope is not None and UUID(str(candidate_scope)) != scope_uuid:
             # 존재 여부 노출 회피 — 다른 scope 의 리소스는 404 로 응답.
-            raise HTTPException(status_code=404, detail="추출 결과를 찾을 수 없습니다.")
+            raise not_found("추출 결과를 찾을 수 없습니다.")
 
     return success_response(
         data=_row_to_detail_payload(row),
@@ -315,7 +306,7 @@ def approve_extraction_result(
 ):
     actor_id = actor.actor_id or "anonymous"
     overrides = body.overrides or {}
-    now = datetime.now(timezone.utc)
+    now = utcnow()
 
     with get_db() as conn:
         cand_repo = ExtractionCandidateRepository(conn)
@@ -323,14 +314,9 @@ def approve_extraction_result(
 
         candidate = cand_repo.get_by_id(extraction_id)
         if not candidate:
-            raise HTTPException(status_code=404, detail="추출 결과를 찾을 수 없습니다.")
+            raise not_found("추출 결과를 찾을 수 없습니다.")
         if candidate.status != ExtractionStatus.PENDING:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"이미 처리된 추출 결과입니다 (현재 상태: {candidate.status.value})."
-                ),
-            )
+            raise conflict(f"이미 처리된 추출 결과입니다 (현재 상태: {candidate.status.value}).")
 
         # overrides 가 비어 있으면 원본 추출 필드를 그대로 승인(approve 경로).
         # overrides 가 있으면 필드별 덮어쓰기 + human_edits 기록(modify 경로).
@@ -411,10 +397,7 @@ def approve_extraction_result(
     if not updated:
         # 동시성으로 인해 update 가 race 했을 때. 캔디데이트가 일관되게
         # 변경되지 못했음을 409 로 통보.
-        raise HTTPException(
-            status_code=409,
-            detail="추출 결과 상태가 변경되었습니다. 다시 시도해주세요.",
-        )
+        raise conflict("추출 결과 상태가 변경되었습니다. 다시 시도해주세요.")
 
     audit_emitter.emit_for_actor(
         actor=actor,
@@ -431,7 +414,7 @@ def approve_extraction_result(
             "document_id": str(candidate.document_id),
             "document_type_code": candidate.extraction_schema_id,
             "scope_profile_id": (
-                str(candidate.scope_profile_id) if candidate.scope_profile_id else None
+                uuid_str_or_none(candidate.scope_profile_id)
             ),
         },
     )
@@ -476,14 +459,9 @@ def reject_extraction_result(
         cand_repo = ExtractionCandidateRepository(conn)
         candidate = cand_repo.get_by_id(extraction_id)
         if not candidate:
-            raise HTTPException(status_code=404, detail="추출 결과를 찾을 수 없습니다.")
+            raise not_found("추출 결과를 찾을 수 없습니다.")
         if candidate.status != ExtractionStatus.PENDING:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"이미 처리된 추출 결과입니다 (현재 상태: {candidate.status.value})."
-                ),
-            )
+            raise conflict(f"이미 처리된 추출 결과입니다 (현재 상태: {candidate.status.value}).")
 
         updated = cand_repo.update_status(
             extraction_id,
@@ -493,10 +471,7 @@ def reject_extraction_result(
         )
 
     if not updated:
-        raise HTTPException(
-            status_code=409,
-            detail="추출 결과 상태가 변경되었습니다. 다시 시도해주세요.",
-        )
+        raise conflict("추출 결과 상태가 변경되었습니다. 다시 시도해주세요.")
 
     audit_emitter.emit_for_actor(
         actor=actor,
@@ -512,7 +487,7 @@ def reject_extraction_result(
             "document_id": str(candidate.document_id),
             "document_type_code": candidate.extraction_schema_id,
             "scope_profile_id": (
-                str(candidate.scope_profile_id) if candidate.scope_profile_id else None
+                uuid_str_or_none(candidate.scope_profile_id)
             ),
         },
     )

@@ -46,6 +46,8 @@ from app.schemas.extraction import (
 )
 
 from fastapi import Depends, Request
+from app.utils.actor import actor_type_str
+from app.utils.http_errors import conflict, not_found, unprocessable_entity
 
 logger = logging.getLogger(__name__)
 
@@ -93,19 +95,11 @@ def _normalize_doc_type_path(raw: str) -> str:
     없다 (P7-1 보안보고서 C2 와 같은 논리).
     """
     if raw is None:
-        raise HTTPException(
-            status_code=422,
-            detail="doc_type 경로 파라미터가 비어 있음",
-        )
+        raise unprocessable_entity("doc_type 경로 파라미터가 비어 있음")
     value = raw.strip().upper()
     if not _DOC_TYPE_PATH_RE.match(value):
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"doc_type (='{raw}') 가 형식에 맞지 않음. "
-                "영문자로 시작해 영문/숫자/하이픈/언더스코어만 허용됨."
-            ),
-        )
+        raise unprocessable_entity(f"doc_type (='{raw}') 가 형식에 맞지 않음. "
+                "영문자로 시작해 영문/숫자/하이픈/언더스코어만 허용됨.")
     return value
 
 
@@ -114,10 +108,16 @@ def _normalize_doc_type_path(raw: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _actor_info(actor: ActorContext) -> ActorInfo:
+    """도서관 §1.6 BE-G4 (2026-04-25): app.utils.actor.actor_type_str 위임.
+
+    기존 로직은 SERVICE / 알 수 없는 값 → "user" 로 좁혔음. 신규 helper 는
+    SERVICE → "system" 매핑이지만 ActorInfo 가 "user"|"agent" 만 허용하므로
+    명시적으로 "system" → "user" 로 좁힌다 (이 ActorInfo 용도는 "사람/에이전트"
+    이분법이지 시스템 주체를 별도로 다루지 않음).
+    """
     actor_id = actor.actor_id or "anonymous"
-    actor_type = actor.actor_type.value if actor.actor_type else "user"
-    if actor_type not in ("user", "agent"):
-        actor_type = "user"
+    mapped = actor_type_str(actor)
+    actor_type = mapped if mapped in ("user", "agent") else "user"
     return ActorInfo(actor_id=actor_id, actor_type=actor_type)
 
 
@@ -145,8 +145,7 @@ def list_extraction_schemas(
         try:
             parsed_scope = UUID(scope_profile_id)
         except ValueError:
-            raise HTTPException(status_code=422, detail="scope_profile_id가 유효한 UUID가 아님")
-
+            raise unprocessable_entity("scope_profile_id가 유효한 UUID가 아님")
     with get_db() as conn:
         repo = ExtractionSchemaRepository(conn)
         schemas = repo.list_all(
@@ -187,8 +186,7 @@ def create_extraction_schema(
         try:
             scope_profile_id = UUID(body.scope_profile_id)
         except ValueError:
-            raise HTTPException(status_code=422, detail="scope_profile_id가 유효한 UUID가 아님")
-
+            raise unprocessable_entity("scope_profile_id가 유효한 UUID가 아님")
     try:
         with get_db() as conn:
             repo = ExtractionSchemaRepository(conn)
@@ -200,9 +198,9 @@ def create_extraction_schema(
                 extra_metadata=body.extra_metadata,
             )
     except ExtractionSchemaAlreadyExistsError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
+        raise conflict(str(exc))
     except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
+        raise unprocessable_entity(str(exc))
     except psycopg2.errors.ForeignKeyViolation:
         # P7-1-a / P7-2-a: extraction_schemas.doc_type_code -> document_types.type_code 참조.
         # document_types 에 해당 코드가 없으면 psycopg2 가 ForeignKeyViolation 을
@@ -218,9 +216,7 @@ def create_extraction_schema(
             "extraction_schema create blocked: doc_type_code=%r not in document_types",
             body.doc_type_code,
         )
-        raise HTTPException(
-            status_code=422,
-            detail={
+        raise unprocessable_entity({
                 "code": ERR_DOC_TYPE_NOT_FOUND,
                 "message": (
                     f"DocumentType '{body.doc_type_code}' 이(가) 존재하지 않습니다. "
@@ -230,8 +226,7 @@ def create_extraction_schema(
                     "href": "/admin/document-types",
                     "label": "문서 유형 관리 열기",
                 },
-            },
-        )
+            })
     except Exception:
         logger.exception("extraction_schema create failed")
         raise HTTPException(status_code=500, detail="내부 서버 오류가 발생했습니다.")
@@ -273,8 +268,7 @@ def get_extraction_schema(
         try:
             parsed_scope = UUID(scope_profile_id)
         except ValueError:
-            raise HTTPException(status_code=422, detail="scope_profile_id가 유효한 UUID가 아님")
-
+            raise unprocessable_entity("scope_profile_id가 유효한 UUID가 아님")
     with get_db() as conn:
         repo = ExtractionSchemaRepository(conn)
         schema = repo.get_by_doc_type(
@@ -284,8 +278,7 @@ def get_extraction_schema(
         )
 
     if not schema:
-        raise HTTPException(status_code=404, detail=f"doc_type_code={doc_type!r}에 대한 추출 스키마 없음")
-
+        raise not_found(f"doc_type_code={doc_type!r}에 대한 추출 스키마 없음")
     return success_response(data=ExtractionSchemaResponse.from_domain(schema).model_dump())
 
 
@@ -312,8 +305,7 @@ def get_extraction_schema_versions(
         try:
             parsed_scope = UUID(scope_profile_id)
         except ValueError:
-            raise HTTPException(status_code=422, detail="scope_profile_id가 유효한 UUID가 아님")
-
+            raise unprocessable_entity("scope_profile_id가 유효한 UUID가 아님")
     with get_db() as conn:
         repo = ExtractionSchemaRepository(conn)
         versions = repo.get_versions(
@@ -364,29 +356,21 @@ def diff_extraction_schema_versions(
     doc_type = _normalize_doc_type_path(doc_type)  # P7-2-b
 
     if base_version == target_version:
-        raise HTTPException(status_code=422, detail="base_version 과 target_version 이 같음")
-
+        raise unprocessable_entity("base_version 과 target_version 이 같음")
     parsed_scope: Optional[UUID] = None
     if scope_profile_id:
         try:
             parsed_scope = UUID(scope_profile_id)
         except ValueError:
-            raise HTTPException(status_code=422, detail="scope_profile_id가 유효한 UUID가 아님")
-
+            raise unprocessable_entity("scope_profile_id가 유효한 UUID가 아님")
     with get_db() as conn:
         repo = ExtractionSchemaRepository(conn)
         base_v = repo.get_version(doc_type, base_version, scope_profile_id=parsed_scope)
         if not base_v:
-            raise HTTPException(
-                status_code=404,
-                detail=f"base_version={base_version} 버전을 찾을 수 없음",
-            )
+            raise not_found(f"base_version={base_version} 버전을 찾을 수 없음")
         target_v = repo.get_version(doc_type, target_version, scope_profile_id=parsed_scope)
         if not target_v:
-            raise HTTPException(
-                status_code=404,
-                detail=f"target_version={target_version} 버전을 찾을 수 없음",
-            )
+            raise not_found(f"target_version={target_version} 버전을 찾을 수 없음")
 
     base_fields = {k: fd.model_dump(mode="json") for k, fd in base_v.fields.items()}
     target_fields = {k: fd.model_dump(mode="json") for k, fd in target_v.fields.items()}
@@ -428,8 +412,7 @@ def rollback_extraction_schema(
         try:
             parsed_scope = UUID(body.scope_profile_id)
         except ValueError:
-            raise HTTPException(status_code=422, detail="scope_profile_id가 유효한 UUID가 아님")
-
+            raise unprocessable_entity("scope_profile_id가 유효한 UUID가 아님")
     try:
         with get_db() as conn:
             repo = ExtractionSchemaRepository(conn)
@@ -441,10 +424,10 @@ def rollback_extraction_schema(
                 scope_profile_id=parsed_scope,
             )
     except ExtractionSchemaNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
+        raise not_found(str(exc))
     except ValueError as exc:
         # 폐기된 스키마 / target_version 범위 오류 / 빈 fields → 422
-        raise HTTPException(status_code=422, detail=str(exc))
+        raise unprocessable_entity(str(exc))
     except Exception:
         logger.exception("extraction_schema rollback failed")
         raise HTTPException(status_code=500, detail="내부 서버 오류가 발생했습니다.")
@@ -495,7 +478,7 @@ def update_extraction_schema(
                 change_summary=body.change_summary,
             )
     except ExtractionSchemaNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
+        raise not_found(str(exc))
     except Exception:
         logger.exception("extraction_schema update failed")
         raise HTTPException(status_code=500, detail="내부 서버 오류가 발생했습니다.")
@@ -536,8 +519,7 @@ def delete_extraction_schema(
         deleted = repo.delete(doc_type, actor_info=_actor_info(actor))
 
     if not deleted:
-        raise HTTPException(status_code=404, detail=f"doc_type_code={doc_type!r}에 대한 추출 스키마 없음")
-
+        raise not_found(f"doc_type_code={doc_type!r}에 대한 추출 스키마 없음")
     audit_emitter.emit_for_actor(
         actor=actor,
         event_type="extraction_schema.deleted",
@@ -569,7 +551,7 @@ def deprecate_extraction_schema(
             repo = ExtractionSchemaRepository(conn)
             schema = repo.deprecate(doc_type, reason=body.reason, actor_info=_actor_info(actor))
     except ExtractionSchemaNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
+        raise not_found(str(exc))
     except Exception:
         logger.exception("extraction_schema deprecate failed")
         raise HTTPException(status_code=500, detail="내부 서버 오류가 발생했습니다.")

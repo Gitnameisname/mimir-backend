@@ -41,6 +41,12 @@ def _domain_doc(**kw):
         "updated_at": datetime.now(timezone.utc),
         "current_draft_version_id": None,
         "current_published_version_id": None,
+        # S3 Phase 2 FG 2-0 (2026-04-24): 새 필드 — 기본 None
+        "scope_profile_id": None,
+        # S3 Phase 2 FG 2-1 (2026-04-24): folder_id + in_collection_ids 누락 보완
+        # (R-D 회귀 패치 2, 2026-04-25 — _to_response 가 doc.folder_id 접근)
+        "folder_id": None,
+        "in_collection_ids": [],
     }
     base.update(kw)
     return SimpleNamespace(**base)

@@ -22,7 +22,7 @@ DraftService — Draft/Publish/Restore 핵심 비즈니스 로직.
 """
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Optional
 
 import psycopg2.extensions
@@ -42,6 +42,7 @@ from app.schemas.versions import (
     VersionResponse,
     VersionSummaryResponse,
 )
+from app.utils.time import utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -220,6 +221,24 @@ class DraftService:
                 document_id, version.id, version.version_number, actor_id,
             )
 
+        # Phase 1 FG 1-1 (D1): content_snapshot 이 단일 정본이므로 nodes 테이블을
+        # snapshot 으로부터 즉시 재구성한다. vectorization_service 는 이제 이
+        # nodes 를 그대로 읽으며 `_parse_nodes_from_snapshot` 의 fallback 경로는
+        # "snapshot 은 있는데 nodes 가 비어있는" 레거시 버전에만 의미가 있다.
+        from app.services.snapshot_sync_service import (
+            rebuild_nodes_from_snapshot,
+            rebuild_tags_for_document,
+        )
+        rebuild_nodes_from_snapshot(conn, version.id, request.content_snapshot)
+        # S3 Phase 2 FG 2-2 (2026-04-24): 태그 파생 동기화.
+        # 작업지시서 상호검증 §7 — nodes 재계산 직후 tags 재계산 (동일 트랜잭션).
+        rebuild_tags_for_document(
+            conn,
+            document_id=document_id,
+            snapshot=request.content_snapshot,
+            metadata=doc.metadata,
+        )
+
         # documents.title 동기화 — 에디터에서 제목 변경 시 목록 뷰에도 즉시 반영
         if request.title and request.title != doc.title:
             documents_repository.update(
@@ -311,7 +330,7 @@ class DraftService:
                 details="invalid_draft_status",
             )
 
-        now = datetime.now(timezone.utc)
+        now = utcnow()
 
         # 기존 published → superseded
         if doc.current_published_version_id:
@@ -565,22 +584,27 @@ class DraftService:
         *,
         actor_id: Optional[str] = None,
     ) -> VersionResponse:
-        """에디터에서 전달한 노드 목록으로 Draft를 저장한다.
+        """[DEPRECATED — Phase 1 FG 1-1] nodes 기반 Draft 저장.
 
-        PUT /draft (content_snapshot 기반) 와 달리, 노드를 nodes 테이블에 직접 저장한다.
+        이 메서드는 과도기 호환을 위해 유지되며, 내부적으로는
+        ``save_draft`` (content_snapshot 단일 정본 경로) 로 위임한다.
+
+        삭제 예정: Phase 2 종결 시점 (Sunset: 2026-11-01).
 
         흐름:
-          1. version_id가 document의 current_draft_version_id인지 검증
-          2. 워크플로 상태 검사 (편집 불가 상태면 409)
-          3. 노드 교체 (DELETE + INSERT)
-          4. title_snapshot / summary_snapshot 갱신
-          5. documents.title 동기화 (title 변경 시)
+          1. version_id 가 current_draft_version_id 인지 검증 (기존 호환)
+          2. 전달받은 nodes → ProseMirror doc 변환 (snapshot_sync_service)
+          3. DraftSaveRequest 로 재구성 후 save_draft 위임
         """
-        from app.repositories.nodes_repository import nodes_repository
-        from app.repositories.workflow_repository import workflow_repository
-        from app.domain.workflow.policies import EDITABLE_STATUSES
-        from app.domain.workflow.enums import WorkflowStatus
+        from app.services.snapshot_sync_service import prosemirror_from_nodes
 
+        logger.warning(
+            "save_draft_nodes is deprecated; use PUT /draft with content_snapshot "
+            "(doc=%s ver=%s actor=%s)",
+            document_id, version_id, actor_id,
+        )
+
+        # version_id 가 현재 Draft 인지 검증 (기존 에러 메시지 호환)
         doc = documents_repository.get_by_id(conn, document_id)
         if doc is None:
             raise ApiNotFoundError(f"Document '{document_id}' not found")
@@ -591,61 +615,22 @@ class DraftService:
                 details={"current_draft_version_id": doc.current_draft_version_id},
             )
 
-        draft = versions_repository.get_by_id(conn, version_id)
-        if draft is None:
-            raise ApiNotFoundError(f"Version '{version_id}' not found")
+        # nodes → ProseMirror 변환. DraftNodeItem.order 를 order_index 로 맞춤.
+        node_dicts: list[dict[str, Any]] = []
+        for item in request.nodes:
+            d = item.model_dump()
+            d["order_index"] = d.pop("order", 0)
+            node_dicts.append(d)
+        snapshot = prosemirror_from_nodes(node_dicts)
 
-        # 워크플로 상태 검사
-        raw_wf = workflow_repository.get_workflow_status(conn, version_id)
-        wf_status_str = raw_wf if raw_wf else draft.status
-        try:
-            wf_status = WorkflowStatus(wf_status_str)
-        except ValueError:
-            wf_status = WorkflowStatus.DRAFT
-        if wf_status not in EDITABLE_STATUSES:
-            raise ApiVersionNotEditableError(
-                f"Cannot edit version in '{wf_status.value}' state. Return to draft first.",
-                details={"workflow_status": wf_status.value},
-            )
-
-        # 노드 교체 — frontend order → DB order_index 매핑
-        node_items = [
-            {
-                "id": item.id,
-                "node_type": item.node_type,
-                "order_index": item.order,
-                "parent_id": item.parent_id,
-                "title": item.title,
-                "content": item.content,
-                "metadata": item.metadata,
-            }
-            for item in request.nodes
-        ]
-        nodes_repository.replace_for_version(conn, version_id, node_items)
-
-        # title_snapshot / summary_snapshot 갱신
-        title_snap = request.title if request.title is not None else (draft.title_snapshot or doc.title)
-        summary_snap = request.summary if request.summary is not None else draft.summary_snapshot
-        version = versions_repository.update_content(
-            conn,
-            version_id,
+        delegated = DraftSaveRequest(
+            title=request.title,
+            summary=request.summary,
             label=request.label,
             change_summary=request.change_summary,
-            title_snapshot=title_snap,
-            summary_snapshot=summary_snap,
+            content_snapshot=snapshot,
         )
-
-        # documents.title 동기화
-        if request.title and request.title != doc.title:
-            documents_repository.update(conn, document_id, title=request.title, updated_by=actor_id)
-
-        logger.info(
-            "Draft nodes saved: doc=%s ver=%s nodes=%d actor=%s",
-            document_id, version_id, len(node_items), actor_id,
-        )
-
-        wf_status_val = workflow_repository.get_workflow_status(conn, version.id) or version.status
-        return _to_version_response(version, workflow_status=wf_status_val)
+        return self.save_draft(conn, document_id, delegated, actor_id=actor_id)
 
 
 # 모듈 수준 싱글턴

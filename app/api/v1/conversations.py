@@ -43,6 +43,7 @@ from app.schemas.conversation import (
     RedactRequest,
     TurnOut,
 )
+from app.utils.http_errors import bad_request, conflict, not_found
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -252,7 +253,7 @@ def get_conversation(
 
         conv = repo.get_by_id(conversation_id)
         if not conv:
-            raise HTTPException(status_code=404, detail="대화를 찾을 수 없습니다.")
+            raise not_found("대화를 찾을 수 없습니다.")
 
         _assert_read_access(conv, actor)
 
@@ -289,7 +290,7 @@ def update_conversation(
         repo = ConversationRepository(conn)
         conv = repo.get_by_id(conversation_id)
         if not conv:
-            raise HTTPException(status_code=404, detail="대화를 찾을 수 없습니다.")
+            raise not_found("대화를 찾을 수 없습니다.")
 
         _assert_write_access(conv, actor)
 
@@ -300,7 +301,7 @@ def update_conversation(
             metadata=body.metadata,
         )
         if updated is None:
-            raise HTTPException(status_code=404, detail="수정 대상을 찾을 수 없습니다.")
+            raise not_found("수정 대상을 찾을 수 없습니다.")
         conn.commit()
 
     audit_emitter.emit(
@@ -334,13 +335,13 @@ def delete_conversation(
         repo = ConversationRepository(conn)
         conv = repo.get_by_id(conversation_id)
         if not conv:
-            raise HTTPException(status_code=404, detail="대화를 찾을 수 없습니다.")
+            raise not_found("대화를 찾을 수 없습니다.")
 
         _assert_write_access(conv, actor)
 
         ok = repo.soft_delete(conversation_id)
         if not ok:
-            raise HTTPException(status_code=409, detail="이미 삭제된 대화입니다.")
+            raise conflict("이미 삭제된 대화입니다.")
         conn.commit()
 
     audit_emitter.emit(
@@ -376,7 +377,7 @@ def list_turns(
 
         conv = repo.get_by_id(conversation_id)
         if not conv:
-            raise HTTPException(status_code=404, detail="대화를 찾을 수 없습니다.")
+            raise not_found("대화를 찾을 수 없습니다.")
         _assert_read_access(conv, actor)
 
         turns = turn_repo.list_by_conversation(conversation_id)
@@ -409,12 +410,12 @@ def get_turn(
 
         conv = repo.get_by_id(conversation_id)
         if not conv:
-            raise HTTPException(status_code=404, detail="대화를 찾을 수 없습니다.")
+            raise not_found("대화를 찾을 수 없습니다.")
         _assert_read_access(conv, actor)
 
         turn = turn_repo.get_by_id(turn_id)
         if not turn or turn.conversation_id != conversation_id:
-            raise HTTPException(status_code=404, detail="턴을 찾을 수 없습니다.")
+            raise not_found("턴을 찾을 수 없습니다.")
 
         msgs = msg_repo.list_by_turn(turn_id)
         turn_out = _domain_to_turn_out(turn, msgs)
@@ -450,16 +451,16 @@ def redact_turn(
 
         conv = repo.get_by_id(conversation_id)
         if not conv:
-            raise HTTPException(status_code=404, detail="대화를 찾을 수 없습니다.")
+            raise not_found("대화를 찾을 수 없습니다.")
         _assert_write_access(conv, actor)
 
         turn = turn_repo.get_by_id(turn_id)
         if not turn or turn.conversation_id != conversation_id:
-            raise HTTPException(status_code=404, detail="턴을 찾을 수 없습니다.")
+            raise not_found("턴을 찾을 수 없습니다.")
 
         ok = turn_repo.redact_turn(turn_id, body.fields)
         if not ok:
-            raise HTTPException(status_code=400, detail="제거할 필드가 없습니다.")
+            raise bad_request("제거할 필드가 없습니다.")
         conn.commit()
 
     audit_emitter.emit(

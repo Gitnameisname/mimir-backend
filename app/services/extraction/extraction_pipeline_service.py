@@ -18,10 +18,12 @@ import hashlib
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import UUID, uuid4
+from app.utils.time import utcnow
+from app.utils.json_utils import dumps_ko
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +77,7 @@ class ExtractionPipelineService:
         from app.repositories.extraction_candidate_repository import ExtractionCandidateRepository
         from app.models.extraction import ExtractionMode, ExtractionConfidenceScore
 
-        start = datetime.now(timezone.utc)
+        start = utcnow()
 
         try:
             # Step 1: 프롬프트 렌더링
@@ -100,7 +102,7 @@ class ExtractionPipelineService:
             # Step 5: 신뢰도 점수 계산
             confidence_scores = self._compute_confidence(schema_fields, extracted_fields)
 
-            latency_ms = int((datetime.now(timezone.utc) - start).total_seconds() * 1000)
+            latency_ms = int((utcnow() - start).total_seconds() * 1000)
             content_hash = hashlib.sha256(document_text.encode()).hexdigest()
             prompt_version = self._prompt_hash()
 
@@ -159,7 +161,7 @@ class ExtractionPipelineService:
         except Exception:
             return self._fallback_prompt(schema_fields, document_text)
 
-        schema_json = json.dumps(schema_fields, indent=2, ensure_ascii=False)
+        schema_json = dumps_ko(schema_fields, indent=2)
         field_instructions = [
             {
                 "field_name": name,
@@ -181,7 +183,7 @@ class ExtractionPipelineService:
         )
 
     def _fallback_prompt(self, schema_fields: Dict[str, Any], document_text: str) -> str:
-        schema_json = json.dumps(schema_fields, indent=2, ensure_ascii=False)
+        schema_json = dumps_ko(schema_fields, indent=2)
         fields_list = ", ".join(schema_fields.keys())
         return (
             f"다음 원문에서 아래 스키마에 따라 정보를 추출하세요.\n\n"

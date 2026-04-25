@@ -14,8 +14,9 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
+from app.utils.time import utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +51,7 @@ class _LRUCache:
         if entry is None:
             return None
         value, expires_at = entry
-        if datetime.now(timezone.utc) > expires_at:
+        if utcnow() > expires_at:
             del self._store[key]
             return None
         return value
@@ -58,7 +59,7 @@ class _LRUCache:
     def set(self, key: str, value: Any, ttl: int) -> None:
         if len(self._store) >= self._max_size:
             # LRU 근사: 만료된 항목 제거
-            now = datetime.now(timezone.utc)
+            now = utcnow()
             expired = [k for k, (_, e) in self._store.items() if e < now]
             for k in expired[:max(1, len(expired))]:
                 del self._store[k]
@@ -66,7 +67,7 @@ class _LRUCache:
             if len(self._store) >= self._max_size:
                 oldest = min(self._store, key=lambda k: self._store[k][1])
                 del self._store[oldest]
-        self._store[key] = (value, datetime.now(timezone.utc) + timedelta(seconds=ttl))
+        self._store[key] = (value, utcnow() + timedelta(seconds=ttl))
 
     def delete(self, key: str) -> None:
         self._store.pop(key, None)

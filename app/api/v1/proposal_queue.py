@@ -28,6 +28,7 @@ from app.api.auth.models import ActorContext
 from app.api.errors.exceptions import ApiPermissionDeniedError
 from app.api.responses import SuccessResponse, success_response
 from app.db.connection import get_db
+from app.repositories.pagination import paginate_page
 from app.services.agent_proposal_service import agent_proposal_service
 
 logger = logging.getLogger(__name__)
@@ -69,7 +70,9 @@ def list_proposals(
 ) -> SuccessResponse:
     _require_admin(actor)
 
-    offset = (page - 1) * page_size
+    # 도서관 §1.9 R4 (2026-04-25): paginate_page 위임. FastAPI Query 가 이미
+    # 검증 (ge=1, le=100) 했지만 helper 통일성 위해 위임.
+    page, page_size, offset = paginate_page(page, page_size, max_page_size=100)
     filters = []
     params: list = []
 
@@ -268,7 +271,9 @@ def my_proposals(
     _require_authenticated(actor)
 
     actor_id = actor.resolved_id
-    offset = (page - 1) * page_size
+    # 도서관 §1.9 R4 (2026-04-25): paginate_page 위임. FastAPI Query 가 이미
+    # 검증 (ge=1, le=100) 했지만 helper 통일성 위해 위임.
+    page, page_size, offset = paginate_page(page, page_size, max_page_size=100)
 
     params: list = [actor_id]
     status_filter = ""

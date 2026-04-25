@@ -6,11 +6,13 @@ agents 테이블 CRUD + 킬스위치 관리.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional
 from uuid import uuid4
 
 from app.models.agent import Agent
+from app.utils.time import utcnow
+from app.utils.json_utils import loads_maybe
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +35,7 @@ class AgentRepository:
         created_by: Optional[str] = None,
         metadata: Optional[dict] = None,
     ) -> Agent:
-        now = datetime.now(timezone.utc)
+        now = utcnow()
         aid = str(uuid4())
         import json
         with self._conn.cursor() as cur:
@@ -107,7 +109,7 @@ class AgentRepository:
         scope_profile_id: Optional[str] = None,
     ) -> Optional[Agent]:
         sets: list[str] = ["updated_at = %s"]
-        params: list = [datetime.now(timezone.utc)]
+        params: list = [utcnow()]
         if name is not None:
             sets.append("name = %s")
             params.append(name)
@@ -143,7 +145,7 @@ class AgentRepository:
         에이전트는 비활성(inactive) 상태가 되어 모든 쓰기 요청이 차단된다.
         is_disabled = True (is_active = False) 상태로 전환된다.
         """
-        now = datetime.now(timezone.utc)
+        now = utcnow()
         with self._conn.cursor() as cur:
             cur.execute(
                 """
@@ -160,7 +162,7 @@ class AgentRepository:
 
     def disable_kill_switch(self, agent_id: str) -> Optional[Agent]:
         """에이전트 킬스위치 해제."""
-        now = datetime.now(timezone.utc)
+        now = utcnow()
         with self._conn.cursor() as cur:
             cur.execute(
                 """
@@ -213,8 +215,7 @@ class AgentRepository:
     def _row_to_agent(row) -> Agent:
         import json
         metadata = row.get("metadata") or {}
-        if isinstance(metadata, str):
-            metadata = json.loads(metadata)
+        metadata = loads_maybe(metadata)
         return Agent(
             id=str(row["id"]),
             name=row["name"],

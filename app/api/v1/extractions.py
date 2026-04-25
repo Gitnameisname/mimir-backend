@@ -25,7 +25,7 @@ S2 원칙:
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import List, Optional
 from uuid import UUID
 
@@ -127,7 +127,7 @@ def get_extraction_detail(
         candidate = repo.get_by_id(extraction_id)
 
     if not candidate:
-        raise HTTPException(status_code=404, detail=f"extraction_candidate id={extraction_id} 없음")
+        raise not_found(f"extraction_candidate id={extraction_id} 없음")
 
     return success_response(data=_candidate_to_dict(candidate))
 
@@ -150,7 +150,7 @@ def approve_extraction(
 ):
     actor_id = _actor_id(actor)
     scope_id = _scope_profile_id(actor)
-    now = datetime.now(timezone.utc)
+    now = utcnow()
 
     try:
         with get_db() as conn:
@@ -159,12 +159,9 @@ def approve_extraction(
 
             candidate = cand_repo.get_by_id(extraction_id)
             if not candidate:
-                raise HTTPException(status_code=404, detail="추출 결과 없음")
+                raise not_found("추출 결과 없음")
             if candidate.status != ExtractionStatus.PENDING:
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"이미 처리된 추출 결과 (status={candidate.status.value})",
-                )
+                raise conflict(f"이미 처리된 추출 결과 (status={candidate.status.value})")
 
             ae = ae_repo.create(
                 candidate_id=candidate.id,
@@ -231,7 +228,7 @@ def modify_extraction(
 ):
     actor_id = _actor_id(actor)
     scope_id = _scope_profile_id(actor)
-    now = datetime.now(timezone.utc)
+    now = utcnow()
 
     try:
         with get_db() as conn:
@@ -240,12 +237,9 @@ def modify_extraction(
 
             candidate = cand_repo.get_by_id(extraction_id)
             if not candidate:
-                raise HTTPException(status_code=404, detail="추출 결과 없음")
+                raise not_found("추출 결과 없음")
             if candidate.status != ExtractionStatus.PENDING:
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"이미 처리된 추출 결과 (status={candidate.status.value})",
-                )
+                raise conflict(f"이미 처리된 추출 결과 (status={candidate.status.value})")
 
             # 수정 적용
             approved_fields = dict(candidate.extracted_fields)
@@ -334,12 +328,9 @@ def reject_extraction(
         cand_repo = ExtractionCandidateRepository(conn)
         candidate = cand_repo.get_by_id(extraction_id)
         if not candidate:
-            raise HTTPException(status_code=404, detail="추출 결과 없음")
+            raise not_found("추출 결과 없음")
         if candidate.status != ExtractionStatus.PENDING:
-            raise HTTPException(
-                status_code=409,
-                detail=f"이미 처리된 추출 결과 (status={candidate.status.value})",
-            )
+            raise conflict(f"이미 처리된 추출 결과 (status={candidate.status.value})")
 
         cand_repo.update_status(
             extraction_id,
@@ -375,7 +366,7 @@ def batch_approve_extractions(
 ):
     actor_id = _actor_id(actor)
     scope_id = _scope_profile_id(actor)
-    now = datetime.now(timezone.utc)
+    now = utcnow()
     approved_count = 0
     failed_ids: List[str] = []
 
@@ -522,7 +513,7 @@ def _candidate_to_dict(c) -> dict:
         "created_at": c.created_at.isoformat(),
         "updated_at": c.updated_at.isoformat(),
         "actor_type": c.actor_type,
-        "scope_profile_id": str(c.scope_profile_id) if c.scope_profile_id else None,
+        "scope_profile_id": uuid_str_or_none(c.scope_profile_id),
     }
 
 
@@ -545,6 +536,10 @@ from app.services.extraction.extraction_verification_service import (  # noqa: E
     ExtractionVerificationService,
 )
 from app.services.extraction.span_calculator import SpanVisualizationConverter  # noqa: E402
+from app.utils.actor import actor_type_str
+from app.utils.time import utcnow
+from app.utils.http_errors import conflict, not_found
+from app.utils.converters import uuid_str_or_none
 
 
 # ---------------------------------------------------------------------------
@@ -578,12 +573,12 @@ def get_extraction_spans(
         fname = item["field_name"]
         span: SourceSpan = item["span"]
         grouped.setdefault(fname, []).append({
-            "id": str(span.id) if span.id else None,
+            "id": uuid_str_or_none(span.id),
             "span_offset": list(span.span_offset),
             "source_text": span.source_text,
             "content_hash": span.content_hash,
             "document_id": str(span.document_id),
-            "node_id": str(span.node_id) if span.node_id else None,
+            "node_id": uuid_str_or_none(span.node_id),
         })
 
     return success_response({"extraction_id": str(extraction_id), "spans": grouped})
@@ -694,7 +689,10 @@ def verify_extraction(
         new_extracted_result=new_result,
         fields_to_verify=req.fields_to_verify,
         verified_by=actor_id,
-        actor_type=actor.actor_type or "user",
+        # 도서관 §1.6 BE-G4 R1 (2026-04-25): Enum 인스턴스는 항상 truthy 라
+        # `actor.actor_type or "user"` 가 fallback 으로 작동 안 함 — 잘못된 코드.
+        # actor_type_str(actor) 로 정정 (SERVICE → "system" 매핑 통일).
+        actor_type=actor_type_str(actor),
     )
 
     vr_repo = VerificationResultRepository(conn)

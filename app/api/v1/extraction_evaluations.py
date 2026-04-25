@@ -22,6 +22,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.api.auth.dependencies import resolve_current_actor
 from app.api.auth.models import ActorContext
+from app.utils.actor import actor_type_str
 from app.api.responses import list_response, success_response
 from app.audit.emitter import audit_emitter
 from app.db.connection import db_dependency
@@ -120,7 +121,8 @@ def run_evaluation(
             golden_item=item,
             actual_fields=actual_fields,
             extraction_candidate_id=candidate_id,
-            actor_type=actor.actor_type or "user",
+            # 도서관 §1.6 BE-G4 R1 (2026-04-25): Enum truthy fallback 잘못된 코드 정정
+            actor_type=actor_type_str(actor),
             scope_profile_id=scope,
         )
         saved = eval_repo.create(eval_result)
@@ -285,7 +287,8 @@ def create_golden_set(
         raise HTTPException(403, "Golden Set 생성 권한이 없습니다.")
 
     gset.created_by = _actor_id(actor)
-    gset.actor_type = actor.actor_type or "user"
+    # 도서관 §1.6 BE-G4 R1 (2026-04-25): Enum truthy fallback 잘못된 코드 정정
+    gset.actor_type = actor_type_str(actor)
     gset.scope_profile_id = _scope_id(actor)
 
     repo = GoldenExtractionSetRepository(conn)

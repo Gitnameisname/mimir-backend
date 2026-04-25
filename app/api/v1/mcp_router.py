@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, Query, Request
@@ -61,6 +61,8 @@ from app.security.prompt_injection import (
     content_directive_separator,
     prompt_injection_detector,
 )
+from app.utils.time import utcnow_iso
+from app.utils.json_utils import dumps_ko
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +116,7 @@ def _make_metadata(
 ) -> MCPMetadata:
     return MCPMetadata(
         request_id=str(uuid.uuid4()),
-        timestamp=datetime.now(timezone.utc).isoformat(),
+        timestamp=utcnow_iso(),
         agent_id=actor.agent_id,
         execution_time_ms=int((time.monotonic() - start) * 1000),
         trusted=False,
@@ -328,7 +330,7 @@ async def mcp_tool_call_stream(
 
 def _sse_chunk(data: dict) -> str:
     import json
-    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+    return f"data: {dumps_ko(data)}\n\n"
 
 
 async def _sse_error(code: str, msg: str):

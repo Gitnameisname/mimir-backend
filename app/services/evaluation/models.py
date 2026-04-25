@@ -3,12 +3,13 @@
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 from enum import Enum
 from statistics import mean, median, stdev
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field, field_validator
+from app.utils.time import utcnow
 
 
 class MetricType(str, Enum):
@@ -102,7 +103,7 @@ class EvaluationResult(BaseModel):
     latency_metrics: Optional[LatencyMetrics] = None
     cost_metrics: Optional[CostMetrics] = None
 
-    evaluation_time: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    evaluation_time: datetime = Field(default_factory=lambda: utcnow())
     evaluator_version: str = "1.0"
     notes: Optional[str] = None
 
@@ -120,7 +121,7 @@ class EvaluationReport(BaseModel):
     total_latency_ms: float = Field(ge=0)
     total_cost: float = Field(ge=0)
     results: List[EvaluationResult]
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = Field(default_factory=lambda: utcnow())
     completed_at: Optional[datetime] = None
     duration_seconds: Optional[float] = None
 

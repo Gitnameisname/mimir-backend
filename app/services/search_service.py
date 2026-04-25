@@ -29,6 +29,8 @@ from app.schemas.search import (
     SearchPagination,
     UnifiedSearchResponse,
 )
+from app.utils.time import utcnow
+from app.repositories.pagination import paginate_page
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +105,16 @@ class SearchService:
         limit: int = 20,
         # 권한 컨텍스트: 현재는 role 기반 단순 필터
         actor_role: Optional[str] = None,
+        # S3 Phase 2 FG 2-0 (2026-04-24): Scope Profile 필터.
+        #   None  = 필터 skip (admin / 내부 호출 / 하위호환 레거시 호출자)
+        #   []    = 결과 없음 (Scope 없음)
+        #   [ids] = documents.scope_profile_id IN (...)
+        viewer_scope_profile_ids: Optional[list[str]] = None,
+        # S3 Phase 2 FG 2-1 UX 5차 (2026-04-24): collection / folder 필터를 /search 에도 포팅.
+        # documents_repository 와 동일 subquery 규약.
+        collection_id: Optional[str] = None,
+        folder_id: Optional[str] = None,
+        include_subfolders: bool = False,
     ) -> DocumentSearchResponse:
         ts_query = _safe_ts_query(q)
         if not ts_query:
@@ -125,18 +137,26 @@ class SearchService:
                 to_date=to_date,
                 sort=sort,
                 count_only=True,
+                viewer_scope_profile_ids=viewer_scope_profile_ids,
+                collection_id=collection_id,
+                folder_id=folder_id,
+                include_subfolders=include_subfolders,
             )
             cur.execute(count_sql, count_params)
             total = (cur.fetchone() or {}).get("count", 0)
 
             # 결과 쿼리
-            offset = (page - 1) * limit
+            page, limit, offset = paginate_page(page, limit)
             data_sql, data_params = self._build_document_query(
                 ts_query=ts_query,
                 doc_type=doc_type,
                 visible_statuses=visible_statuses,
                 from_date=from_date,
                 to_date=to_date,
+                viewer_scope_profile_ids=viewer_scope_profile_ids,
+                collection_id=collection_id,
+                folder_id=folder_id,
+                include_subfolders=include_subfolders,
                 sort=sort,
                 count_only=False,
                 limit=limit,
@@ -169,6 +189,10 @@ class SearchService:
         count_only: bool,
         limit: int = 20,
         offset: int = 0,
+        viewer_scope_profile_ids: Optional[list[str]] = None,
+        collection_id: Optional[str] = None,
+        folder_id: Optional[str] = None,
+        include_subfolders: bool = False,
     ) -> tuple[str, list]:
         params: list = [ts_query]  # %s[1] = ts_query
 
@@ -192,6 +216,41 @@ class SearchService:
         if to_date:
             where_clauses.append("d.created_at <= %s::timestamptz")
             params.append(to_date)
+
+        # S3 Phase 2 FG 2-0: Scope Profile 필터 (documents_repository 와 동일 규약)
+        if viewer_scope_profile_ids is not None:
+            ids = list(viewer_scope_profile_ids)
+            if not ids:
+                where_clauses.append("1 = 0")
+            else:
+                placeholders = ", ".join(["%s"] * len(ids))
+                where_clauses.append(f"d.scope_profile_id IN ({placeholders})")
+                params.extend(ids)
+
+        # S3 Phase 2 FG 2-1 UX 5차: collection / folder 필터 (documents_repository 와 동일 규약)
+        if collection_id:
+            where_clauses.append(
+                "d.id IN (SELECT document_id FROM collection_documents WHERE collection_id = %s)"
+            )
+            params.append(collection_id)
+        if folder_id:
+            if include_subfolders:
+                where_clauses.append(
+                    """d.id IN (
+                        SELECT df.document_id
+                        FROM document_folder df
+                        JOIN folders f ON f.id = df.folder_id
+                        WHERE f.path LIKE (
+                            SELECT path || '%%' FROM folders WHERE id = %s
+                        )
+                    )"""
+                )
+                params.append(folder_id)
+            else:
+                where_clauses.append(
+                    "d.id IN (SELECT document_id FROM document_folder WHERE folder_id = %s)"
+                )
+                params.append(folder_id)
 
         where_sql = " AND ".join(where_clauses)
 
@@ -302,7 +361,7 @@ class SearchService:
             cur.execute(count_sql, count_params)
             total = (cur.fetchone() or {}).get("count", 0)
 
-            offset = (page - 1) * limit
+            page, limit, offset = paginate_page(page, limit)
             data_sql, data_params = self._build_node_query(
                 ts_query=ts_query,
                 document_id=document_id,
@@ -487,6 +546,12 @@ class SearchService:
         actor_role: Optional[str] = None,
         rrf_k: int = 60,
         top_k: int = 50,
+        # S3 Phase 2 UX 5차: FTS 레그에도 동일 ACL / 컬렉션·폴더 필터 전달.
+        # 벡터 레그는 document_chunks delegated ACL 층에서 이미 필터됨.
+        viewer_scope_profile_ids: Optional[list[str]] = None,
+        collection_id: Optional[str] = None,
+        folder_id: Optional[str] = None,
+        include_subfolders: bool = False,
     ) -> DocumentSearchResponse:
         """FTS + pgvector 유사도 검색 결과를 RRF로 통합한 하이브리드 검색.
 
@@ -512,6 +577,10 @@ class SearchService:
                 count_only=False,
                 limit=top_k,
                 offset=0,
+                viewer_scope_profile_ids=viewer_scope_profile_ids,
+                collection_id=collection_id,
+                folder_id=folder_id,
+                include_subfolders=include_subfolders,
             )
             with conn.cursor() as cur:
                 cur.execute(fts_sql, fts_params)
@@ -560,7 +629,7 @@ class SearchService:
         total = len(sorted_doc_ids)
 
         # 페이지네이션
-        offset = (page - 1) * limit
+        page, limit, offset = paginate_page(page, limit)
         page_doc_ids = sorted_doc_ids[offset: offset + limit]
 
         if not page_doc_ids:
@@ -679,7 +748,7 @@ class SearchService:
             )
             for row in rows
         ]
-        return SearchIndexStats(stats=stats, retrieved_at=datetime.utcnow())
+        return SearchIndexStats(stats=stats, retrieved_at=utcnow())
 
     # ---------------------------------------------------------------------------
     # 수동 재인덱싱 (Admin용)

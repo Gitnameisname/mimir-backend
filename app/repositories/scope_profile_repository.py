@@ -7,11 +7,12 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional
 from uuid import uuid4
 
 from app.models.scope_profile import ScopeDefinition, ScopeProfile
+from app.utils.time import utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +32,7 @@ class ScopeProfileRepository:
         description: Optional[str] = None,
         organization_id: Optional[str] = None,
     ) -> ScopeProfile:
-        now = datetime.now(timezone.utc)
+        now = utcnow()
         pid = str(uuid4())
         with self._conn.cursor() as cur:
             cur.execute(
@@ -105,7 +106,7 @@ class ScopeProfileRepository:
         description: Optional[str] = None,
     ) -> Optional[ScopeProfile]:
         sets: list[str] = ["updated_at = %s"]
-        params: list = [datetime.now(timezone.utc)]
+        params: list = [utcnow()]
         if name is not None:
             sets.append("name = %s")
             params.append(name)
@@ -143,7 +144,7 @@ class ScopeProfileRepository:
         description: Optional[str] = None,
     ) -> ScopeDefinition:
         did = str(uuid4())
-        now = datetime.now(timezone.utc)
+        now = utcnow()
         with self._conn.cursor() as cur:
             cur.execute(
                 """

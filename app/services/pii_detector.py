@@ -21,6 +21,7 @@ import logging
 import os
 import re
 from typing import Any, Optional
+from app.utils.time import utcnow_iso
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +136,7 @@ class PiiDetector:
             "has_pii": has_pii,
             "user_message": um_patterns,
             "assistant_response": ar_patterns,
-            "detected_at": datetime.now(timezone.utc).isoformat(),
+            "detected_at": utcnow_iso(),
         }
 
 

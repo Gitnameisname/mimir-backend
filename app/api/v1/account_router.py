@@ -24,7 +24,7 @@ import ipaddress
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Literal, Optional
 from urllib.parse import urlencode, urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -43,6 +43,7 @@ from app.cache.valkey import get_valkey
 from app.config import settings
 from app.db import get_db
 from app.repositories.users_repository import users_repository
+from app.utils.http_errors import bad_request, conflict, not_found, unprocessable_entity
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +82,36 @@ class UpdateProfileRequest(BaseModel):
     """프로필 수정 요청."""
     display_name: Optional[str] = Field(None, min_length=1, max_length=100)
     avatar_url: Optional[str] = Field(None, max_length=500)
+
+
+class UserPreferences(BaseModel):
+    """사용자 개인화 설정 (Phase 1 FG 1-3, FG 2-2 UX 다듬기 1차에서 theme 추가).
+
+    공식 필드:
+      - editor_view_mode: "block" | "flow"
+      - theme: "system" | "light" | "dark" (Phase 2 FG 2-2 UX1)
+    extra 는 allow — 향후 language 등 확장 허용.
+    """
+    # S1 ① 하드코딩 금지: view_mode 어휘는 프런트 EditorViewMode 와 1:1 매칭.
+    #   신규 뷰 추가 시 이 Literal 확장 + 프런트 타입 동시 갱신.
+    editor_view_mode: Optional[Literal["block", "flow"]] = None
+    # S3 Phase 2 FG 2-2 UX1 (2026-04-25): 다크모드 토큰 도입 선행 프리퍼런스.
+    #   "system" = prefers-color-scheme 추종 (기본), "light" / "dark" = 강제.
+    #   DB 상 null 이면 프런트에서 "system" 으로 해석 (서버는 Literal 만 검증).
+    theme: Optional[Literal["system", "light", "dark"]] = None
+
+    model_config = {"extra": "allow"}
+
+
+class UpdatePreferencesRequest(BaseModel):
+    """PATCH /account/preferences 요청.
+
+    partial shallow merge. 키를 명시적으로 ``null`` 로 설정하면 해당 키가 삭제된다.
+    """
+    editor_view_mode: Optional[Literal["block", "flow"]] = None
+    theme: Optional[Literal["system", "light", "dark"]] = None
+
+    model_config = {"extra": "allow"}
 
 
 class ChangePasswordRequest(BaseModel):
@@ -123,7 +154,7 @@ def get_profile(
         user = users_repository.get_by_id(conn, user_id)
 
     if not user:
-        raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다")
+        raise not_found("사용자를 찾을 수 없습니다")
 
     return success_response(
         data=ProfileResponse(
@@ -160,7 +191,7 @@ def update_profile(
     if body.display_name is not None:
         name_errors = validate_display_name(body.display_name)
         if name_errors:
-            raise HTTPException(status_code=422, detail={"errors": name_errors})
+            raise unprocessable_entity({"errors": name_errors})
 
     # avatar_url 검증 — SEC4-BE-001: 스킴 + 내부 IP SSRF 방어
     if body.avatar_url is not None and body.avatar_url.strip():
@@ -168,22 +199,22 @@ def update_profile(
         try:
             parsed = urlparse(url)
             if parsed.scheme not in ("https", "http"):
-                raise HTTPException(status_code=422, detail="아바타 URL은 http:// 또는 https://로 시작해야 합니다")
+                raise unprocessable_entity("아바타 URL은 http:// 또는 https://로 시작해야 합니다")
             hostname = (parsed.hostname or "").lower()
             if not hostname:
-                raise HTTPException(status_code=422, detail="아바타 URL의 호스트를 확인할 수 없습니다")
+                raise unprocessable_entity("아바타 URL의 호스트를 확인할 수 없습니다")
             if hostname == "localhost":
-                raise HTTPException(status_code=422, detail="내부 네트워크 URL은 허용되지 않습니다")
+                raise unprocessable_entity("내부 네트워크 URL은 허용되지 않습니다")
             try:
                 addr = ipaddress.ip_address(hostname)
                 if addr.is_loopback or addr.is_private or addr.is_link_local or addr.is_multicast:
-                    raise HTTPException(status_code=422, detail="내부 네트워크 URL은 허용되지 않습니다")
+                    raise unprocessable_entity("내부 네트워크 URL은 허용되지 않습니다")
             except ValueError:
                 pass  # 도메인명 — 정상
         except HTTPException:
             raise
         except Exception:
-            raise HTTPException(status_code=422, detail="아바타 URL 형식이 올바르지 않습니다")
+            raise unprocessable_entity("아바타 URL 형식이 올바르지 않습니다")
 
     update_kwargs = {}
     if body.display_name is not None:
@@ -192,13 +223,13 @@ def update_profile(
         update_kwargs["avatar_url"] = body.avatar_url.strip() if body.avatar_url.strip() else None
 
     if not update_kwargs:
-        raise HTTPException(status_code=422, detail="수정할 항목이 없습니다")
+        raise unprocessable_entity("수정할 항목이 없습니다")
 
     with get_db() as conn:
         updated_user = users_repository.update(conn, user_id, **update_kwargs)
 
     if not updated_user:
-        raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다")
+        raise not_found("사용자를 찾을 수 없습니다")
 
     audit_emitter.emit(
         event_type="user.profile_updated",
@@ -231,6 +262,80 @@ def update_profile(
 
 
 # ---------------------------------------------------------------------------
+# GET /account/preferences — 사용자 선호 조회 (Phase 1 FG 1-3)
+# ---------------------------------------------------------------------------
+
+@router.get("/preferences")
+def get_preferences(
+    request: Request,
+    actor: ActorContext = Depends(resolve_current_actor),
+):
+    """인증된 사용자의 preferences(JSONB) 를 반환.
+
+    본인 데이터만 조회 (path-less self-only). 에이전트가 호출한 경우에도
+    actor.resolved_id 기준 자기 자신의 preferences 를 반환한다 (S2 ⑤).
+    """
+    req_id, trace_id = get_request_ids(request)
+    user_id = _require_auth(actor)
+
+    with get_db() as conn:
+        prefs = users_repository.get_preferences(conn, user_id)
+
+    return success_response(
+        data=UserPreferences(**prefs).model_dump(),
+        request_id=req_id,
+        trace_id=trace_id,
+    )
+
+
+# ---------------------------------------------------------------------------
+# PATCH /account/preferences — 사용자 선호 부분 갱신 (Phase 1 FG 1-3)
+# ---------------------------------------------------------------------------
+
+@router.patch("/preferences")
+def update_preferences(
+    body: UpdatePreferencesRequest,
+    request: Request,
+    actor: ActorContext = Depends(resolve_current_actor),
+):
+    """인증된 사용자의 preferences 를 partial shallow merge 로 갱신.
+
+    - 허용 키: editor_view_mode (추가 확장은 UserPreferences/UpdatePreferencesRequest
+      의 ``Literal`` / ``extra="allow"`` 를 통해 수용)
+    - 키를 명시적으로 ``null`` 로 보내면 삭제
+    - 감사 이벤트: ``preferences.updated`` + ``actor_type``
+    """
+    req_id, trace_id = get_request_ids(request)
+    user_id = _require_auth(actor)
+
+    # 요청 바디 → 패치 dict (None 필드도 유지 — null 로 명시 제거 의미)
+    patch = body.model_dump(exclude_unset=True)
+
+    with get_db() as conn:
+        updated = users_repository.update_preferences(conn, user_id, patch)
+
+    audit_emitter.emit(
+        event_type="preferences.updated",
+        action="preferences.update",
+        actor_id=user_id,
+        actor_type=(
+            "agent" if getattr(actor, "actor_type", None) == "agent" else "user"
+        ),
+        resource_type="user",
+        resource_id=user_id,
+        result="success",
+        request_id=req_id,
+        metadata={"patch_keys": sorted(patch.keys())},
+    )
+
+    return success_response(
+        data=UserPreferences(**updated).model_dump(),
+        request_id=req_id,
+        trace_id=trace_id,
+    )
+
+
+# ---------------------------------------------------------------------------
 # POST /account/change-password — 비밀번호 변경
 # ---------------------------------------------------------------------------
 
@@ -255,14 +360,11 @@ def change_password(
     with get_db() as conn:
         user = users_repository.get_by_id(conn, user_id)
         if not user:
-            raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다")
+            raise not_found("사용자를 찾을 수 없습니다")
 
         # GitLab 전용 계정(password_hash=NULL)인 경우 비밀번호 변경 비활성화
         if not user.password_hash:
-            raise HTTPException(
-                status_code=400,
-                detail="소셜 로그인 계정은 비밀번호를 변경할 수 없습니다. 먼저 비밀번호를 설정해 주세요.",
-            )
+            raise bad_request("소셜 로그인 계정은 비밀번호를 변경할 수 없습니다. 먼저 비밀번호를 설정해 주세요.")
 
         # 1. 현재 비밀번호 검증
         if not verify_password(body.current_password, user.password_hash):
@@ -282,7 +384,7 @@ def change_password(
         # 2. 새 비밀번호 복잡도 검증
         pw_errors = validate_password_strength(body.new_password)
         if pw_errors:
-            raise HTTPException(status_code=422, detail={"errors": pw_errors})
+            raise unprocessable_entity({"errors": pw_errors})
 
         # 3. 새 비밀번호 해싱 → 저장
         new_hash = hash_password(body.new_password)
@@ -371,7 +473,7 @@ def link_gitlab(
     with get_db() as conn:
         existing = gitlab_oauth_service.find_by_user_id(conn, user_id, provider="gitlab")
         if existing:
-            raise HTTPException(status_code=409, detail="이미 GitLab 계정이 연결되어 있습니다")
+            raise conflict("이미 GitLab 계정이 연결되어 있습니다")
 
     valkey = get_valkey()
     result = gitlab_oauth_service.create_authorization_url(valkey, link_to_user_id=user_id)
@@ -421,14 +523,11 @@ def unlink_gitlab(
     with get_db() as conn:
         user = users_repository.get_by_id(conn, user_id)
         if not user:
-            raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다")
+            raise not_found("사용자를 찾을 수 없습니다")
 
         # 비밀번호 미설정 상태에서 유일한 로그인 수단 해제 시도 방지
         if not user.password_hash:
-            raise HTTPException(
-                status_code=400,
-                detail="비밀번호가 설정되지 않은 상태에서는 GitLab 계정을 해제할 수 없습니다. 먼저 비밀번호를 설정해 주세요.",
-            )
+            raise bad_request("비밀번호가 설정되지 않은 상태에서는 GitLab 계정을 해제할 수 없습니다. 먼저 비밀번호를 설정해 주세요.")
 
         # GitLab OAuth 계정 삭제
         with conn.cursor() as cur:
@@ -439,7 +538,7 @@ def unlink_gitlab(
             deleted_count = cur.rowcount
 
     if deleted_count == 0:
-        raise HTTPException(status_code=404, detail="연결된 GitLab 계정이 없습니다")
+        raise not_found("연결된 GitLab 계정이 없습니다")
 
     audit_emitter.emit(
         event_type="user.oauth_unlinked",
@@ -557,10 +656,7 @@ def revoke_session(
                 )
                 row = cur.fetchone()
                 if row and str(row["family_id"]) == session_id:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="현재 세션은 삭제할 수 없습니다. 로그아웃을 사용해 주세요.",
-                    )
+                    raise bad_request("현재 세션은 삭제할 수 없습니다. 로그아웃을 사용해 주세요.")
 
     # 해당 family가 본인 소유인지 확인 후 폐기
     with get_db() as conn:
@@ -575,7 +671,7 @@ def revoke_session(
             )
             row = cur.fetchone()
             if not row or row["cnt"] == 0:
-                raise HTTPException(status_code=404, detail="해당 세션을 찾을 수 없습니다")
+                raise not_found("해당 세션을 찾을 수 없습니다")
 
         revoked_count = refresh_token_service.revoke_family(conn, session_id)
 

@@ -23,7 +23,7 @@ router 역할 (thin router 원칙):
 
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Header, Request
+from fastapi import APIRouter, Depends, Header, Request, Response
 
 from app.api.auth import ResourceRef, authorization_service, resolve_current_actor
 from app.api.auth.models import ActorContext
@@ -32,6 +32,7 @@ from app.api.query import FilterFieldSpec, ListQuerySpec, ParsedListQuery, make_
 from app.api.responses import SuccessResponse, list_response, paginated_list_response, success_response
 from app.db import get_db
 from app.schemas.documents import DocumentCreateRequest, DocumentResponse, DocumentUpdateRequest
+from app.schemas.folders import SetDocumentFolderRequest  # S3 Phase 2 FG 2-1
 from app.schemas.render import RenderDocument
 from app.schemas.versions import DraftNodeSaveRequest, DraftSaveRequest, PublishRequest, RestoreRequest, VersionCreateRequest
 from app.audit.emitter import audit_emitter
@@ -55,6 +56,19 @@ _DOCUMENTS_SPEC = ListQuerySpec(
         ),
         FilterFieldSpec(name="document_type"),
         FilterFieldSpec(name="owner_id", type="uuid"),
+        # S3 Phase 2 FG 2-1: 컬렉션 / 폴더 필터 + include_subfolders
+        FilterFieldSpec(name="collection", type="uuid"),
+        FilterFieldSpec(name="folder", type="uuid"),
+        FilterFieldSpec(
+            name="include_subfolders",
+            type="bool",
+            allowed_values=["true", "false"],
+        ),
+        # S3 Phase 2 FG 2-1 UX 3차 (2026-04-24): 제목 부분 일치 검색.
+        # Repository 에서 ILIKE + ESCAPE 로 안전 처리.
+        FilterFieldSpec(name="q"),
+        # S3 Phase 2 FG 2-2 (2026-04-24): 태그 이름으로 필터 (정규화 후 매칭).
+        FilterFieldSpec(name="tag"),
     ],
 )
 
@@ -101,7 +115,7 @@ def list_documents(
     request_id, trace_id = get_request_ids(request)
 
     with get_db() as conn:
-        docs, total = documents_service.list_documents(conn, query)
+        docs, total = documents_service.list_documents(conn, query, actor=actor)
 
     return paginated_list_response(
         data=[doc.model_dump() for doc in docs],
@@ -164,7 +178,9 @@ def create_document(
         return replay_response
 
     with get_db() as conn:
-        doc = documents_service.create_document(conn, body, actor_id=actor_id)
+        doc = documents_service.create_document(
+            conn, body, actor_id=actor_id, actor=actor,
+        )
 
     response = success_response(
         data=doc.model_dump(),
@@ -226,7 +242,7 @@ def get_document(
     request_id, trace_id = get_request_ids(request)
 
     with get_db() as conn:
-        doc = documents_service.get_document(conn, document_id)
+        doc = documents_service.get_document(conn, document_id, actor=actor)
 
     return success_response(
         data=doc.model_dump(),
@@ -280,6 +296,7 @@ def update_document(
             document_id,
             body,
             actor_id=actor_id,
+            actor=actor,
         )
 
     audit_emitter.emit_for_actor(
@@ -294,6 +311,61 @@ def update_document(
 
     return success_response(
         data=doc.model_dump(),
+        request_id=request_id,
+        trace_id=trace_id,
+    )
+
+
+# ---------------------------------------------------------------------------
+# PUT /documents/{document_id}/folder — 문서 폴더 지정/해제 (FG 2-1)
+# ---------------------------------------------------------------------------
+
+
+@router.put(
+    "/{document_id}/folder",
+    summary="문서 폴더 지정/해제",
+    description=(
+        "문서를 특정 폴더에 배치하거나 해제한다.\n\n"
+        "- `folder_id: null` → 해제 (루트로 빠짐)\n"
+        "- `folder_id: <UUID>` → 해당 폴더로 이동 (폴더는 요청자 소유여야 함)\n"
+        "- 문서와 폴더 모두 viewer Scope / owner 검증을 통과해야 함.\n"
+        "- 폴더 이동은 **권한을 바꾸지 않는다** (뷰 레이어, FG 2-1 절대 규칙)."
+    ),
+    response_model=SuccessResponse,
+)
+def set_document_folder(
+    document_id: str,
+    request: Request,
+    body: SetDocumentFolderRequest,
+    actor: ActorContext = Depends(resolve_current_actor),
+) -> SuccessResponse:
+    from app.services.folders_service import folders_service
+
+    authorization_service.authorize(
+        actor=actor,
+        action="document.folder.set",
+        resource=ResourceRef(resource_type="document", resource_id=document_id),
+        require_authenticated=True,
+    )
+    request_id, trace_id = get_request_ids(request)
+    with get_db() as conn:
+        folders_service.set_document_folder(
+            conn,
+            actor=actor,
+            document_id=document_id,
+            folder_id=body.folder_id,
+        )
+    audit_emitter.emit_for_actor(
+        event_type="document.folder_set",
+        action="document.folder.set",
+        actor=actor,
+        resource_type="document",
+        resource_id=document_id,
+        request_id=request_id,
+        trace_id=trace_id,
+    )
+    return success_response(
+        data={"document_id": document_id, "folder_id": body.folder_id},
         request_id=request_id,
         trace_id=trace_id,
     )
@@ -501,9 +573,14 @@ def save_draft(
 @router.patch(
     "/{document_id}/versions/{version_id}/draft",
     status_code=200,
-    summary="Draft 노드 저장 (에디터)",
+    summary="[DEPRECATED] Draft 노드 저장 (에디터)",
     description=(
-        "에디터에서 편집한 노드 목록 + 제목을 Draft 버전에 저장한다.\n\n"
+        "**[DEPRECATED — Phase 1 FG 1-1]** 이 엔드포인트는 Phase 2 종결 시점에 제거됩니다 "
+        "(Sunset: 2026-11-01). 대신 `PUT /api/v1/documents/{id}/draft` 을 사용하고 "
+        "`content_snapshot` (ProseMirror doc) 을 전송하세요.\n\n"
+        "과도기 호환: 본 엔드포인트로 전달된 `nodes` 는 서버 사이드에서 ProseMirror "
+        "doc 으로 변환되어 PUT /draft 와 동일한 저장 경로로 위임됩니다. 따라서 "
+        "`content_snapshot` 도 자동으로 동기화됩니다.\n\n"
         "- `nodes`: 현재 버전의 전체 노드 목록으로 교체 (기존 노드 모두 삭제 후 삽입).\n"
         "- `title`: 지정 시 `title_snapshot` 및 `documents.title`을 동기화한다.\n"
         "- version_id가 현재 Draft 버전이 아니면 409.\n"
@@ -512,11 +589,13 @@ def save_draft(
     ),
     response_model=SuccessResponse,
     tags=["draft"],
+    deprecated=True,
 )
 def save_draft_nodes(
     document_id: str,
     version_id: str,
     request: Request,
+    response: Response,
     body: DraftNodeSaveRequest,
     actor: ActorContext = Depends(resolve_current_actor),
 ) -> SuccessResponse:
@@ -546,7 +625,15 @@ def save_draft_nodes(
             "document_id": document_id,
             "version_number": version.version_number,
             "node_count": len(body.nodes),
+            "deprecated_endpoint": True,
         },
+    )
+
+    # Phase 1 FG 1-1: Deprecation 안내 헤더 (RFC 8594 / RFC 9745)
+    response.headers["Deprecation"] = "true"
+    response.headers["Sunset"] = "Sat, 01 Nov 2026 00:00:00 GMT"
+    response.headers["Link"] = (
+        f'</api/v1/documents/{document_id}/draft>; rel="successor-version"'
     )
 
     return success_response(data=version.model_dump(), request_id=request_id, trace_id=trace_id)

@@ -34,6 +34,7 @@ from app.api.responses import SuccessResponse
 from app.api.responses.helpers import success_response
 from app.db import get_db
 from app.repositories.idempotency_repository import idempotency_repository
+from app.utils.json_utils import dumps_ko
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +80,7 @@ def _compute_fingerprint(
         components["path"] = path_params
 
     # key-sorted JSON → stable string → sha256
-    stable_str = json.dumps(components, sort_keys=True, ensure_ascii=False, default=str)
+    stable_str = dumps_ko(components, sort_keys=True, default=str)
     return hashlib.sha256(stable_str.encode()).hexdigest()
 
 

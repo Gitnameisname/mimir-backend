@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from app.services.evaluation.models import EvaluationResult
+from app.utils.time import utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +105,7 @@ class EvaluationRunRepository:
         return [dict(r) for r in rows], total
 
     def update_status(self, run_id: str, scope_id: str, new_status: str) -> bool:
-        now = datetime.now(timezone.utc)
+        now = utcnow()
         extra_fields = ""
         extra_vals: list = []
         if new_status == "running":

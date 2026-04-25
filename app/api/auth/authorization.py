@@ -122,6 +122,37 @@ _PERMISSION_MATRIX: dict[str, frozenset[str]] = {
     # --- 관리자 ---
     "admin.read":  frozenset({"ORG_ADMIN", "SUPER_ADMIN"}),
     "admin.write": frozenset({"SUPER_ADMIN"}),
+
+    # --- S3 Phase 2 FG 2-1 (2026-04-24): 수동 컬렉션 + 계층 폴더 ---
+    # 순수 뷰 레이어이고 owner 별 격리가 서비스에서 강제되므로, 인증된 모든 사용자가
+    # 자기 소유 영역에서 CRUD 가능. 타 owner 리소스는 서비스 계층에서 404 로 차단되며
+    # 컬렉션에 담기는 문서는 FG 2-0 의 viewer Scope 필터를 통과해야 한다.
+    "collection.list":              frozenset({"VIEWER", "AUTHOR", "REVIEWER", "APPROVER", "ORG_ADMIN", "SUPER_ADMIN"}),
+    "collection.read":              frozenset({"VIEWER", "AUTHOR", "REVIEWER", "APPROVER", "ORG_ADMIN", "SUPER_ADMIN"}),
+    "collection.create":            frozenset({"VIEWER", "AUTHOR", "REVIEWER", "APPROVER", "ORG_ADMIN", "SUPER_ADMIN"}),
+    "collection.update":            frozenset({"VIEWER", "AUTHOR", "REVIEWER", "APPROVER", "ORG_ADMIN", "SUPER_ADMIN"}),
+    "collection.delete":            frozenset({"VIEWER", "AUTHOR", "REVIEWER", "APPROVER", "ORG_ADMIN", "SUPER_ADMIN"}),
+    "collection.add_documents":     frozenset({"VIEWER", "AUTHOR", "REVIEWER", "APPROVER", "ORG_ADMIN", "SUPER_ADMIN"}),
+    "collection.remove_document":   frozenset({"VIEWER", "AUTHOR", "REVIEWER", "APPROVER", "ORG_ADMIN", "SUPER_ADMIN"}),
+
+    "folder.list":   frozenset({"VIEWER", "AUTHOR", "REVIEWER", "APPROVER", "ORG_ADMIN", "SUPER_ADMIN"}),
+    "folder.read":   frozenset({"VIEWER", "AUTHOR", "REVIEWER", "APPROVER", "ORG_ADMIN", "SUPER_ADMIN"}),
+    "folder.create": frozenset({"VIEWER", "AUTHOR", "REVIEWER", "APPROVER", "ORG_ADMIN", "SUPER_ADMIN"}),
+    "folder.update": frozenset({"VIEWER", "AUTHOR", "REVIEWER", "APPROVER", "ORG_ADMIN", "SUPER_ADMIN"}),
+    "folder.move":   frozenset({"VIEWER", "AUTHOR", "REVIEWER", "APPROVER", "ORG_ADMIN", "SUPER_ADMIN"}),
+    "folder.delete": frozenset({"VIEWER", "AUTHOR", "REVIEWER", "APPROVER", "ORG_ADMIN", "SUPER_ADMIN"}),
+
+    # 문서 → 폴더 배치. 문서 편집 권한이 없어도 자기 뷰 정리 목적으로 폴더 지정 가능.
+    # 배치 대상 문서는 documents_service.get_document(viewer_scope 필터) 를 통과해야
+    # 하므로 Scope 밖 문서는 404 로 차단된다.
+    "document.folder.set": frozenset({"VIEWER", "AUTHOR", "REVIEWER", "APPROVER", "ORG_ADMIN", "SUPER_ADMIN"}),
+
+    # --- S3 Phase 2 FG 2-2 (2026-04-24): 태그 동적 그룹 ---
+    # 태그는 전역 풀 (Scope 무관) + 조회는 모든 인증된 사용자. 서버 파서가 정본이라
+    # 사용자가 직접 태그를 생성하는 엔드포인트는 없음 (문서 저장 시 자동 파생).
+    # 단 전역 삭제는 관리자 전용 (고아 정리 / 오타 통합).
+    "tag.list":   frozenset({"VIEWER", "AUTHOR", "REVIEWER", "APPROVER", "ORG_ADMIN", "SUPER_ADMIN"}),
+    "tag.delete": frozenset({"ORG_ADMIN", "SUPER_ADMIN"}),
 }
 
 

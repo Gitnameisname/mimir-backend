@@ -18,7 +18,7 @@ WorkflowService — Phase 5 워크플로 비즈니스 로직.
 """
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Optional
 
 import psycopg2.extensions
@@ -38,6 +38,7 @@ from app.domain.workflow.policies import (
 from app.repositories.documents_repository import documents_repository
 from app.repositories.versions_repository import versions_repository
 from app.repositories.workflow_repository import workflow_repository
+from app.utils.time import utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -180,7 +181,7 @@ class WorkflowService:
         # PUBLISH 전이 시 versions.status / published_by / published_at 동기화,
         # documents.current_published_version_id 및 documents.status 업데이트
         if target_status == WorkflowStatus.PUBLISHED:
-            now_ts = datetime.now(timezone.utc)
+            now_ts = utcnow()
             versions_repository.update_status(
                 conn,
                 version_id,
@@ -250,7 +251,7 @@ class WorkflowService:
                 },
             )
 
-        acted_at = datetime.now(timezone.utc)
+        acted_at = utcnow()
 
         # 10. Audit Log emit (Admin override 시 명시 기록, Task 5-9 §6)
         audit_emitter.emit(

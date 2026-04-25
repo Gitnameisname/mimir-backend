@@ -38,6 +38,9 @@ from app.api.v1 import extractions  # S2 Phase 8 (FG8.2): 추출 결과 검토 A
 from app.api.v1 import admin_extraction_results  # S2 Phase 8 (B 스코프): 관리자 검토 큐 API
 from app.api.v1 import batch_extractions  # S2 Phase 8 (Task 8-7): 배치 재추출 API
 from app.api.v1 import extraction_evaluations  # S2 Phase 8 (FG8.3): 추출 품질 평가 API
+from app.api.v1 import collections as collections_router  # S3 Phase 2 (FG 2-1)
+from app.api.v1 import folders as folders_router  # S3 Phase 2 (FG 2-1)
+from app.api.v1 import tags as tags_router  # S3 Phase 2 (FG 2-2)
 
 v1_router = APIRouter()
 
@@ -128,3 +131,10 @@ v1_router.include_router(batch_extractions.router, prefix="/extractions", tags=[
 
 # S2 Phase 8 (FG8.3): 추출 품질 평가 API
 v1_router.include_router(extraction_evaluations.router, prefix="/extraction-evaluations", tags=["extraction-evaluations"])
+
+# S3 Phase 2 (FG 2-1): 수동 컬렉션 + 계층 폴더 (뷰 레이어, ACL 무영향)
+v1_router.include_router(collections_router.router, prefix="/collections", tags=["collections"])
+v1_router.include_router(folders_router.router, prefix="/folders", tags=["folders"])
+
+# S3 Phase 2 (FG 2-2): 태그 동적 그룹 (서버 파서가 정본, 뷰 레이어)
+v1_router.include_router(tags_router.router, prefix="/tags", tags=["tags"])

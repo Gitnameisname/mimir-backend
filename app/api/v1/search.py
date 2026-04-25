@@ -26,7 +26,9 @@ from app.api.context import get_request_ids
 from app.api.rate_limit import limiter
 from app.api.responses import SuccessResponse, success_response
 from app.db import get_db
+from app.services.documents_service import _resolve_viewer_scope_profile_ids
 from app.services.search_service import search_service
+from app.utils.http_errors import bad_request
 
 router = APIRouter()
 
@@ -46,18 +48,15 @@ _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 def _validate_q(q: str) -> None:
     """검색어 길이 및 기본 유효성 검사."""
     if len(q) > _MAX_QUERY_LEN:
-        raise HTTPException(status_code=400, detail=f"검색어는 {_MAX_QUERY_LEN}자를 초과할 수 없습니다.")
-
+        raise bad_request(f"검색어는 {_MAX_QUERY_LEN}자를 초과할 수 없습니다.")
 
 def _validate_uuid(value: Optional[str], field: str) -> None:
     if value and not _UUID_RE.match(value):
-        raise HTTPException(status_code=400, detail=f"{field}이(가) 유효한 UUID 형식이 아닙니다.")
-
+        raise bad_request(f"{field}이(가) 유효한 UUID 형식이 아닙니다.")
 
 def _validate_date(value: Optional[str], field: str) -> None:
     if value and not _DATE_RE.match(value):
-        raise HTTPException(status_code=400, detail=f"{field}은(는) YYYY-MM-DD 형식이어야 합니다.")
-
+        raise bad_request(f"{field}은(는) YYYY-MM-DD 형식이어야 합니다.")
 
 # ---------------------------------------------------------------------------
 # GET /search/filter-options — 검색 필터 옵션 (공개)
@@ -192,6 +191,10 @@ async def search_documents(
     reranker: Optional[Literal["cross_encoder", "rule_based", "null"]] = None,
     page: int = 1,
     limit: int = 20,
+    # S3 Phase 2 FG 2-1 UX 5차 (2026-04-24): 리스트와 동일한 컬렉션/폴더 필터
+    collection: Optional[str] = None,
+    folder: Optional[str] = None,
+    include_subfolders: bool = False,
     actor: ActorContext = Depends(resolve_current_actor),
 ) -> SuccessResponse:
     _validate_q(q)
@@ -205,10 +208,13 @@ async def search_documents(
     )
     request_id, trace_id = get_request_ids(request)
     actor_role = getattr(actor, "role", None)
+    # S3 Phase 2 FG 2-0/UX 5차: 리스트와 동일한 Scope Profile ACL 을 /search 에도 적용.
+    # _resolve_viewer_scope_profile_ids 는 admin role bypass / scope 없는 사용자 차단 규약을
+    # 그대로 가져간다.
+    viewer_scope_profile_ids = _resolve_viewer_scope_profile_ids(actor)
 
     if mode not in ("fts", "hybrid"):
-        raise HTTPException(status_code=400, detail=f"지원하지 않는 mode입니다: '{mode}'. 허용 값: fts, hybrid")
-
+        raise bad_request(f"지원하지 않는 mode입니다: '{mode}'. 허용 값: fts, hybrid")
     # S2: retriever/reranker 플러그인 오버라이드가 있으면 플러그인 경로로 처리
     if retriever is not None or reranker is not None:
         with get_db() as conn:
@@ -255,6 +261,10 @@ async def search_documents(
                 page=max(1, page),
                 limit=min(100, max(1, limit)),
                 actor_role=actor_role,
+                viewer_scope_profile_ids=viewer_scope_profile_ids,
+                collection_id=collection,
+                folder_id=folder,
+                include_subfolders=include_subfolders,
             )
         else:
             result = search_service.search_documents(
@@ -268,6 +278,10 @@ async def search_documents(
                 page=max(1, page),
                 limit=min(100, max(1, limit)),
                 actor_role=actor_role,
+                viewer_scope_profile_ids=viewer_scope_profile_ids,
+                collection_id=collection,
+                folder_id=folder,
+                include_subfolders=include_subfolders,
             )
 
     return success_response(data=result.model_dump(), request_id=request_id, trace_id=trace_id)

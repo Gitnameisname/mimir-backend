@@ -21,6 +21,8 @@ from typing import Any, Optional
 import psycopg2.extensions
 
 from app.models.version import Version
+from app.utils.json_utils import dumps_ko
+from app.repositories.pagination import paginate_page
 
 logger = logging.getLogger(__name__)
 
@@ -121,15 +123,15 @@ class VersionsRepository:
                     status,
                     change_summary,
                     source,
-                    json.dumps(metadata, ensure_ascii=False),
+                    dumps_ko(metadata),
                     created_by,
                     parent_version_id,
                     restored_from_version_id,
                     title_snapshot,
                     summary_snapshot,
-                    json.dumps(metadata_snapshot, ensure_ascii=False)
+                    dumps_ko(metadata_snapshot)
                     if metadata_snapshot is not None else None,
-                    json.dumps(content_snapshot, ensure_ascii=False)
+                    dumps_ko(content_snapshot)
                     if content_snapshot is not None else None,
                 ),
             )
@@ -278,10 +280,10 @@ class VersionsRepository:
             params.append(summary_snapshot)
         if metadata_snapshot is not None:
             set_clauses.append("metadata_snapshot = %s")
-            params.append(json.dumps(metadata_snapshot, ensure_ascii=False))
+            params.append(dumps_ko(metadata_snapshot))
         if content_snapshot is not None:
             set_clauses.append("content_snapshot = %s")
-            params.append(json.dumps(content_snapshot, ensure_ascii=False))
+            params.append(dumps_ko(content_snapshot))
 
         if not set_clauses:
             return self.get_by_id(conn, version_id)
@@ -317,7 +319,7 @@ class VersionsRepository:
         }
         col = _SORT_WHITELIST.get(sort_field, "version_number")
         direction = "DESC" if sort_dir.upper() == "DESC" else "ASC"
-        offset = (page - 1) * page_size
+        page, page_size, offset = paginate_page(page, page_size)
 
         count_sql = "SELECT COUNT(*) AS total FROM versions WHERE document_id = %s"
         data_sql = f"""

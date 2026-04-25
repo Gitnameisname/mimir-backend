@@ -16,6 +16,7 @@ from enum import Enum
 from typing import Any, Optional
 
 from pydantic import BaseModel, Field, field_validator
+from app.utils.json_utils import dumps_ko
 
 _METADATA_MAX_BYTES = 65_536  # 64 KB
 
@@ -72,7 +73,7 @@ class DocumentCreateRequest(BaseModel):
             return {}
         if not isinstance(v, dict):
             raise ValueError("metadata must be a key-value object (dict)")
-        serialized = json.dumps(v, ensure_ascii=False).encode()
+        serialized = dumps_ko(v).encode()
         if len(serialized) > _METADATA_MAX_BYTES:
             raise ValueError(f"metadata size exceeds {_METADATA_MAX_BYTES // 1024}KB limit")
         return v
@@ -103,7 +104,7 @@ class DocumentUpdateRequest(BaseModel):
             return None  # None = 수정하지 않음
         if not isinstance(v, dict):
             raise ValueError("metadata must be a key-value object (dict)")
-        serialized = json.dumps(v, ensure_ascii=False).encode()
+        serialized = dumps_ko(v).encode()
         if len(serialized) > _METADATA_MAX_BYTES:
             raise ValueError(f"metadata size exceeds {_METADATA_MAX_BYTES // 1024}KB limit")
         return v
@@ -141,5 +142,27 @@ class DocumentResponse(BaseModel):
     # Phase 4: 현재 활성 버전 포인터
     current_draft_version_id: Optional[str] = Field(None, description="현재 활성 Draft 버전 UUID")
     current_published_version_id: Optional[str] = Field(None, description="현재 공식 Published 버전 UUID")
+    # S3 Phase 2 FG 2-0 (2026-04-24): Scope Profile 바인딩
+    scope_profile_id: Optional[str] = Field(
+        None,
+        description="Scope Profile UUID. ACL 필터의 근거.",
+    )
+    # S3 Phase 2 FG 2-1 UX 2차 (2026-04-24): 문서 상세 응답에서만 채워지는 배치 상태
+    folder_id: Optional[str] = Field(
+        None,
+        description="현재 배치된 폴더 UUID (배치 없으면 null). 문서 상세 응답 전용.",
+    )
+    in_collection_ids: list[str] = Field(
+        default_factory=list,
+        description="요청자 소유의 컬렉션 중 이 문서를 포함하고 있는 컬렉션 id 목록. 문서 상세 응답 전용.",
+    )
+    # S3 Phase 2 FG 2-2 (2026-04-24): 서버 파서가 계산한 태그 목록
+    document_tags: list[dict] = Field(
+        default_factory=list,
+        description=(
+            "이 문서에 달린 태그 목록. 각 항목 {id, name, source}. "
+            "source ∈ {'inline','frontmatter','both'}. 문서 상세 응답 전용."
+        ),
+    )
 
     model_config = {"from_attributes": True}

@@ -38,6 +38,7 @@ from app.models.batch_extraction import (
 )
 from app.repositories.batch_extraction_repository import BatchExtractionJobRepository
 from app.services.extraction.batch_extraction_service import run_batch_extraction_background
+from app.utils.converters import uuid_str_or_none
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +105,8 @@ def start_batch_retry(
         sample_count=req.sample_count,
         sample_mode=req.sample_count is not None,
         comparison_mode=req.comparison_mode,
-        actor_type=actor.actor_type or "user",
+        # 도서관 §1.6 BE-G4 R1 (2026-04-25): Enum truthy fallback 잘못된 코드 정정
+        actor_type=actor_type_str(actor),
     )
     conn.commit()
 
@@ -113,7 +115,7 @@ def start_batch_retry(
         job_id=str(job.id),
         extraction_schema_id=req.extraction_schema_id,
         extraction_schema_version=req.extraction_schema_version,
-        scope_profile_id=str(scope_id) if scope_id else None,
+        scope_profile_id=uuid_str_or_none(scope_id),
         date_from=req.date_from,
         date_to=req.date_to,
         sample_count=req.sample_count,
@@ -168,7 +170,8 @@ def start_sample_retry(
         scope_profile_id=scope_id,
         sample_count=req.sample_count,
         sample_mode=True,
-        actor_type=actor.actor_type or "user",
+        # 도서관 §1.6 BE-G4 R1 (2026-04-25): Enum truthy fallback 잘못된 코드 정정
+        actor_type=actor_type_str(actor),
     )
     conn.commit()
 
@@ -177,7 +180,7 @@ def start_sample_retry(
         job_id=str(job.id),
         extraction_schema_id=req.extraction_schema_id,
         extraction_schema_version=req.extraction_schema_version,
-        scope_profile_id=str(scope_id) if scope_id else None,
+        scope_profile_id=uuid_str_or_none(scope_id),
         date_from=None,
         date_to=None,
         sample_count=req.sample_count,

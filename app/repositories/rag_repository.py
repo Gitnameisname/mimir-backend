@@ -14,6 +14,8 @@ from typing import Optional
 
 import psycopg2.extensions
 import psycopg2.extras
+from app.utils.json_utils import dumps_ko, loads_maybe
+from app.db.cursor_helpers import fetch_many_as, fetch_one_as
 
 logger = logging.getLogger(__name__)
 
@@ -111,17 +113,11 @@ class RAGRepository:
         conversation_id: str,
         user_id: str,
     ) -> Optional[dict]:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
+        return fetch_one_as(conn, """
                 SELECT id, user_id, title, document_id, created_at, updated_at
                 FROM rag_conversations
                 WHERE id = %s::uuid AND user_id = %s::uuid
-                """,
-                (conversation_id, user_id),
-            )
-            row = cur.fetchone()
-        return _conv_row(row) if row else None
+                """, (conversation_id, user_id), lambda row: _conv_row(row))
 
     def list_conversations(
         self,
@@ -200,8 +196,8 @@ class RAGRepository:
         token_used: Optional[int] = None,
         model: Optional[str] = None,
     ) -> dict:
-        cit_json = json.dumps(citations or [], ensure_ascii=False)
-        ctx_json = json.dumps(context_chunks or [], ensure_ascii=False)
+        cit_json = dumps_ko(citations or [])
+        ctx_json = dumps_ko(context_chunks or [])
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -227,20 +223,14 @@ class RAGRepository:
         *,
         limit: int = 50,
     ) -> list[dict]:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
+        return fetch_many_as(conn, """
                 SELECT id, conversation_id, role, content, citations,
                        context_chunks, token_used, model, created_at
                 FROM rag_messages
                 WHERE conversation_id = %s::uuid
                 ORDER BY created_at ASC
                 LIMIT %s
-                """,
-                (conversation_id, limit),
-            )
-            rows = cur.fetchall()
-        return [_msg_row(r) for r in rows]
+                """, (conversation_id, limit), lambda r: _msg_row(r))
 
     def get_history_for_llm(
         self,
@@ -285,10 +275,8 @@ def _conv_row(row: dict) -> dict:
 def _msg_row(row: dict) -> dict:
     citations = row.get("citations") or []
     context_chunks = row.get("context_chunks") or []
-    if isinstance(citations, str):
-        citations = json.loads(citations)
-    if isinstance(context_chunks, str):
-        context_chunks = json.loads(context_chunks)
+    citations = loads_maybe(citations)
+    context_chunks = loads_maybe(context_chunks)
     return {
         "id": str(row["id"]),
         "conversation_id": str(row["conversation_id"]),

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -26,6 +26,8 @@ from app.models.golden_set import (
     GoldenSetVersionInfo,
     SourceRef,
 )
+from app.utils.time import utcnow
+from app.utils.json_utils import dumps_ko, loads_maybe
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +37,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return utcnow()
 
 
 def _row_to_golden_set(row: dict) -> GoldenSet:
@@ -62,10 +64,8 @@ def _row_to_golden_item(row: dict) -> GoldenItem:
     raw_cites = row.get("expected_citations") or []
 
     # psycopg2 JSON 컬럼은 dict/list로 자동 파싱됨
-    if isinstance(raw_docs, str):
-        raw_docs = json.loads(raw_docs)
-    if isinstance(raw_cites, str):
-        raw_cites = json.loads(raw_cites)
+    raw_docs = loads_maybe(raw_docs)
+    raw_cites = loads_maybe(raw_cites)
 
     source_docs = [SourceRef(**d) for d in raw_docs]
     citations = [Citation5Tuple(**c) for c in raw_cites]
@@ -121,7 +121,7 @@ class GoldenSetRepository:
                 (
                     gid, scope_id, request.name, request.description,
                     request.domain.value, GoldenSetStatus.DRAFT.value,
-                    json.dumps(request.extra_metadata, ensure_ascii=False),
+                    dumps_ko(request.extra_metadata),
                     now, created_by, now,
                 ),
             )
@@ -239,7 +239,7 @@ class GoldenSetRepository:
             params.append(request.status.value)
         if request.extra_metadata is not None:
             fields.append("extra_metadata=%s")
-            params.append(json.dumps(request.extra_metadata, ensure_ascii=False))
+            params.append(dumps_ko(request.extra_metadata))
 
         params += [golden_set_id, scope_id]
 
@@ -403,8 +403,8 @@ class GoldenSetRepository:
                         sid, golden_set_id, version,
                         gs_row["name"], gs_row.get("description"),
                         gs_row["domain"], gs_row["status"],
-                        json.dumps(gs_row.get("extra_metadata") or {}, ensure_ascii=False),
-                        json.dumps(items_snapshot, ensure_ascii=False),
+                        dumps_ko(gs_row.get("extra_metadata") or {}),
+                        dumps_ko(items_snapshot),
                         now, actor,
                     ),
                 )
@@ -451,8 +451,8 @@ class GoldenItemRepository:
                 (
                     iid, golden_set_id,
                     request.question, request.expected_answer,
-                    json.dumps([d.model_dump() for d in request.expected_source_docs], ensure_ascii=False),
-                    json.dumps([c.model_dump() for c in request.expected_citations], ensure_ascii=False),
+                    dumps_ko([d.model_dump() for d in request.expected_source_docs]),
+                    dumps_ko([c.model_dump() for c in request.expected_citations]),
                     request.notes,
                     now, created_by, now,
                 ),
@@ -532,10 +532,10 @@ class GoldenItemRepository:
             params.append(request.expected_answer)
         if request.expected_source_docs is not None:
             fields.append("expected_source_docs=%s")
-            params.append(json.dumps([d.model_dump() for d in request.expected_source_docs], ensure_ascii=False))
+            params.append(dumps_ko([d.model_dump() for d in request.expected_source_docs]))
         if request.expected_citations is not None:
             fields.append("expected_citations=%s")
-            params.append(json.dumps([c.model_dump() for c in request.expected_citations], ensure_ascii=False))
+            params.append(dumps_ko([c.model_dump() for c in request.expected_citations]))
         if request.notes is not None:
             fields.append("notes=%s")
             params.append(request.notes)

@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, Field, model_validator
+from app.utils.converters import uuid_str_or_none
 
 
 class HumanEdit(BaseModel):
@@ -128,7 +129,7 @@ class ApprovedExtractionResponse(BaseModel):
     def from_domain(cls, ae: ApprovedExtraction) -> "ApprovedExtractionResponse":
         return cls(
             id=str(ae.id),
-            candidate_id=str(ae.candidate_id) if ae.candidate_id else None,
+            candidate_id=uuid_str_or_none(ae.candidate_id),
             document_id=str(ae.document_id),
             document_version=ae.document_version,
             extraction_schema_id=ae.extraction_schema_id,
@@ -140,6 +141,6 @@ class ApprovedExtractionResponse(BaseModel):
             approved_at=ae.approved_at.isoformat(),
             approval_comment=ae.approval_comment,
             actor_type=ae.actor_type,
-            scope_profile_id=str(ae.scope_profile_id) if ae.scope_profile_id else None,
+            scope_profile_id=uuid_str_or_none(ae.scope_profile_id),
             created_at=ae.created_at.isoformat(),
         )

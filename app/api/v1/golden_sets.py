@@ -57,6 +57,9 @@ from app.repositories.golden_set_repository import (
     GoldenSetRepository,
 )
 from app.services.golden_set_import_export_service import GoldenSetImportExportService
+from app.utils.actor import actor_type_str
+from app.utils.http_errors import bad_request, not_found
+from app.utils.strings import normalize_lower
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +95,9 @@ def _require_write(actor: ActorContext) -> None:
 
 
 def _actor_type_str(actor: ActorContext) -> str:
-    return actor.actor_type.value if actor.actor_type else "user"
+    """도서관 §1.6 BE-G4 (2026-04-25): app.utils.actor.actor_type_str 위임.
+    SERVICE → "system" 매핑 통일 (보안 시맨틱 강화)."""
+    return actor_type_str(actor)
 
 
 def _item_to_response(item) -> GoldenItemResponse:
@@ -210,7 +215,7 @@ def get_golden_set(
         gs = repo.get_by_id(golden_set_id, scope_id, include_items=True)
 
     if not gs:
-        raise HTTPException(status_code=404, detail="GoldenSet을 찾을 수 없습니다.")
+        raise not_found("GoldenSet을 찾을 수 없습니다.")
     return success_response(data=_set_to_detail(gs))
 
 
@@ -230,7 +235,7 @@ def update_golden_set(
         updated = repo.update(golden_set_id, scope_id, request, updated_by=actor_id)
 
     if not updated:
-        raise HTTPException(status_code=404, detail="GoldenSet을 찾을 수 없습니다.")
+        raise not_found("GoldenSet을 찾을 수 없습니다.")
 
     audit_emitter.emit(
         event_type="golden_set.updated",
@@ -259,7 +264,7 @@ def delete_golden_set(
         ok = repo.soft_delete(golden_set_id, scope_id)
 
     if not ok:
-        raise HTTPException(status_code=404, detail="GoldenSet을 찾을 수 없습니다.")
+        raise not_found("GoldenSet을 찾을 수 없습니다.")
 
     audit_emitter.emit(
         event_type="golden_set.deleted",
@@ -294,7 +299,7 @@ def add_golden_item(
         )
 
     if not item:
-        raise HTTPException(status_code=404, detail="GoldenSet을 찾을 수 없습니다.")
+        raise not_found("GoldenSet을 찾을 수 없습니다.")
 
     audit_emitter.emit(
         event_type="golden_item.added",
@@ -324,7 +329,7 @@ def list_golden_items(
         items = repo.list_items(golden_set_id, scope_id)
 
     if items is None:
-        raise HTTPException(status_code=404, detail="GoldenSet을 찾을 수 없습니다.")
+        raise not_found("GoldenSet을 찾을 수 없습니다.")
 
     paged = items[offset: offset + limit]
     page = (offset // limit) + 1
@@ -353,7 +358,7 @@ def update_golden_item(
         updated = repo.update_item(item_id, scope_id, request, updated_by=actor_id)
 
     if not updated:
-        raise HTTPException(status_code=404, detail="GoldenItem을 찾을 수 없습니다.")
+        raise not_found("GoldenItem을 찾을 수 없습니다.")
 
     audit_emitter.emit(
         event_type="golden_item.modified",
@@ -383,7 +388,7 @@ def delete_golden_item(
         ok = repo.soft_delete_item(item_id, scope_id, deleted_by=actor_id)
 
     if not ok:
-        raise HTTPException(status_code=404, detail="GoldenItem을 찾을 수 없습니다.")
+        raise not_found("GoldenItem을 찾을 수 없습니다.")
 
     audit_emitter.emit(
         event_type="golden_item.deleted",
@@ -414,7 +419,7 @@ def get_version_history(
         history = repo.get_version_history(golden_set_id, scope_id)
 
     if not history:
-        raise HTTPException(status_code=404, detail="GoldenSet을 찾을 수 없습니다.")
+        raise not_found("GoldenSet을 찾을 수 없습니다.")
     return success_response(data=[v.model_dump() for v in history])
 
 
@@ -432,7 +437,7 @@ def get_version_snapshot(
         snapshot = repo.get_version_snapshot(golden_set_id, scope_id, version)
 
     if not snapshot:
-        raise HTTPException(status_code=404, detail="해당 버전을 찾을 수 없습니다.")
+        raise not_found("해당 버전을 찾을 수 없습니다.")
     return success_response(data=snapshot)
 
 
@@ -452,7 +457,7 @@ def get_version_diff(
         snap_to = repo.get_version_snapshot(golden_set_id, scope_id, to_v)
 
     if not snap_from or not snap_to:
-        raise HTTPException(status_code=404, detail="버전을 찾을 수 없습니다.")
+        raise not_found("버전을 찾을 수 없습니다.")
 
     from_ids = {item["id"] for item in snap_from.get("items", [])}
     to_ids = {item["id"] for item in snap_to.get("items", [])}
@@ -491,7 +496,7 @@ def export_golden_set(
         exported = svc.export(golden_set_id, scope_id)
 
     if not exported:
-        raise HTTPException(status_code=404, detail="GoldenSet을 찾을 수 없습니다.")
+        raise not_found("GoldenSet을 찾을 수 없습니다.")
 
     audit_emitter.emit(
         event_type="golden_set.exported",
@@ -529,35 +534,36 @@ def import_golden_set(
 
     # 파일 타입 및 확장자 검증 (SEC5-BE-001: 허용 MIME만 수락)
     _ALLOWED_MIME = {"application/json", "text/json", "text/plain"}
-    content_type = (file.content_type or "").split(";")[0].strip().lower()
+    # 도서관 §1.4 BE-G1 (2026-04-25): split 결과는 항상 str → normalize_lower 결과도 str
+    content_type = normalize_lower((file.content_type or "").split(";")[0]) or ""
     if content_type and content_type not in _ALLOWED_MIME:
-        raise HTTPException(status_code=400, detail="JSON 파일만 업로드할 수 있습니다.")
+        raise bad_request("JSON 파일만 업로드할 수 있습니다.")
     filename = file.filename or ""
     if filename and not filename.lower().endswith(".json"):
-        raise HTTPException(status_code=400, detail="파일 확장자는 .json이어야 합니다.")
+        raise bad_request("파일 확장자는 .json이어야 합니다.")
 
     # 파일 읽기 및 크기 제한
     raw = file.file.read(_MAX_UPLOAD_BYTES + 1)
     if len(raw) > _MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=400, detail="파일 크기가 10MB를 초과합니다.")
+        raise bad_request("파일 크기가 10MB를 초과합니다.")
 
     # JSON 파싱
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=400, detail=f"JSON 파싱 오류: {exc}") from exc
+        raise bad_request(f"JSON 파싱 오류: {exc}") from exc
 
     # 스키마 검증
     try:
         import_req = GoldenSetImportRequest.model_validate(payload)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"스키마 검증 오류: {exc}") from exc
+        raise bad_request(f"스키마 검증 오류: {exc}") from exc
 
     # 중복 question 사전 검사 (allow_partial=False로 한 번 더 확인)
     from app.models.golden_set_import_export import ImportValidator
     ok, errs = ImportValidator.validate(import_req)
     if not ok:
-        raise HTTPException(status_code=400, detail="; ".join(errs))
+        raise bad_request("; ".join(errs))
 
     with get_db() as conn:
         svc = GoldenSetImportExportService(conn)
@@ -596,6 +602,6 @@ def verify_round_trip(
         is_ok, errors = svc.verify_round_trip(golden_set_id, scope_id)
 
     if not is_ok and errors and errors[0] == "GoldenSet을 찾을 수 없습니다.":
-        raise HTTPException(status_code=404, detail=errors[0])
+        raise not_found(errors[0])
 
     return success_response(data={"is_consistent": is_ok, "errors": errors})

@@ -19,10 +19,11 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any
 
 from app.cache.valkey import get_valkey
+from app.utils.time import utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +35,7 @@ def _fallback_get(key: str) -> Any | None:
     if entry is None:
         return None
     value, expires_at = entry
-    if datetime.now(timezone.utc) > expires_at:
+    if utcnow() > expires_at:
         _FALLBACK_CACHE.pop(key, None)
         return None
     return value
@@ -43,7 +44,7 @@ def _fallback_get(key: str) -> Any | None:
 def _fallback_set(key: str, value: Any, ttl_seconds: int) -> None:
     _FALLBACK_CACHE[key] = (
         value,
-        datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds),
+        utcnow() + timedelta(seconds=ttl_seconds),
     )
 
 

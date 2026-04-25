@@ -14,6 +14,7 @@ import ipaddress
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, HTTPException
+from app.utils.http_errors import bad_request
 
 router = APIRouter()
 
@@ -29,19 +30,19 @@ def validate_webhook_url(url: str) -> str:
     - 빈 URL 거부
     """
     if not url:
-        raise HTTPException(status_code=400, detail="웹훅 URL이 비어 있습니다.")
+        raise bad_request("웹훅 URL이 비어 있습니다.")
     parsed = urlparse(url)
     if parsed.scheme not in _ALLOWED_URL_SCHEMES:
-        raise HTTPException(status_code=400, detail="웹훅 URL은 https만 허용됩니다.")
+        raise bad_request("웹훅 URL은 https만 허용됩니다.")
     hostname = (parsed.hostname or "").lower()
     if not hostname:
-        raise HTTPException(status_code=400, detail="웹훅 URL의 호스트를 확인할 수 없습니다.")
+        raise bad_request("웹훅 URL의 호스트를 확인할 수 없습니다.")
     if hostname == "localhost":
-        raise HTTPException(status_code=400, detail="내부 네트워크 URL은 허용되지 않습니다.")
+        raise bad_request("내부 네트워크 URL은 허용되지 않습니다.")
     try:
         addr = ipaddress.ip_address(hostname)
         if addr.is_loopback or addr.is_private or addr.is_link_local or addr.is_multicast:
-            raise HTTPException(status_code=400, detail="내부 네트워크 URL은 허용되지 않습니다.")
+            raise bad_request("내부 네트워크 URL은 허용되지 않습니다.")
     except ValueError:
         pass  # 도메인명 — 정상
     return url

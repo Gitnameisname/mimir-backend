@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 from uuid import UUID, uuid4
 
@@ -22,6 +22,9 @@ from app.models.extraction import (
     ExtractionSchemaVersion,
     ExtractionTargetSchema,
 )
+from app.utils.time import utcnow
+from app.utils.converters import uuid_str_or_none
+from app.utils.json_utils import dumps_ko, loads_maybe
 
 logger = logging.getLogger(__name__)
 
@@ -57,15 +60,12 @@ class ExtractionSchemaRepository:
     # ------------------------------------------------------------------
 
     def _fields_to_json(self, fields: Dict[str, ExtractionFieldDef]) -> str:
-        return json.dumps(
-            {k: v.model_dump(mode="json") for k, v in fields.items()},
-            ensure_ascii=False,
-        )
+        return dumps_ko({k: v.model_dump(mode="json") for k, v in fields.items()})
 
     def _json_to_fields(self, raw: Any) -> Dict[str, ExtractionFieldDef]:
         if raw is None:
             return {}
-        data: dict = raw if isinstance(raw, dict) else json.loads(raw)
+        data: dict = loads_maybe(raw)
         return {k: ExtractionFieldDef(**v) for k, v in data.items()}
 
     def _row_to_schema(self, row: dict) -> ExtractionTargetSchema:
@@ -113,10 +113,10 @@ class ExtractionSchemaRepository:
         extra_metadata: Optional[Dict[str, Any]] = None,
     ) -> ExtractionTargetSchema:
         """새로운 추출 스키마 생성 (version=1)."""
-        now = datetime.now(timezone.utc)
+        now = utcnow()
         schema_id = str(uuid4())
         fields_json = self._fields_to_json(fields)
-        meta_json = json.dumps(extra_metadata or {}, ensure_ascii=False)
+        meta_json = dumps_ko(extra_metadata or {})
 
         with self._conn.cursor() as cur:
             # 중복 확인 (soft-deleted 제외)
@@ -153,7 +153,7 @@ class ExtractionSchemaRepository:
                 (
                     schema_id, doc_type_code, fields_json, meta_json,
                     now, now, actor_info.actor_id, actor_info.actor_id,
-                    str(scope_profile_id) if scope_profile_id else None,
+                    uuid_str_or_none(scope_profile_id),
                 ),
             )
             row = cur.fetchone()
@@ -429,7 +429,7 @@ class ExtractionSchemaRepository:
         change_summary: Optional[str] = None,
     ) -> ExtractionTargetSchema:
         """스키마 업데이트 — 기존 레코드 갱신 + 버전 이력 추가."""
-        now = datetime.now(timezone.utc)
+        now = utcnow()
         fields_json = self._fields_to_json(fields)
 
         with self._conn.cursor() as cur:
@@ -516,7 +516,7 @@ class ExtractionSchemaRepository:
         - 폐기(deprecated) 된 스키마는 롤백 불가.
         - change_summary 가 없으면 "v{N} 로 되돌리기" 가 자동 기록됨.
         """
-        now = datetime.now(timezone.utc)
+        now = utcnow()
 
         conditions = ["doc_type_code = %s", "is_soft_deleted = FALSE"]
         params: list = [doc_type_code]
@@ -571,12 +571,12 @@ class ExtractionSchemaRepository:
 
             raw_fields = target_row["fields_json"]
             target_fields_map: dict = (
-                raw_fields if isinstance(raw_fields, dict) else json.loads(raw_fields)
+                loads_maybe(raw_fields)
             )
             if not target_fields_map:
                 raise ValueError("target_version 의 fields 가 비어 있어 되돌릴 수 없음")
 
-            fields_json = json.dumps(target_fields_map, ensure_ascii=False)
+            fields_json = dumps_ko(target_fields_map)
             new_version = current_version + 1
 
             # 스키마 레코드 갱신
@@ -603,7 +603,7 @@ class ExtractionSchemaRepository:
             prev_fields_map: dict = {}
             if prev_raw:
                 p = prev_raw["fields_json"]
-                prev_fields_map = p if isinstance(p, dict) else json.loads(p)
+                prev_fields_map = loads_maybe(p)
             changed = sorted(
                 set(prev_fields_map.keys()).symmetric_difference(target_fields_map.keys())
             )
@@ -615,10 +615,7 @@ class ExtractionSchemaRepository:
                 if change_summary and change_summary.strip()
                 else f"v{target_version} 로 되돌리기"
             )
-            rollback_meta = json.dumps(
-                {"rolled_back_from_version": target_version},
-                ensure_ascii=False,
-            )
+            rollback_meta = dumps_ko({"rolled_back_from_version": target_version})
             cur.execute(
                 """
                 INSERT INTO extraction_schema_versions
@@ -642,7 +639,7 @@ class ExtractionSchemaRepository:
 
     def delete(self, doc_type_code: str, actor_info: ActorInfo) -> bool:
         """소프트 삭제."""
-        now = datetime.now(timezone.utc)
+        now = utcnow()
         with self._conn.cursor() as cur:
             cur.execute(
                 """
@@ -679,7 +676,7 @@ class ExtractionSchemaRepository:
         actor_info: ActorInfo,
     ) -> ExtractionTargetSchema:
         """스키마 폐기 표시 (deprecated=True)."""
-        now = datetime.now(timezone.utc)
+        now = utcnow()
         with self._conn.cursor() as cur:
             cur.execute(
                 """

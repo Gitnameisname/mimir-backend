@@ -13,8 +13,11 @@ from typing import Any, Optional
 import psycopg2.extensions
 
 from app.models.organization import Organization
+from app.utils.json_utils import dumps_ko
+from app.utils.strings import normalize_lower
 from app.models.role import Role, UserOrgRole
 from app.models.user import User
+from app.db.cursor_helpers import fetch_one_as
 
 logger = logging.getLogger(__name__)
 
@@ -91,28 +94,16 @@ class UsersRepository:
     # --- 조회 ---
 
     def get_by_id(self, conn: psycopg2.extensions.connection, user_id: str) -> Optional[User]:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM users WHERE id = %s", (user_id,))
-            row = cur.fetchone()
-        return _row_to_user(row) if row else None
+        return fetch_one_as(conn, "SELECT * FROM users WHERE id = %s", (user_id,), lambda row: _row_to_user(row))
 
     def get_by_email(self, conn: psycopg2.extensions.connection, email: str) -> Optional[User]:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM users WHERE email = %s", (email,))
-            row = cur.fetchone()
-        return _row_to_user(row) if row else None
+        return fetch_one_as(conn, "SELECT * FROM users WHERE email = %s", (email,), lambda row: _row_to_user(row))
 
     def get_by_username(
         self, conn: psycopg2.extensions.connection, username: str
     ) -> Optional[User]:
         """아이디(username)로 사용자를 조회한다. 대소문자 구분 없음."""
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT * FROM users WHERE LOWER(username) = LOWER(%s)",
-                (username,),
-            )
-            row = cur.fetchone()
-        return _row_to_user(row) if row else None
+        return fetch_one_as(conn, "SELECT * FROM users WHERE LOWER(username) = LOWER(%s)", (username,), lambda row: _row_to_user(row))
 
     def get_by_identifier(
         self, conn: psycopg2.extensions.connection, identifier: str
@@ -122,7 +113,11 @@ class UsersRepository:
         identifier에 '@'가 포함되어 있으면 이메일로, 그렇지 않으면 아이디로 조회한다.
         """
         if "@" in identifier:
-            return self.get_by_email(conn, identifier.lower().strip())
+            # 도서관 §1.4 BE-G1 (2026-04-25): normalize_lower 로 strip→lower 통일.
+            # identifier 는 위 if 분기로 인해 None 이 아니므로 결과도 str 보장.
+            normalized = normalize_lower(identifier)
+            assert normalized is not None  # for type checkers
+            return self.get_by_email(conn, normalized)
         return self.get_by_username(conn, identifier.strip())
 
     def list(
@@ -251,13 +246,7 @@ class UsersRepository:
         fields.append("updated_at = NOW()")
         params.append(user_id)
 
-        with conn.cursor() as cur:
-            cur.execute(
-                f"UPDATE users SET {', '.join(fields)} WHERE id = %s RETURNING *",
-                params,
-            )
-            row = cur.fetchone()
-        return _row_to_user(row) if row else None
+        return fetch_one_as(conn, f"UPDATE users SET {', '.join(fields)} WHERE id = %s RETURNING *", params, lambda row: _row_to_user(row))
 
     def record_login_success(
         self,
@@ -265,19 +254,99 @@ class UsersRepository:
         user_id: str,
     ) -> Optional[User]:
         """로그인 성공 시: failed_login_count 초기화, last_login_at 갱신."""
-        with conn.cursor() as cur:
-            cur.execute(
-                """
+        return fetch_one_as(conn, """
                 UPDATE users
                 SET failed_login_count = 0, locked_until = NULL,
                     last_login_at = NOW(), updated_at = NOW()
                 WHERE id = %s
                 RETURNING *
+                """, (user_id,), lambda row: _row_to_user(row))
+
+    # ------------------------------------------------------------------
+    # Phase 1 FG 1-3 — users.preferences (JSONB)
+    # ------------------------------------------------------------------
+
+    def get_preferences(
+        self,
+        conn: psycopg2.extensions.connection,
+        user_id: str,
+    ) -> dict[str, Any]:
+        """user.preferences JSONB 를 dict 로 반환한다. 컬럼 부재 시 빈 dict.
+
+        컬럼 부재 대응: Alembic `s3_p1_users_preferences` 이전 DB 에서도 안전하게
+        빈 dict 를 반환한다 (쿼리 실패 시 fallback).
+        """
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT preferences FROM users WHERE id = %s",
+                    (user_id,),
+                )
+                row = cur.fetchone()
+        except Exception:
+            # preferences 컬럼 부재 등 — 빈 dict 반환 (기능 degrade)
+            conn.rollback()
+            return {}
+        if row is None:
+            return {}
+        raw = row.get("preferences")
+        if raw is None:
+            return {}
+        if isinstance(raw, str):
+            # JSON 직렬화 상태로 오는 드라이버 대응
+            import json as _json
+            try:
+                return _json.loads(raw)
+            except (ValueError, TypeError):
+                return {}
+        if isinstance(raw, dict):
+            return raw
+        return {}
+
+    def update_preferences(
+        self,
+        conn: psycopg2.extensions.connection,
+        user_id: str,
+        patch: dict[str, Any],
+    ) -> dict[str, Any]:
+        """주어진 ``patch`` 를 기존 preferences 에 shallow merge 하고 반환.
+
+        키를 ``None`` 으로 설정하면 해당 키가 삭제된다. 중첩 merge 는 하지 않는다
+        (Phase 3 에서 Deep merge 재검토 — task1-3.md Q2).
+        """
+        import json as _json
+
+        current = self.get_preferences(conn, user_id)
+        merged: dict[str, Any] = dict(current)
+        for k, v in (patch or {}).items():
+            if v is None:
+                merged.pop(k, None)
+            else:
+                merged[k] = v
+
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE users
+                SET preferences = %s::jsonb, updated_at = NOW()
+                WHERE id = %s
+                RETURNING preferences
                 """,
-                (user_id,),
+                # 도서관 §1.3 BE-G2 (2026-04-25): dumps_ko 통일 (ensure_ascii=False 고정)
+                (dumps_ko(merged), user_id),
             )
             row = cur.fetchone()
-        return _row_to_user(row) if row else None
+        if row is None:
+            return merged
+        ret = row.get("preferences")
+        if isinstance(ret, str):
+            try:
+                return _json.loads(ret)
+            except (ValueError, TypeError):
+                return merged
+        if isinstance(ret, dict):
+            return ret
+        return merged
 
     def record_login_failure(
         self,
@@ -285,18 +354,12 @@ class UsersRepository:
         user_id: str,
     ) -> Optional[User]:
         """로그인 실패 시: failed_login_count 증가."""
-        with conn.cursor() as cur:
-            cur.execute(
-                """
+        return fetch_one_as(conn, """
                 UPDATE users
                 SET failed_login_count = failed_login_count + 1, updated_at = NOW()
                 WHERE id = %s
                 RETURNING *
-                """,
-                (user_id,),
-            )
-            row = cur.fetchone()
-        return _row_to_user(row) if row else None
+                """, (user_id,), lambda row: _row_to_user(row))
 
     def delete(self, conn: psycopg2.extensions.connection, user_id: str) -> bool:
         with conn.cursor() as cur:
@@ -348,13 +411,7 @@ class UsersRepository:
         org_id: str,
     ) -> Optional[str]:
         """특정 조직에서의 사용자 역할명을 반환한다."""
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT role_name FROM user_org_roles WHERE user_id = %s AND org_id = %s",
-                (user_id, org_id),
-            )
-            row = cur.fetchone()
-        return row["role_name"] if row else None
+        return fetch_one_as(conn, "SELECT role_name FROM user_org_roles WHERE user_id = %s AND org_id = %s", (user_id, org_id), lambda row: row["role_name"])
 
 
 # ---------------------------------------------------------------------------
@@ -364,10 +421,7 @@ class UsersRepository:
 class OrganizationsRepository:
 
     def get_by_id(self, conn: psycopg2.extensions.connection, org_id: str) -> Optional[Organization]:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM organizations WHERE id = %s", (org_id,))
-            row = cur.fetchone()
-        return _row_to_organization(row) if row else None
+        return fetch_one_as(conn, "SELECT * FROM organizations WHERE id = %s", (org_id,), lambda row: _row_to_organization(row))
 
     def list(
         self,
@@ -450,13 +504,7 @@ class OrganizationsRepository:
         fields.append("updated_at = NOW()")
         params.append(org_id)
 
-        with conn.cursor() as cur:
-            cur.execute(
-                f"UPDATE organizations SET {', '.join(fields)} WHERE id = %s RETURNING *",
-                params,
-            )
-            row = cur.fetchone()
-        return _row_to_organization(row) if row else None
+        return fetch_one_as(conn, f"UPDATE organizations SET {', '.join(fields)} WHERE id = %s RETURNING *", params, lambda row: _row_to_organization(row))
 
     def delete(self, conn: psycopg2.extensions.connection, org_id: str) -> bool:
         with conn.cursor() as cur:
@@ -471,16 +519,10 @@ class OrganizationsRepository:
 class RolesRepository:
 
     def get_by_id(self, conn: psycopg2.extensions.connection, role_id: str) -> Optional[Role]:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM roles WHERE id = %s", (role_id,))
-            row = cur.fetchone()
-        return _row_to_role(row) if row else None
+        return fetch_one_as(conn, "SELECT * FROM roles WHERE id = %s", (role_id,), lambda row: _row_to_role(row))
 
     def get_by_name(self, conn: psycopg2.extensions.connection, name: str) -> Optional[Role]:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM roles WHERE name = %s", (name,))
-            row = cur.fetchone()
-        return _row_to_role(row) if row else None
+        return fetch_one_as(conn, "SELECT * FROM roles WHERE name = %s", (name,), lambda row: _row_to_role(row))
 
     def list(self, conn: psycopg2.extensions.connection) -> list[Role]:
         with conn.cursor() as cur:
@@ -514,13 +556,7 @@ class RolesRepository:
         *,
         description: Optional[str] = None,
     ) -> Optional[Role]:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE roles SET description = %s WHERE id = %s AND is_system = FALSE RETURNING *",
-                (description, role_id),
-            )
-            row = cur.fetchone()
-        return _row_to_role(row) if row else None
+        return fetch_one_as(conn, "UPDATE roles SET description = %s WHERE id = %s AND is_system = FALSE RETURNING *", (description, role_id), lambda row: _row_to_role(row))
 
     def delete(self, conn: psycopg2.extensions.connection, role_id: str) -> bool:
         """is_system=FALSE인 역할만 삭제 가능."""

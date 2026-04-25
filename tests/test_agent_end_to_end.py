@@ -23,6 +23,15 @@ from app.services.agent_proposal_service import AgentProposalService
 from app.api.errors.exceptions import ApiPermissionDeniedError, ApiConflictError
 
 
+# Phase 1 FG 1-1: propose_draft 가 호출하는 snapshot_sync_service.rebuild_nodes_from_snapshot
+# 은 실 nodes_repository 를 호출하므로 본 파일의 mock conn 환경에서 실패한다.
+# 모든 테스트에서 no-op 으로 교체 (rebuild 검증은 fg11 전용 스위트에서 수행).
+@pytest.fixture(autouse=True)
+def _mock_rebuild_nodes(monkeypatch):
+    import app.services.snapshot_sync_service as snap_mod
+    monkeypatch.setattr(snap_mod, "rebuild_nodes_from_snapshot", lambda *a, **kw: [])
+
+
 def _make_agent_conn(
     *,
     agent_active: bool = True,

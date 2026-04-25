@@ -15,6 +15,7 @@ from uuid import UUID
 from pydantic import BaseModel, Field, field_validator
 
 from app.models.extraction import ExtractionFieldDef
+from app.utils.converters import uuid_str_or_none
 
 
 # ---------------------------------------------------------------------------
@@ -231,7 +232,7 @@ class ExtractionSchemaResponse(BaseModel):
             updated_at=schema.updated_at.isoformat(),
             created_by=schema.created_by,
             updated_by=schema.updated_by,
-            scope_profile_id=str(schema.scope_profile_id) if schema.scope_profile_id else None,
+            scope_profile_id=uuid_str_or_none(schema.scope_profile_id),
             extra_metadata=schema.extra_metadata,
         )
 

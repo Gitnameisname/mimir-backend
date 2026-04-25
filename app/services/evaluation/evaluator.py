@@ -9,7 +9,7 @@ import asyncio
 import functools
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from statistics import mean, median, stdev
 from typing import Any, Dict, List, Optional
 
@@ -28,6 +28,7 @@ from .models import (
     ScoreMetrics,
     TokenMetrics,
 )
+from app.utils.time import utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -157,7 +158,7 @@ class Evaluator:
         golden_items: List[Dict[str, Any]],
         max_concurrent: int = 5,
     ) -> EvaluationReport:
-        start = datetime.now(timezone.utc)
+        start = utcnow()
         semaphore = asyncio.Semaphore(max_concurrent)
         failed_count = 0
 
@@ -190,7 +191,7 @@ class Evaluator:
         total_latency = sum(r.latency_metrics.total_ms for r in results if r.latency_metrics)
         total_cost = sum(r.cost_metrics.total_cost for r in results if r.cost_metrics)
 
-        completed_at = datetime.now(timezone.utc)
+        completed_at = utcnow()
         duration = (completed_at - start).total_seconds()
 
         report = EvaluationReport(

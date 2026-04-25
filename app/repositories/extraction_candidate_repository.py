@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 from uuid import UUID, uuid4
 
@@ -19,6 +19,9 @@ from app.models.extraction import (
     ExtractionStatus,
     HumanEditRecord,
 )
+from app.utils.time import utcnow
+from app.utils.converters import uuid_str_or_none
+from app.utils.json_utils import dumps_ko, loads_maybe
 
 logger = logging.getLogger(__name__)
 
@@ -34,28 +37,25 @@ class ExtractionCandidateRepository:
     # ------------------------------------------------------------------
 
     def _json_dumps(self, obj: Any) -> str:
-        return json.dumps(obj, ensure_ascii=False, default=str)
+        return dumps_ko(obj, default=str)
 
     def _row_to_candidate(self, row: dict) -> ExtractionCandidate:
         confidence_raw = row.get("confidence_scores") or []
-        if isinstance(confidence_raw, str):
-            confidence_raw = json.loads(confidence_raw)
+        confidence_raw = loads_maybe(confidence_raw)
         confidence_scores = [
             ExtractionConfidenceScore(**item) if isinstance(item, dict) else item
             for item in confidence_raw
         ]
 
         edits_raw = row.get("human_edits") or []
-        if isinstance(edits_raw, str):
-            edits_raw = json.loads(edits_raw)
+        edits_raw = loads_maybe(edits_raw)
         human_edits = [
             HumanEditRecord(**item) if isinstance(item, dict) else item
             for item in edits_raw
         ]
 
         extracted_fields = row.get("extracted_fields") or {}
-        if isinstance(extracted_fields, str):
-            extracted_fields = json.loads(extracted_fields)
+        extracted_fields = loads_maybe(extracted_fields)
 
         return ExtractionCandidate(
             id=UUID(str(row["id"])),
@@ -108,7 +108,7 @@ class ExtractionCandidateRepository:
         actor_type: str = "agent",
     ) -> ExtractionCandidate:
         """새 ExtractionCandidate 생성 (status=pending)."""
-        now = datetime.now(timezone.utc)
+        now = utcnow()
         candidate_id = str(uuid4())
 
         scores_json = self._json_dumps([s.model_dump() for s in confidence_scores])
@@ -153,7 +153,7 @@ class ExtractionCandidateRepository:
                     extraction_model, extraction_mode.value, extraction_latency_ms,
                     tokens_json, extraction_cost_estimate,
                     extraction_prompt_version, document_content_hash,
-                    actor_type, str(scope_profile_id) if scope_profile_id else None,
+                    actor_type, uuid_str_or_none(scope_profile_id),
                     now, now,
                 ),
             )
@@ -452,7 +452,7 @@ class ExtractionCandidateRepository:
         human_edits: Optional[List[HumanEditRecord]] = None,
     ) -> Optional[ExtractionCandidate]:
         """상태 + 검토 정보 업데이트."""
-        now = datetime.now(timezone.utc)
+        now = utcnow()
         edits_json = self._json_dumps(
             [e.model_dump(mode="json") for e in (human_edits or [])]
         )
@@ -493,7 +493,7 @@ class ExtractionCandidateRepository:
 
     def soft_delete(self, candidate_id: UUID, deleted_by: str) -> bool:
         """소프트 삭제."""
-        now = datetime.now(timezone.utc)
+        now = utcnow()
         with self._conn.cursor() as cur:
             cur.execute(
                 """

@@ -15,11 +15,12 @@ from __future__ import annotations
 
 import logging
 import threading
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Callable, Optional
 from uuid import uuid4
 
 from app.services.cron_util import next_run as cron_next_run
+from app.utils.time import utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +91,7 @@ class BatchScheduler:
     def _loop(self) -> None:
         """다음 실행 시각까지 대기 → 실행 반복."""
         while not self._stop_event.is_set():
-            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            now = utcnow().replace(tzinfo=None)
             next_dt = cron_next_run(self._schedule, now=now)
             if next_dt is None:
                 logger.error("BatchScheduler: cannot compute next_run, stopping")

@@ -25,6 +25,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from app.api.context.models import RequestContext
+from app.audit.emitter import reset_trace_id, set_trace_id
 from app.observability.logging import log_request_completion
 
 
@@ -46,6 +47,10 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
         request.state.request_id = request_id
         request.state.trace_id = trace_id
 
+        # R9 (2026-04-25): AuditEmitter 가 자동 첨부하도록 trace_id ContextVar set.
+        # try/finally 로 dispatch 종료 시 반드시 reset (재진입 안전).
+        trace_token = set_trace_id(trace_id)
+
         start_time = time.monotonic()
 
         try:
@@ -65,6 +70,7 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
                 duration_ms=duration_ms,
                 result="failure",
             )
+            reset_trace_id(trace_token)
             raise
 
         duration_ms = (time.monotonic() - start_time) * 1000
@@ -102,4 +108,6 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
         )
 
         response.headers["X-Request-ID"] = request_id
+        # R9 (2026-04-25): trace_id ContextVar reset (재진입 안전)
+        reset_trace_id(trace_token)
         return response

@@ -93,5 +93,16 @@ class ActorContext:
 
     @property
     def audit_actor_type(self) -> str:
-        """감사 로그용 actor_type 문자열 (S2 원칙 ⑥)."""
-        return self.actor_type.value
+        """감사 로그용 actor_type 문자열 (S2 원칙 ⑥).
+
+        도서관 §1.6 BE-G4 (2026-04-25): 매핑을 ``app.utils.actor.actor_type_str``
+        에 위임. 시맨틱 통일 — ``ActorType.SERVICE`` → ``"system"`` (이전엔
+        ``"service"`` 를 그대로 반환해 ``AuditEmitter`` 의
+        ``Literal["user", "agent", "system"]`` 위반 가능). ``ActorType.ANONYMOUS``
+        → ``"user"`` (감사 로그 기본값).
+
+        지연 import 로 순환 참조 회피 (utils → models → ...).
+        """
+        from app.utils.actor import actor_type_str
+
+        return actor_type_str(self)

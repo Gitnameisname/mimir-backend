@@ -48,6 +48,10 @@ from app.schemas.rag import (
 )
 from app.services.rag_service import rag_service
 from app.config import settings
+from app.utils.http_errors import not_found
+from app.utils.converters import uuid_str_or_none
+from app.utils.json_utils import dumps_ko
+from app.repositories.pagination import paginate_page
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -130,10 +134,10 @@ async def rag_answer(
     audit_emitter.emit(
         event_type="rag.answer",
         action="rag.answer",
-        actor_id=str(actor_id) if actor_id else None,
+        actor_id=uuid_str_or_none(actor_id),
         actor_type=actor_type,
         resource_type="conversation",
-        resource_id=str(body.conversation_id) if body.conversation_id else None,
+        resource_id=uuid_str_or_none(body.conversation_id),
         result="success",
         request_id=getattr(request.state.context, "request_id", None),
         metadata={
@@ -171,7 +175,7 @@ async def rag_query(
         if body.conversation_id:
             conv = rag_repository.get_conversation(conn, body.conversation_id, user_id)
             if not conv:
-                raise HTTPException(status_code=404, detail="대화 세션을 찾을 수 없습니다.")
+                raise not_found("대화 세션을 찾을 수 없습니다.")
             conversation_id = body.conversation_id
         else:
             conv = rag_repository.create_conversation(
@@ -343,7 +347,7 @@ async def _stream_rag(
     except Exception as exc:
         logger.error("RAG 스트리밍 오류: %s", exc, exc_info=True)
         # RAG-001: 내부 오류 상세를 클라이언트에게 노출하지 않는다
-        error_line = f"data: {json.dumps({'event': 'error', 'data': {'message': '요청 처리 중 오류가 발생했습니다.'}}, ensure_ascii=False)}\n\n"
+        error_line = f"data: {dumps_ko({'event': 'error', 'data': {'message': '요청 처리 중 오류가 발생했습니다.'}})}\n\n"
         yield error_line.encode("utf-8")
 
 
@@ -387,7 +391,7 @@ def list_conversations(
     )
     # RAG-005: limit 상한 — 클라이언트가 임의로 큰 값을 보내도 100으로 제한
     limit = min(limit, 100)
-    offset = (page - 1) * limit
+    page, limit, offset = paginate_page(page, limit)
     with get_db() as conn:
         convs, total = rag_repository.list_conversations(
             conn, actor.actor_id, limit=limit, offset=offset
@@ -415,7 +419,7 @@ def get_conversation(
     with get_db() as conn:
         conv = rag_repository.get_conversation(conn, conversation_id, actor.actor_id)
         if not conv:
-            raise HTTPException(status_code=404, detail="대화 세션을 찾을 수 없습니다.")
+            raise not_found("대화 세션을 찾을 수 없습니다.")
         messages = rag_repository.list_messages(conn, conversation_id)
 
     return success_response(ConversationDetailResponse(
@@ -440,7 +444,7 @@ def list_messages(
     with get_db() as conn:
         conv = rag_repository.get_conversation(conn, conversation_id, actor.actor_id)
         if not conv:
-            raise HTTPException(status_code=404, detail="대화 세션을 찾을 수 없습니다.")
+            raise not_found("대화 세션을 찾을 수 없습니다.")
         messages = rag_repository.list_messages(conn, conversation_id)
 
     return success_response({"messages": [_to_msg_schema(m) for m in messages]})
@@ -462,7 +466,7 @@ def delete_conversation(
     with get_db() as conn:
         deleted = rag_repository.delete_conversation(conn, conversation_id, actor.actor_id)
         if not deleted:
-            raise HTTPException(status_code=404, detail="대화 세션을 찾을 수 없습니다.")
+            raise not_found("대화 세션을 찾을 수 없습니다.")
         conn.commit()
 
 

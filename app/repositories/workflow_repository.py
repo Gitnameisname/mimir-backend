@@ -18,6 +18,7 @@ import psycopg2.extensions
 from app.models.change_log import ChangeLog
 from app.models.review_action import ReviewAction
 from app.models.workflow_history import WorkflowHistory
+from app.db.cursor_helpers import fetch_many_as
 
 logger = logging.getLogger(__name__)
 
@@ -165,10 +166,7 @@ class WorkflowRepository:
             WHERE version_id = %s
             ORDER BY created_at ASC
         """
-        with conn.cursor() as cur:
-            cur.execute(sql, (version_id,))
-            rows = cur.fetchall()
-        return [_row_to_review_action(dict(r)) for r in rows]
+        return fetch_many_as(conn, sql, (version_id,), lambda r: _row_to_review_action(dict(r)))
 
     # -----------------------------------------------------------------------
     # workflow_history

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import List, Optional
 from uuid import UUID
 
@@ -18,19 +18,20 @@ from app.models.extraction_evaluation import (
     GoldenExtractionItem,
     GoldenExtractionSet,
 )
+from app.utils.time import utcnow
+from app.utils.converters import uuid_str_or_none
+from app.utils.json_utils import loads_maybe
 
 logger = logging.getLogger(__name__)
 
 
 def _row_to_evaluation(row: dict) -> ExtractionEvaluationResult:
     metrics_raw = row.get("metrics") or {}
-    if isinstance(metrics_raw, str):
-        metrics_raw = json.loads(metrics_raw)
+    metrics_raw = loads_maybe(metrics_raw)
     metrics = ExtractionMetrics(**metrics_raw)
 
     details_raw = row.get("field_details") or []
-    if isinstance(details_raw, str):
-        details_raw = json.loads(details_raw)
+    details_raw = loads_maybe(details_raw)
     details = [FieldEvaluationDetail(**d) for d in details_raw]
 
     return ExtractionEvaluationResult(
@@ -63,15 +64,15 @@ class ExtractionEvaluationRepository:
             RETURNING *
         """
         params = (
-            str(result.golden_set_id) if result.golden_set_id else None,
-            str(result.golden_item_id) if result.golden_item_id else None,
-            str(result.extraction_candidate_id) if result.extraction_candidate_id else None,
+            uuid_str_or_none(result.golden_set_id),
+            uuid_str_or_none(result.golden_item_id),
+            uuid_str_or_none(result.extraction_candidate_id),
             json.dumps(result.metrics.model_dump()),
             json.dumps([d.model_dump() for d in result.field_details]),
-            result.evaluated_at or datetime.now(timezone.utc),
+            result.evaluated_at or utcnow(),
             result.evaluated_by,
             result.actor_type,
-            str(result.scope_profile_id) if result.scope_profile_id else None,
+            uuid_str_or_none(result.scope_profile_id),
         )
         with self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(sql, params)
@@ -118,7 +119,7 @@ class GoldenExtractionSetRepository:
         params = (
             gset.name, gset.description, gset.document_type, gset.version,
             gset.created_by,
-            str(gset.scope_profile_id) if gset.scope_profile_id else None,
+            uuid_str_or_none(gset.scope_profile_id),
             gset.actor_type,
         )
         with self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -179,7 +180,7 @@ class GoldenExtractionItemRepository:
                       expected_fields, expected_spans, created_by, created_at
         """
         params = (
-            str(item.golden_set_id) if item.golden_set_id else None,
+            uuid_str_or_none(item.golden_set_id),
             str(item.document_id),
             item.document_version,
             item.document_type,
@@ -204,13 +205,11 @@ class GoldenExtractionItemRepository:
         from app.models.extraction_evaluation import ExpectedField, ExpectedSpan
 
         fields_raw = row.get("expected_fields") or []
-        if isinstance(fields_raw, str):
-            fields_raw = json.loads(fields_raw)
+        fields_raw = loads_maybe(fields_raw)
         expected_fields = [ExpectedField(**f) for f in fields_raw]
 
         spans_raw = row.get("expected_spans") or []
-        if isinstance(spans_raw, str):
-            spans_raw = json.loads(spans_raw)
+        spans_raw = loads_maybe(spans_raw)
         expected_spans = [ExpectedSpan(**s) for s in spans_raw]
 
         return GoldenExtractionItem(

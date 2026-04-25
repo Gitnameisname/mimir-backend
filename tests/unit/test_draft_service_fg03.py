@@ -74,14 +74,22 @@ def _version(**kw):
 
 
 def _draft_save_request(**kw):
+    # Phase 1 FG 1-1: content_snapshot 은 ProseMirror doc 루트 (type=="doc") 로 강제.
     body = {
         "title": "신규 타이틀",
         "summary": "신규 요약",
         "label": None,
         "change_summary": "변경 요약",
         "content_snapshot": {
-            "type": "document",
-            "children": [{"type": "paragraph", "content": "본문"}],
+            "type": "doc",
+            "schema_version": 1,
+            "content": [
+                {
+                    "type": "paragraph",
+                    "attrs": {"node_id": "11111111-1111-4111-8111-111111111111"},
+                    "content": [{"type": "text", "text": "본문"}],
+                }
+            ],
         },
     }
     body.update(kw)
@@ -131,6 +139,11 @@ def mocked(monkeypatch):
     # workflow_repository 는 draft_service 내부 late-import —  모듈 속성 교체 시도
     import app.repositories.workflow_repository as wfrepo_mod
     monkeypatch.setattr(wfrepo_mod, "workflow_repository", wf, raising=False)
+
+    # Phase 1 FG 1-1: save_draft 는 이제 snapshot_sync_service.rebuild_nodes_from_snapshot
+    # 를 호출한다. DB 를 타지 않도록 no-op 으로 교체한다.
+    import app.services.snapshot_sync_service as snap_mod
+    monkeypatch.setattr(snap_mod, "rebuild_nodes_from_snapshot", lambda *a, **kw: [])
 
     return SimpleNamespace(docs=docs, vers=vers, wf=wf, mod=svc_mod)
 

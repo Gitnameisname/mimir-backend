@@ -17,14 +17,15 @@ from app.models.extraction_record import (
     MatchStatus,
     VerificationResult,
 )
+from app.utils.converters import uuid_str_or_none
+from app.utils.json_utils import loads_maybe
 
 logger = logging.getLogger(__name__)
 
 
 def _row_to_record(row: dict) -> ExtractionRecord:
     result = row.get("extracted_result") or {}
-    if isinstance(result, str):
-        result = json.loads(result)
+    result = loads_maybe(result)
 
     return ExtractionRecord(
         id=UUID(str(row["id"])),
@@ -50,8 +51,7 @@ def _row_to_record(row: dict) -> ExtractionRecord:
 
 def _row_to_verification(row: dict) -> VerificationResult:
     diffs_raw = row.get("diff_details") or []
-    if isinstance(diffs_raw, str):
-        diffs_raw = json.loads(diffs_raw)
+    diffs_raw = loads_maybe(diffs_raw)
     diffs = [DiffDetail(**d) for d in diffs_raw] if diffs_raw else []
 
     return VerificationResult(
@@ -99,7 +99,7 @@ class ExtractionRecordRepository:
             record.seed,
             json.dumps(record.extracted_result),
             record.extracted_timestamp,
-            str(record.scope_profile_id) if record.scope_profile_id else None,
+            uuid_str_or_none(record.scope_profile_id),
             record.actor_type,
         )
         with self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:

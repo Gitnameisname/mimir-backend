@@ -19,11 +19,55 @@ audit_events 컬럼 매핑:
 안전 원칙:
   - raw auth token, 전체 request body, 민감 metadata는 절대 포함 안 함.
   - actor_id (정규화 식별자), resource_id, action, result만 기록.
+
+폐쇄망 정책 (S2 ⑦, R-D1 2026-04-25 명문화):
+  - **현재 외부 sink 0건**: emitter 가 호출하는 외부 시스템은 PostgreSQL
+    (내부 인프라) + Python logging 모듈 (로컬) 뿐. 폐쇄망에서 그대로 작동.
+  - DB INSERT 실패 → ``_persist`` 의 try/except 가 logging fallback (이미 작동).
+  - **새 외부 sink 추가 PR (예: Slack 알람 / PagerDuty webhook / 외부 SIEM)
+    의 의무**:
+      1. 환경변수 가드 — ``AUDIT_<SINK>_ENABLED=false`` 같은 명시적 toggle.
+         off 일 때 sink 호출 자체를 skip.
+      2. FileSink fallback — sink 호출 실패 (timeout / 401 / DNS) 시 logging
+         으로 자동 전환. 핵심 audit 기록이 외부 sink 장애로 누락되지 않도록.
+      3. 폐쇄망 회귀 테스트 — sink off / sink 실패 두 케이스 모두 emit 이
+         예외를 던지지 않고 핵심 DB INSERT 가 성공함을 검증.
+  - 위 의무를 누락하면 폐쇄망 환경에서 audit 누락 또는 요청 5xx 위험.
 """
 
+import contextvars
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Literal, Optional
+from app.utils.time import utcnow_iso
+
+# R9 (2026-04-25): trace_id 자동 전파용 ContextVar.
+#   - RequestContextMiddleware 가 요청 진입 시 set_trace_id 호출 → 본 emitter 가
+#     자동으로 trace_id 첨부 (호출자가 명시하지 않아도 됨).
+#   - 본 ContextVar 가 None 이면 emit 시 trace_id 도 None — 기존 동작 유지.
+#   - asyncio.Task 안전 — ContextVar 는 task-local.
+_trace_id_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "audit_trace_id", default=None
+)
+
+
+def set_trace_id(trace_id: Optional[str]) -> contextvars.Token:
+    """현재 컨텍스트의 trace_id 를 설정한다. 미들웨어 진입 시 호출.
+
+    :returns: ``reset_trace_id(token)`` 에 넘길 토큰. 미들웨어 dispatch 종료 시
+        호출해 contextvar 를 이전 값으로 복원 (재진입 안전).
+    """
+    return _trace_id_var.set(trace_id)
+
+
+def reset_trace_id(token: contextvars.Token) -> None:
+    """``set_trace_id`` 가 반환한 토큰으로 contextvar 를 복원한다."""
+    _trace_id_var.reset(token)
+
+
+def current_trace_id() -> Optional[str]:
+    """현재 contextvar 의 trace_id 를 읽는다 (테스트·로깅 보조)."""
+    return _trace_id_var.get()
 
 # F-07 시정(2026-04-18): actor_type 을 타입 레벨에서 강제.
 #   S2 원칙 ⑥ "AI 에이전트는 사람과 동등한 API 소비자" 에 따라 모든 감사 이벤트는
@@ -86,6 +130,11 @@ class AuditEmitter:
             previous_state    : 상태 전이 전 값 (예: draft)
             new_state         : 상태 전이 후 값 (예: published)
         """
+        # R9 (2026-04-25): trace_id 가 명시되지 않으면 ContextVar 에서 가져온다.
+        # 미들웨어가 set_trace_id 한 값을 호출자가 매번 명시하지 않아도 자동 첨부.
+        # 호출자가 명시한 trace_id 가 우선 (None 일 때만 fallback).
+        effective_trace_id = trace_id if trace_id is not None else _trace_id_var.get()
+
         # --- 1. structured log ---
         log_event: dict[str, Any] = {
             "audit_event": event_type,
@@ -95,14 +144,14 @@ class AuditEmitter:
             "actor_type": actor_type,
             "resource_type": resource_type,
             "result": result,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": utcnow_iso(),
         }
         if resource_id:
             log_event["resource_id"] = resource_id
         if request_id:
             log_event["request_id"] = request_id
-        if trace_id:
-            log_event["trace_id"] = trace_id
+        if effective_trace_id:
+            log_event["trace_id"] = effective_trace_id
         if tenant_id:
             log_event["tenant_id"] = tenant_id
         if metadata:

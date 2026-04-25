@@ -54,10 +54,14 @@ CREATE INDEX IF NOT EXISTS idx_documents_title
 """
 
 # Phase 4: documents 테이블 버전 포인터 컬럼 추가 마이그레이션
+# S3 Phase 2 FG 2-0 (2026-04-24): scope_profile_id 컬럼은 Alembic revision
+#   s3_p2_documents_scope_profile 이 정본. 신규 init_db 경로 호환을 위해
+#   여기에도 idempotent (IF NOT EXISTS) 로 보강한다.
 _DOCUMENTS_MIGRATION_DDL = """
 ALTER TABLE documents
     ADD COLUMN IF NOT EXISTS current_draft_version_id UUID REFERENCES versions(id) ON DELETE SET NULL,
-    ADD COLUMN IF NOT EXISTS current_published_version_id UUID REFERENCES versions(id) ON DELETE SET NULL;
+    ADD COLUMN IF NOT EXISTS current_published_version_id UUID REFERENCES versions(id) ON DELETE SET NULL,
+    ADD COLUMN IF NOT EXISTS scope_profile_id UUID REFERENCES scope_profiles(id) ON DELETE SET NULL;
 
 CREATE INDEX IF NOT EXISTS idx_documents_current_draft
     ON documents(current_draft_version_id)
@@ -65,6 +69,9 @@ CREATE INDEX IF NOT EXISTS idx_documents_current_draft
 CREATE INDEX IF NOT EXISTS idx_documents_current_published
     ON documents(current_published_version_id)
     WHERE current_published_version_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_documents_scope_profile_id
+    ON documents(scope_profile_id)
+    WHERE scope_profile_id IS NOT NULL;
 """
 
 

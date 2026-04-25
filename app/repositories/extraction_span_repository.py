@@ -13,6 +13,7 @@ from uuid import UUID
 import psycopg2.extras
 
 from app.models.extraction_span import SourceSpan
+from app.utils.converters import uuid_str_or_none
 
 logger = logging.getLogger(__name__)
 
@@ -61,8 +62,8 @@ class ExtractionSpanRepository:
             str(extraction_candidate_id),
             field_name,
             str(span.document_id),
-            str(span.version_id) if span.version_id else None,
-            str(span.node_id) if span.node_id else None,
+            uuid_str_or_none(span.version_id),
+            uuid_str_or_none(span.node_id),
             span.span_offset[0],
             span.span_offset[1],
             span.source_text,

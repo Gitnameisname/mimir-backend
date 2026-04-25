@@ -8,11 +8,14 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 from uuid import UUID, uuid4
 
 from app.models.approved_extraction import ApprovedExtraction, HumanEdit
+from app.utils.time import utcnow
+from app.utils.converters import uuid_str_or_none
+from app.utils.json_utils import dumps_ko, loads_maybe
 
 logger = logging.getLogger(__name__)
 
@@ -28,21 +31,18 @@ class ApprovedExtractionRepository:
     # ------------------------------------------------------------------
 
     def _json_dumps(self, obj: Any) -> str:
-        return json.dumps(obj, ensure_ascii=False, default=str)
+        return dumps_ko(obj, default=str)
 
     def _row_to_model(self, row: dict) -> ApprovedExtraction:
         edits_raw = row.get("human_edits") or []
-        if isinstance(edits_raw, str):
-            edits_raw = json.loads(edits_raw)
+        edits_raw = loads_maybe(edits_raw)
         human_edits = [HumanEdit(**item) if isinstance(item, dict) else item for item in edits_raw]
 
         approved_fields = row.get("approved_fields") or {}
-        if isinstance(approved_fields, str):
-            approved_fields = json.loads(approved_fields)
+        approved_fields = loads_maybe(approved_fields)
 
         tokens = row.get("extraction_tokens")
-        if isinstance(tokens, str):
-            tokens = json.loads(tokens)
+        tokens = loads_maybe(tokens)
 
         return ApprovedExtraction(
             id=UUID(str(row["id"])),
@@ -94,7 +94,7 @@ class ApprovedExtractionRepository:
         scope_profile_id: Optional[UUID] = None,
     ) -> ApprovedExtraction:
         """새 ApprovedExtraction 저장."""
-        now = datetime.now(timezone.utc)
+        now = utcnow()
         ae_id = str(uuid4())
 
         edits_json = self._json_dumps([e.model_dump(mode="json") for e in human_edits])
@@ -134,14 +134,14 @@ class ApprovedExtractionRepository:
                     created_at, updated_at, is_soft_deleted
                 """,
                 (
-                    ae_id, str(candidate_id) if candidate_id else None,
+                    ae_id, uuid_str_or_none(candidate_id),
                     str(document_id), document_version,
                     extraction_schema_id, extraction_schema_version,
                     extraction_model, extraction_latency_ms,
                     tokens_json, extraction_cost_estimate, extraction_prompt_version,
                     fields_json, edits_json,
                     approved_by, approved_at, approval_comment,
-                    actor_type, str(scope_profile_id) if scope_profile_id else None,
+                    actor_type, uuid_str_or_none(scope_profile_id),
                     now, now,
                 ),
             )
@@ -273,7 +273,7 @@ class ApprovedExtractionRepository:
     # ------------------------------------------------------------------
 
     def soft_delete(self, ae_id: UUID, deleted_by: str) -> bool:
-        now = datetime.now(timezone.utc)
+        now = utcnow()
         with self._conn.cursor() as cur:
             cur.execute(
                 """

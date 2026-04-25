@@ -40,3 +40,12 @@ class Document:
     # Phase 4: 현재 활성 버전 포인터
     current_draft_version_id: Optional[str] = None
     current_published_version_id: Optional[str] = None
+    # S3 Phase 2 FG 2-0 (2026-04-24): Scope Profile 바인딩
+    # 값이 채워지는 경로는 Alembic revision s3_p2_documents_scope_profile,
+    # 이후 생성부터는 DocumentsService.create_document 가 ActorContext 기반으로 주입.
+    scope_profile_id: Optional[str] = None
+    # S3 Phase 2 FG 2-1 UX 2차 (2026-04-24): 현재 배치된 폴더 + 본인 컬렉션 포함 목록.
+    # Repository 는 채우지 않고, Service 가 문서 상세 응답을 조립할 때만 set. 리스트
+    # 조회 경로는 비용 고려해 None/빈 리스트로 남긴다.
+    folder_id: Optional[str] = None
+    in_collection_ids: list[str] = field(default_factory=list)

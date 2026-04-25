@@ -51,11 +51,15 @@ from app.api.auth import ResourceRef, authorization_service, get_permission_matr
 from app.api.auth.models import ActorContext
 from app.api.responses import list_response, success_response
 from app.db import get_db
+from app.repositories.pagination import paginate_page
 from app.repositories.users_repository import (
     organizations_repository,
     roles_repository,
     users_repository,
 )
+from app.utils.time import utcnow, utcnow_iso
+from app.utils.http_errors import bad_request, conflict, not_found, unprocessable_entity
+from app.utils.converters import uuid_str_or_none
 
 router = APIRouter()
 
@@ -293,7 +297,8 @@ def list_users(
     role: Optional[str] = Query(default=None),
     _=Depends(require_admin_access),
 ):
-    offset = (page - 1) * limit
+    # 도서관 §1.9 R4 (2026-04-25): paginate_page 위임 (limit 별칭으로 page_size 사용).
+    page, limit, offset = paginate_page(page, limit, max_page_size=100)
     conditions = []
     count_conditions = []
     params: list = []
@@ -367,7 +372,7 @@ def get_user(user_id: str, _=Depends(require_admin_access)):
             )
             row = cur.fetchone()
             if not row:
-                raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다.")
+                raise not_found("사용자를 찾을 수 없습니다.")
 
             # 조직-역할 매핑
             cur.execute(
@@ -438,7 +443,7 @@ def list_organizations(
     search: Optional[str] = Query(default=None),
     _=Depends(require_admin_access),
 ):
-    offset = (page - 1) * limit
+    page, limit, offset = paginate_page(page, limit)
     conditions = []
     params: list = []
     if search:
@@ -488,7 +493,7 @@ def get_organization(org_id: str, _=Depends(require_admin_access)):
             cur.execute("SELECT * FROM organizations WHERE id = %s", (org_id,))
             row = cur.fetchone()
             if not row:
-                raise HTTPException(status_code=404, detail="조직을 찾을 수 없습니다.")
+                raise not_found("조직을 찾을 수 없습니다.")
 
             cur.execute(
                 """
@@ -590,7 +595,7 @@ def get_role(role_id: str, _=Depends(require_admin_access)):
             cur.execute("SELECT * FROM roles WHERE id = %s", (role_id,))
             row = cur.fetchone()
             if not row:
-                raise HTTPException(status_code=404, detail="역할을 찾을 수 없습니다.")
+                raise not_found("역할을 찾을 수 없습니다.")
 
             cur.execute(
                 "SELECT COUNT(*) AS cnt FROM users WHERE role_name = %s",
@@ -618,10 +623,7 @@ _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d+)?)?([+-
 def _validate_date_param(value: Optional[str], param_name: str) -> None:
     """VULN-016: date 파라미터가 ISO 8601 형식인지 검증한다."""
     if value and not _ISO_DATE_RE.match(value):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid date format for '{param_name}'. Use ISO 8601 (e.g. 2024-01-01 or 2024-01-01T00:00:00).",
-        )
+        raise bad_request(f"Invalid date format for '{param_name}'. Use ISO 8601 (e.g. 2024-01-01 or 2024-01-01T00:00:00).")
 
 
 @router.get("/audit-logs/event-types", summary="감사 이벤트 유형 카탈로그 (필터 드롭다운)")
@@ -646,7 +648,7 @@ def list_audit_logs(
     _validate_date_param(from_dt, "from")
     _validate_date_param(to_dt, "to")
 
-    offset = (page - 1) * page_size
+    page, page_size, offset = paginate_page(page, page_size)
     conditions = []
     params: list = []
 
@@ -695,7 +697,7 @@ def list_audit_logs(
             "actor_id": r["actor_user_id"],
             "actor_role": r["actor_role"],
             "resource_type": "Document" if r["document_id"] else None,
-            "resource_id": str(r["document_id"]) if r["document_id"] else None,
+            "resource_id": uuid_str_or_none(r["document_id"]),
             "result": r["action_result"],
             "before_state": r["previous_state"],
             "after_state": r["new_state"],
@@ -713,7 +715,7 @@ def get_audit_log(event_id: str, _=Depends(require_admin_access)):
             cur.execute("SELECT * FROM audit_events WHERE id = %s", (event_id,))
             row = cur.fetchone()
             if not row:
-                raise HTTPException(status_code=404, detail="감사 이벤트를 찾을 수 없습니다.")
+                raise not_found("감사 이벤트를 찾을 수 없습니다.")
 
     return success_response(data={
         "id": str(row["id"]),
@@ -723,8 +725,8 @@ def get_audit_log(event_id: str, _=Depends(require_admin_access)):
         "actor_id": row["actor_user_id"],
         "actor_role": row["actor_role"],
         "resource_type": "Document" if row["document_id"] else None,
-        "resource_id": str(row["document_id"]) if row["document_id"] else None,
-        "version_id": str(row["version_id"]) if row["version_id"] else None,
+        "resource_id": uuid_str_or_none(row["document_id"]),
+        "version_id": uuid_str_or_none(row["version_id"]),
         "result": row["action_result"],
         "before_state": row["previous_state"],
         "after_state": row["new_state"],
@@ -826,7 +828,7 @@ def get_document_type(type_code: str, _=Depends(require_admin_access)):
             # Phase 12: DB 레코드 없는 내장 플러그인 타입도 상세 반환
             if not row:
                 if not registry.is_builtin(type_code):
-                    raise HTTPException(status_code=404, detail="DocumentType을 찾을 수 없습니다.")
+                    raise not_found("DocumentType을 찾을 수 없습니다.")
                 plugin = registry.get(type_code)
                 return success_response(data={
                     "type_code": type_code,
@@ -879,7 +881,7 @@ def list_jobs(
     job_type: Optional[str] = Query(default=None),
     _=Depends(require_admin_access),
 ):
-    offset = (page - 1) * limit
+    page, limit, offset = paginate_page(page, limit)
     conditions = []
     params: list = []
     if status:
@@ -960,7 +962,7 @@ def get_job(job_id: UUID, _=Depends(require_admin_access)):
             cur.execute("SELECT * FROM background_jobs WHERE id = %s", (str(job_id),))
             row = cur.fetchone()
             if not row:
-                raise HTTPException(status_code=404, detail="작업을 찾을 수 없습니다.")
+                raise not_found("작업을 찾을 수 없습니다.")
     return success_response(data=_format_job(row))
 
 
@@ -975,7 +977,7 @@ def list_indexing_jobs(
     status: Optional[str] = Query(default=None),
     _=Depends(require_admin_access),
 ):
-    offset = (page - 1) * limit
+    page, limit, offset = paginate_page(page, limit)
     conditions = ["job_type LIKE 'INDEX%'"]
     params: list = []
     if status:
@@ -1034,7 +1036,7 @@ def list_api_keys(
     search: Optional[str] = Query(default=None),
     _=Depends(require_admin_access),
 ):
-    offset = (page - 1) * limit
+    page, limit, offset = paginate_page(page, limit)
     conditions = []
     params: list = []
     if status:
@@ -1158,15 +1160,15 @@ class UpdateUserBody(BaseModel):
 @router.post("/users", summary="사용자 생성", status_code=201)
 def create_user(body: CreateUserBody, _=Depends(require_admin_access)):
     if body.role_name not in _VALID_ROLES:
-        raise HTTPException(status_code=422, detail=f"유효하지 않은 역할입니다: {body.role_name}")
+        raise unprocessable_entity(f"유효하지 않은 역할입니다: {body.role_name}")
     if body.status not in _VALID_STATUSES:
-        raise HTTPException(status_code=422, detail=f"유효하지 않은 상태입니다: {body.status}")
+        raise unprocessable_entity(f"유효하지 않은 상태입니다: {body.status}")
 
     with get_db() as conn:
         # 이메일 중복 확인
         existing = users_repository.get_by_email(conn, body.email)
         if existing:
-            raise HTTPException(status_code=409, detail="이미 존재하는 이메일입니다.")
+            raise conflict("이미 존재하는 이메일입니다.")
         user = users_repository.create(
             conn,
             email=body.email,
@@ -1188,9 +1190,9 @@ def create_user(body: CreateUserBody, _=Depends(require_admin_access)):
 @router.patch("/users/{user_id}", summary="사용자 수정")
 def update_user(user_id: str, body: UpdateUserBody, _=Depends(require_admin_access)):
     if body.role_name and body.role_name not in _VALID_ROLES:
-        raise HTTPException(status_code=422, detail=f"유효하지 않은 역할입니다: {body.role_name}")
+        raise unprocessable_entity(f"유효하지 않은 역할입니다: {body.role_name}")
     if body.status and body.status not in _VALID_STATUSES:
-        raise HTTPException(status_code=422, detail=f"유효하지 않은 상태입니다: {body.status}")
+        raise unprocessable_entity(f"유효하지 않은 상태입니다: {body.status}")
 
     with get_db() as conn:
         user = users_repository.update(
@@ -1200,7 +1202,7 @@ def update_user(user_id: str, body: UpdateUserBody, _=Depends(require_admin_acce
             status=body.status,
         )
     if not user:
-        raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다.")
+        raise not_found("사용자를 찾을 수 없습니다.")
 
     return success_response(data={
         "id": user.id,
@@ -1222,9 +1224,9 @@ def activate_user(user_id: str, request: Request, actor: ActorContext = Depends(
     with get_db() as conn:
         user = users_repository.get_by_id(conn, user_id)
         if not user:
-            raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다.")
+            raise not_found("사용자를 찾을 수 없습니다.")
         if user.status != "PENDING":
-            raise HTTPException(status_code=409, detail=f"대기 상태가 아닙니다. 현재 상태: {user.status}")
+            raise conflict(f"대기 상태가 아닙니다. 현재 상태: {user.status}")
         updated = users_repository.update(conn, user_id, status="ACTIVE")
 
     audit_emitter.emit(
@@ -1250,7 +1252,7 @@ def delete_user(user_id: str, _=Depends(require_admin_access)):
     with get_db() as conn:
         deleted = users_repository.delete(conn, user_id)
     if not deleted:
-        raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다.")
+        raise not_found("사용자를 찾을 수 없습니다.")
 
 
 # --- 조직 역할 매핑 ---
@@ -1263,13 +1265,13 @@ class AssignOrgRoleBody(BaseModel):
 @router.post("/users/{user_id}/org-roles", summary="사용자 조직 역할 부여", status_code=201)
 def assign_user_org_role(user_id: str, body: AssignOrgRoleBody, _=Depends(require_admin_access)):
     if body.role_name not in _VALID_ROLES:
-        raise HTTPException(status_code=422, detail=f"유효하지 않은 역할입니다: {body.role_name}")
+        raise unprocessable_entity(f"유효하지 않은 역할입니다: {body.role_name}")
 
     with get_db() as conn:
         if not users_repository.get_by_id(conn, user_id):
-            raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다.")
+            raise not_found("사용자를 찾을 수 없습니다.")
         if not organizations_repository.get_by_id(conn, body.org_id):
-            raise HTTPException(status_code=404, detail="조직을 찾을 수 없습니다.")
+            raise not_found("조직을 찾을 수 없습니다.")
         mapping = users_repository.assign_org_role(
             conn, user_id=user_id, org_id=body.org_id, role_name=body.role_name,
         )
@@ -1288,7 +1290,7 @@ def remove_user_org_role(user_id: str, org_id: str, _=Depends(require_admin_acce
     with get_db() as conn:
         removed = users_repository.remove_org_role(conn, user_id=user_id, org_id=org_id)
     if not removed:
-        raise HTTPException(status_code=404, detail="매핑을 찾을 수 없습니다.")
+        raise not_found("매핑을 찾을 수 없습니다.")
 
 
 # ===========================================================================
@@ -1333,7 +1335,7 @@ def update_organization(org_id: str, body: UpdateOrganizationBody, _=Depends(req
             status=body.status,
         )
     if not org:
-        raise HTTPException(status_code=404, detail="조직을 찾을 수 없습니다.")
+        raise not_found("조직을 찾을 수 없습니다.")
 
     return success_response(data={
         "id": org.id,
@@ -1349,7 +1351,7 @@ def delete_organization(org_id: str, _=Depends(require_admin_access)):
     with get_db() as conn:
         deleted = organizations_repository.delete(conn, org_id)
     if not deleted:
-        raise HTTPException(status_code=404, detail="조직을 찾을 수 없습니다.")
+        raise not_found("조직을 찾을 수 없습니다.")
 
 
 # ===========================================================================
@@ -1370,7 +1372,7 @@ def create_role(body: CreateRoleBody, _=Depends(require_admin_access)):
     with get_db() as conn:
         existing = roles_repository.get_by_name(conn, body.name)
         if existing:
-            raise HTTPException(status_code=409, detail="이미 존재하는 역할명입니다.")
+            raise conflict("이미 존재하는 역할명입니다.")
         role = roles_repository.create(conn, name=body.name, description=body.description)
 
     return success_response(data={
@@ -1387,7 +1389,7 @@ def update_role(role_id: str, body: UpdateRoleBody, _=Depends(require_admin_acce
     with get_db() as conn:
         role = roles_repository.update(conn, role_id, description=body.description)
     if not role:
-        raise HTTPException(status_code=404, detail="역할을 찾을 수 없거나 시스템 역할은 수정할 수 없습니다.")
+        raise not_found("역할을 찾을 수 없거나 시스템 역할은 수정할 수 없습니다.")
 
     return success_response(data={
         "id": role.id,
@@ -1402,7 +1404,7 @@ def delete_role(role_id: str, _=Depends(require_admin_access)):
     with get_db() as conn:
         deleted = roles_repository.delete(conn, role_id)
     if not deleted:
-        raise HTTPException(status_code=404, detail="역할을 찾을 수 없거나 시스템 역할은 삭제할 수 없습니다.")
+        raise not_found("역할을 찾을 수 없거나 시스템 역할은 삭제할 수 없습니다.")
 
 
 # ===========================================================================
@@ -1454,7 +1456,7 @@ def create_document_type(body: CreateDocumentTypeBody, _=Depends(require_admin_a
         with conn.cursor() as cur:
             cur.execute("SELECT 1 FROM document_types WHERE type_code = %s", (body.type_code,))
             if cur.fetchone():
-                raise HTTPException(status_code=409, detail="이미 존재하는 type_code입니다.")
+                raise conflict("이미 존재하는 type_code입니다.")
 
             cur.execute(
                 """
@@ -1502,7 +1504,7 @@ def update_document_type(
         params.append(body.description)
     if body.status is not None:
         if body.status not in {"ACTIVE", "INACTIVE"}:
-            raise HTTPException(status_code=422, detail="status는 ACTIVE 또는 INACTIVE이어야 합니다.")
+            raise unprocessable_entity("status는 ACTIVE 또는 INACTIVE이어야 합니다.")
         fields.append("status = %s")
         params.append(body.status)
     if body.schema_fields is not None:
@@ -1516,12 +1518,12 @@ def update_document_type(
         try:
             validated = RetrievalConfig.model_validate(body.retrieval_config)
         except Exception as exc:
-            raise HTTPException(status_code=422, detail=f"retrieval_config가 유효하지 않습니다: {exc}")
+            raise unprocessable_entity(f"retrieval_config가 유효하지 않습니다: {exc}")
         fields.append("retrieval_config = %s::jsonb")
         params.append(json.dumps(validated.model_dump()))
 
     if not fields:
-        raise HTTPException(status_code=422, detail="수정할 필드가 없습니다.")
+        raise unprocessable_entity("수정할 필드가 없습니다.")
 
     fields.append("updated_at = NOW()")
     params.append(type_code)
@@ -1535,7 +1537,7 @@ def update_document_type(
             row = cur.fetchone()
 
     if not row:
-        raise HTTPException(status_code=404, detail="DocumentType을 찾을 수 없습니다.")
+        raise not_found("DocumentType을 찾을 수 없습니다.")
 
     return success_response(data={
         "type_code": row["type_code"],
@@ -1555,10 +1557,7 @@ def deactivate_document_type(type_code: str, _=Depends(require_admin_access)):
     # Phase 12: 내장 플러그인 타입은 삭제 불가
     from app.plugins.base import DocumentTypeRegistry
     if DocumentTypeRegistry.instance().is_builtin(type_code):
-        raise HTTPException(
-            status_code=422,
-            detail=f"'{type_code}'는 내장 플러그인 타입으로 삭제할 수 없습니다."
-        )
+        raise unprocessable_entity(f"'{type_code}'는 내장 플러그인 타입으로 삭제할 수 없습니다.")
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -1566,7 +1565,7 @@ def deactivate_document_type(type_code: str, _=Depends(require_admin_access)):
                 (type_code,),
             )
             if cur.rowcount == 0:
-                raise HTTPException(status_code=404, detail="DocumentType을 찾을 수 없습니다.")
+                raise not_found("DocumentType을 찾을 수 없습니다.")
 
 
 # ===========================================================================
@@ -1656,10 +1655,7 @@ _TYPE_CODE_PATTERN = re.compile(r'^[A-Z][A-Z0-9_]*$')
 def _validate_type_code_format(type_code: str) -> None:
     """P12-SEC-05: type_code 경로 파라미터 형식 검증."""
     if not _TYPE_CODE_PATTERN.match(type_code):
-        raise HTTPException(
-            status_code=422,
-            detail="type_code는 영문 대문자, 숫자, 밑줄만 허용됩니다."
-        )
+        raise unprocessable_entity("type_code는 영문 대문자, 숫자, 밑줄만 허용됩니다.")
 
 
 def _validate_chunking_config(cfg: dict) -> None:
@@ -1692,7 +1688,7 @@ def _validate_chunking_config(cfg: dict) -> None:
         errors.append("overlap_tokens는 max_chunk_tokens보다 작아야 합니다.")
 
     if errors:
-        raise HTTPException(status_code=422, detail=" / ".join(errors))
+        raise unprocessable_entity(" / ".join(errors))
 
 
 @router.put("/document-types/{type_code}/plugin", summary="플러그인 설정 업데이트")
@@ -1737,10 +1733,7 @@ def update_document_type_plugin_config(
         except ImportError:
             pass  # jsonschema 미설치 시 검증 건너뜀
         except Exception:
-            raise HTTPException(
-                status_code=422,
-                detail="유효하지 않은 JSON Schema (Draft-07) 형식입니다. 스키마 구조를 확인하세요."
-            )
+            raise unprocessable_entity("유효하지 않은 JSON Schema (Draft-07) 형식입니다. 스키마 구조를 확인하세요.")
         plugin_config_update["metadata_schema"] = body.metadata_schema
         changed_fields.append("metadata_schema")
 
@@ -1757,7 +1750,7 @@ def update_document_type_plugin_config(
         changed_fields.append("workflow_config")
 
     if not changed_fields:
-        raise HTTPException(status_code=422, detail="변경할 설정이 없습니다.")
+        raise unprocessable_entity("변경할 설정이 없습니다.")
 
     with get_db() as conn:
         with conn.cursor() as cur:
@@ -1928,13 +1921,13 @@ def get_settings_by_category(category: str, _=Depends(require_admin_access)):
 
     # 카테고리 형식 검증 (영문 소문자/숫자/언더스코어만)
     if not re.match(r"^[a-z][a-z0-9_]{0,99}$", category):
-        raise HTTPException(status_code=422, detail="유효하지 않은 카테고리 형식입니다.")
+        raise unprocessable_entity("유효하지 않은 카테고리 형식입니다.")
 
     with get_db() as conn:
         rows = settings_repository.list_by_category(conn, category)
 
     if not rows:
-        raise HTTPException(status_code=404, detail=f"카테고리 '{category}'를 찾을 수 없습니다.")
+        raise not_found(f"카테고리 '{category}'를 찾을 수 없습니다.")
 
     return success_response(data={
         "category": category,
@@ -1970,17 +1963,14 @@ def update_setting(
 
     # 카테고리/키 형식 검증 (SQL injection 방어 보강 — 파라미터 바인딩과 이중 안전망)
     if not re.match(r"^[a-z][a-z0-9_]{0,99}$", category):
-        raise HTTPException(status_code=422, detail="유효하지 않은 카테고리 형식입니다.")
+        raise unprocessable_entity("유효하지 않은 카테고리 형식입니다.")
     if not re.match(r"^[a-z][a-z0-9_]{0,254}$", key):
-        raise HTTPException(status_code=422, detail="유효하지 않은 키 형식입니다.")
+        raise unprocessable_entity("유효하지 않은 키 형식입니다.")
 
     with get_db() as conn:
         existing = settings_repository.get_one(conn, category, key)
         if existing is None:
-            raise HTTPException(
-                status_code=404,
-                detail=f"설정 '{category}.{key}'를 찾을 수 없습니다.",
-            )
+            raise not_found(f"설정 '{category}.{key}'를 찾을 수 없습니다.")
 
         old_value = existing["value"]
         new_value = body.value
@@ -2006,10 +1996,7 @@ def update_setting(
         old_type = _type_signature(old_value)
         new_type = _type_signature(new_value)
         if old_type != new_type:
-            raise HTTPException(
-                status_code=422,
-                detail=f"값 타입이 일치하지 않습니다 (기존: {old_type}, 신규: {new_type}).",
-            )
+            raise unprocessable_entity(f"값 타입이 일치하지 않습니다 (기존: {old_type}, 신규: {new_type}).")
 
         # 변경 없음
         if old_value == new_value:
@@ -2021,7 +2008,7 @@ def update_setting(
         )
         if updated is None:
             # 동시성 — 타 트랜잭션이 삭제 (시드만 있는 환경에서는 발생 어려움)
-            raise HTTPException(status_code=404, detail="업데이트 대상이 사라졌습니다.")
+            raise not_found("업데이트 대상이 사라졌습니다.")
 
     # 캐시 무효화
     _invalidate_settings_cache()
@@ -2067,10 +2054,7 @@ _MONITORING_PERIODS = {
 
 def _validate_period(period: str) -> tuple[int, int]:
     if period not in _MONITORING_PERIODS:
-        raise HTTPException(
-            status_code=422,
-            detail=f"지원하지 않는 period입니다. (허용: {', '.join(_MONITORING_PERIODS.keys())})",
-        )
+        raise unprocessable_entity(f"지원하지 않는 period입니다. (허용: {', '.join(_MONITORING_PERIODS.keys())})")
     return _MONITORING_PERIODS[period]
 
 
@@ -2395,32 +2379,20 @@ def _validate_rule_payload(
     from app.services.alert_evaluator import _METRIC_LABELS  # 내부 화이트리스트
 
     if metric_name is not None and metric_name not in _METRIC_LABELS:
-        raise HTTPException(
-            status_code=422,
-            detail=f"지원하지 않는 메트릭입니다: {metric_name}",
-        )
+        raise unprocessable_entity(f"지원하지 않는 메트릭입니다: {metric_name}")
     if condition is not None:
         if condition.operator not in _ALERT_OPERATORS:
-            raise HTTPException(
-                status_code=422,
-                detail=f"지원하지 않는 연산자입니다: {condition.operator}",
-            )
+            raise unprocessable_entity(f"지원하지 않는 연산자입니다: {condition.operator}")
         try:
             float(condition.threshold)
         except (TypeError, ValueError):
-            raise HTTPException(status_code=422, detail="threshold 는 숫자여야 합니다.")
+            raise unprocessable_entity("threshold 는 숫자여야 합니다.")
     if severity is not None and severity not in _ALERT_SEVERITIES:
-        raise HTTPException(
-            status_code=422,
-            detail=f"지원하지 않는 심각도입니다. (허용: {', '.join(sorted(_ALERT_SEVERITIES))})",
-        )
+        raise unprocessable_entity(f"지원하지 않는 심각도입니다. (허용: {', '.join(sorted(_ALERT_SEVERITIES))})")
     if channels is not None:
         for ch in channels:
             if ch not in _ALERT_CHANNELS:
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"지원하지 않는 채널입니다: {ch}",
-                )
+                raise unprocessable_entity(f"지원하지 않는 채널입니다: {ch}")
 
 
 @router.get("/alerts/metrics", summary="지원되는 메트릭 목록")
@@ -2497,11 +2469,11 @@ def get_alert_rule(
     from app.repositories.alert_repository import alert_repository
     # UUID 형식 검증 (SQL injection 2중 방어)
     if not re.match(r"^[0-9a-f\-]{36}$", rule_id, re.IGNORECASE):
-        raise HTTPException(status_code=422, detail="유효하지 않은 rule_id 형식입니다.")
+        raise unprocessable_entity("유효하지 않은 rule_id 형식입니다.")
     with get_db() as conn:
         rule = alert_repository.get_rule(conn, rule_id)
     if rule is None:
-        raise HTTPException(status_code=404, detail="알림 규칙을 찾을 수 없습니다.")
+        raise not_found("알림 규칙을 찾을 수 없습니다.")
     return success_response(data=rule)
 
 
@@ -2516,7 +2488,7 @@ def update_alert_rule(
     from app.repositories.alert_repository import alert_repository
 
     if not re.match(r"^[0-9a-f\-]{36}$", rule_id, re.IGNORECASE):
-        raise HTTPException(status_code=422, detail="유효하지 않은 rule_id 형식입니다.")
+        raise unprocessable_entity("유효하지 않은 rule_id 형식입니다.")
 
     _validate_rule_payload(
         metric_name=body.metric_name,
@@ -2537,7 +2509,7 @@ def update_alert_rule(
     with get_db() as conn:
         existing = alert_repository.get_rule(conn, rule_id)
         if existing is None:
-            raise HTTPException(status_code=404, detail="알림 규칙을 찾을 수 없습니다.")
+            raise not_found("알림 규칙을 찾을 수 없습니다.")
         updated = alert_repository.update_rule(conn, rule_id, fields)
         conn.commit()
 
@@ -2569,13 +2541,13 @@ def delete_alert_rule(
     from app.repositories.alert_repository import alert_repository
 
     if not re.match(r"^[0-9a-f\-]{36}$", rule_id, re.IGNORECASE):
-        raise HTTPException(status_code=422, detail="유효하지 않은 rule_id 형식입니다.")
+        raise unprocessable_entity("유효하지 않은 rule_id 형식입니다.")
 
     with get_db() as conn:
         deleted = alert_repository.delete_rule(conn, rule_id)
         conn.commit()
     if not deleted:
-        raise HTTPException(status_code=404, detail="알림 규칙을 찾을 수 없습니다.")
+        raise not_found("알림 규칙을 찾을 수 없습니다.")
 
     try:
         audit_emitter.emit(
@@ -2607,17 +2579,11 @@ def list_alert_history(
     from app.repositories.alert_repository import alert_repository
 
     if status is not None and status not in _ALERT_STATUSES:
-        raise HTTPException(
-            status_code=422,
-            detail=f"지원하지 않는 상태입니다. (허용: {', '.join(sorted(_ALERT_STATUSES))})",
-        )
+        raise unprocessable_entity(f"지원하지 않는 상태입니다. (허용: {', '.join(sorted(_ALERT_STATUSES))})")
     if severity is not None and severity not in _ALERT_SEVERITIES:
-        raise HTTPException(
-            status_code=422,
-            detail=f"지원하지 않는 심각도입니다. (허용: {', '.join(sorted(_ALERT_SEVERITIES))})",
-        )
+        raise unprocessable_entity(f"지원하지 않는 심각도입니다. (허용: {', '.join(sorted(_ALERT_SEVERITIES))})")
 
-    offset = (page - 1) * page_size
+    page, page_size, offset = paginate_page(page, page_size)
     with get_db() as conn:
         items, total = alert_repository.list_history(
             conn,
@@ -2646,13 +2612,13 @@ def acknowledge_alert(
     from app.repositories.alert_repository import alert_repository
 
     if not re.match(r"^[0-9a-f\-]{36}$", history_id, re.IGNORECASE):
-        raise HTTPException(status_code=422, detail="유효하지 않은 history_id 형식입니다.")
+        raise unprocessable_entity("유효하지 않은 history_id 형식입니다.")
 
     with get_db() as conn:
         acked = alert_repository.acknowledge(conn, history_id, actor.actor_id)
         conn.commit()
     if acked is None:
-        raise HTTPException(status_code=404, detail="알림 이력을 찾을 수 없거나 이미 확인되었습니다.")
+        raise not_found("알림 이력을 찾을 수 없거나 이미 확인되었습니다.")
 
     try:
         audit_emitter.emit(
@@ -2696,7 +2662,7 @@ class UpdateJobScheduleBody(BaseModel):
 
 def _validate_schedule_id(schedule_id: str) -> None:
     if not _SCHEDULE_ID_RE.match(schedule_id):
-        raise HTTPException(status_code=422, detail="유효하지 않은 스케줄 ID 형식입니다.")
+        raise unprocessable_entity("유효하지 않은 스케줄 ID 형식입니다.")
 
 
 def _schedule_with_runs(
@@ -2758,7 +2724,7 @@ def get_job_schedule(job_id: str, _=Depends(require_admin_access)):
     with get_db() as conn:
         sched = job_schedule_repository.get_schedule(conn, job_id)
         if sched is None:
-            raise HTTPException(status_code=404, detail="스케줄을 찾을 수 없습니다.")
+            raise not_found("스케줄을 찾을 수 없습니다.")
         result = _schedule_with_runs(conn, sched, include_runs=True)
     return success_response(data=result)
 
@@ -2776,10 +2742,10 @@ def run_job_schedule(
     with get_db() as conn:
         sched = job_schedule_repository.get_schedule(conn, job_id)
         if sched is None:
-            raise HTTPException(status_code=404, detail="스케줄을 찾을 수 없습니다.")
+            raise not_found("스케줄을 찾을 수 없습니다.")
         running = job_schedule_repository.get_running_run(conn, job_id)
         if running:
-            raise HTTPException(status_code=409, detail="이미 실행 중입니다.")
+            raise conflict("이미 실행 중입니다.")
         run_id = job_schedule_repository.enqueue_manual_run(
             conn, job_id, requester_id=actor.actor_id
         )
@@ -2821,7 +2787,7 @@ def update_job_schedule(
         try:
             cron_validate(body.schedule)
         except ValueError as e:
-            raise HTTPException(status_code=422, detail=f"유효하지 않은 cron: {e}")
+            raise unprocessable_entity(f"유효하지 않은 cron: {e}")
         fields["schedule"] = body.schedule
         try:
             fields["next_run_at"] = cron_next(body.schedule)
@@ -2834,7 +2800,7 @@ def update_job_schedule(
     with get_db() as conn:
         existing = job_schedule_repository.get_schedule(conn, job_id)
         if existing is None:
-            raise HTTPException(status_code=404, detail="스케줄을 찾을 수 없습니다.")
+            raise not_found("스케줄을 찾을 수 없습니다.")
         updated = job_schedule_repository.update_schedule(conn, job_id, fields)
         conn.commit()
 
@@ -2869,10 +2835,10 @@ def cancel_job_schedule(
     with get_db() as conn:
         sched = job_schedule_repository.get_schedule(conn, job_id)
         if sched is None:
-            raise HTTPException(status_code=404, detail="스케줄을 찾을 수 없습니다.")
+            raise not_found("스케줄을 찾을 수 없습니다.")
         cancelled_id = job_schedule_repository.mark_cancel_requested(conn, job_id)
         if cancelled_id is None:
-            raise HTTPException(status_code=400, detail="실행 중인 작업이 없습니다.")
+            raise bad_request("실행 중인 작업이 없습니다.")
         conn.commit()
 
     try:
@@ -2900,11 +2866,11 @@ def preview_cron(body: dict[str, Any], _=Depends(require_admin_access)):
 
     expr = body.get("schedule") if isinstance(body, dict) else None
     if not isinstance(expr, str):
-        raise HTTPException(status_code=422, detail="schedule 필드가 필요합니다.")
+        raise unprocessable_entity("schedule 필드가 필요합니다.")
     try:
         cron_validate(expr)
     except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e))
+        raise unprocessable_entity(str(e))
 
     description = describe_ko(expr)
     nexts: list[str] = []
@@ -2964,15 +2930,15 @@ def _generate_api_key() -> tuple[str, str, str]:
 def _validate_api_key_name(name: str) -> str:
     name = name.strip()
     if not name:
-        raise HTTPException(status_code=422, detail="이름을 입력하세요.")
+        raise unprocessable_entity("이름을 입력하세요.")
     if not _API_KEY_NAME_RE.match(name):
-        raise HTTPException(status_code=422, detail="이름에 허용되지 않은 문자가 포함되어 있습니다.")
+        raise unprocessable_entity("이름에 허용되지 않은 문자가 포함되어 있습니다.")
     return name
 
 
 def _validate_api_key_scope(scope: str) -> str:
     if scope not in _VALID_API_KEY_SCOPES:
-        raise HTTPException(status_code=422, detail=f"지원되지 않는 scope: {scope}")
+        raise unprocessable_entity(f"지원되지 않는 scope: {scope}")
     return scope
 
 
@@ -2995,7 +2961,7 @@ def create_api_key(
     description = (body.description or "").strip() or None
 
     full_key, prefix, digest = _generate_api_key()
-    issuer_id = str(actor.actor_id) if actor.actor_id else None
+    issuer_id = uuid_str_or_none(actor.actor_id)
     issuer_name = getattr(actor, "actor_name", None) if actor else None
 
     expires_at_sql = "NULL" if body.expires_in_days == 0 else "NOW() + (%s || ' days')::interval"
@@ -3078,7 +3044,7 @@ def revoke_api_key(
         import uuid as _uuid
         _uuid.UUID(key_id)
     except (ValueError, TypeError):
-        raise HTTPException(status_code=422, detail="잘못된 key_id 형식")
+        raise unprocessable_entity("잘못된 key_id 형식")
 
     reason = (body.reason or "").strip() or None
 
@@ -3096,13 +3062,13 @@ def revoke_api_key(
             row = cur.fetchone()
 
     if not row:
-        raise HTTPException(status_code=404, detail="키를 찾을 수 없거나 이미 폐기됨")
+        raise not_found("키를 찾을 수 없거나 이미 폐기됨")
 
     try:
         audit_emitter.emit(
             event_type="API_KEY_REVOKED",
             action="api_key.revoke",
-            actor_id=str(actor.actor_id) if actor.actor_id else None,
+            actor_id=uuid_str_or_none(actor.actor_id),
             actor_type="user",
             actor_role=getattr(actor, "role", None),
             resource_type="api_key",
@@ -3161,7 +3127,7 @@ def export_usage_csv(
     import io
     from fastapi.responses import StreamingResponse
 
-    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    since = (utcnow() - timedelta(days=days)).isoformat()
 
     rows: list[dict] = []
     with get_db() as conn:
@@ -3235,7 +3201,7 @@ def get_usage_dashboard(
     _=Depends(require_admin_access),
 ):
     """rag_messages + embedding_token_usage 테이블 기반 사용량 집계."""
-    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    since = (utcnow() - timedelta(days=days)).isoformat()
 
     daily: list[dict] = []
     with get_db() as conn:
@@ -3367,7 +3333,7 @@ def get_agent_activity_dashboard(
     _=Depends(require_admin_access),
 ):
     """agent_proposals 기반 에이전트별 활동 통계·시계열·이상 알림."""
-    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    since = (utcnow() - timedelta(days=days)).isoformat()
 
     with get_db() as conn:
         with conn.cursor() as cur:
@@ -3460,7 +3426,7 @@ def get_agent_activity_dashboard(
                 "agent_name": r["agent_name"],
                 "type": "high_rejection_rate",
                 "detail": f"거절률 {round(rejected/total*100,1)}% (총 {total}건 중 {rejected}건 거절)",
-                "detected_at": datetime.now(timezone.utc).isoformat(),
+                "detected_at": utcnow_iso(),
             })
 
     for row in disabled_agents:
@@ -3469,7 +3435,7 @@ def get_agent_activity_dashboard(
             "agent_name": row["name"],
             "type": "kill_switch_triggered",
             "detail": row["disabled_reason"] or "관리자에 의해 비활성화됨",
-            "detected_at": row["disabled_at"].isoformat() if row["disabled_at"] else datetime.now(timezone.utc).isoformat(),
+            "detected_at": row["disabled_at"].isoformat() if row["disabled_at"] else utcnow_iso(),
         })
 
     return success_response(data={
@@ -3588,7 +3554,7 @@ def update_provider(
     is_default_requested = updates.pop("is_default", None)
 
     if not updates and is_default_requested is None:
-        raise HTTPException(status_code=422, detail="변경할 항목이 없습니다.")
+        raise unprocessable_entity("변경할 항목이 없습니다.")
 
     with get_db() as conn:
         with conn.cursor() as cur:
@@ -3614,7 +3580,7 @@ def update_provider(
                 row = cur.fetchone()
 
     if not row:
-        raise HTTPException(status_code=404, detail="프로바이더를 찾을 수 없습니다.")
+        raise not_found("프로바이더를 찾을 수 없습니다.")
     from app.services.rag_service import invalidate_provider_cache
     from app.api.v1.system import invalidate_capabilities_cache
     invalidate_provider_cache()
@@ -3628,7 +3594,7 @@ def delete_provider(provider_id: str, _=Depends(require_admin_access)):
         with conn.cursor() as cur:
             cur.execute("DELETE FROM llm_providers WHERE id = %s RETURNING id", (provider_id,))
             if not cur.fetchone():
-                raise HTTPException(status_code=404, detail="프로바이더를 찾을 수 없습니다.")
+                raise not_found("프로바이더를 찾을 수 없습니다.")
 
 
 class SetDefaultBody(BaseModel):
@@ -3648,7 +3614,7 @@ def set_default_provider(
             cur.execute("SELECT * FROM llm_providers WHERE id = %s", (provider_id,))
             provider = cur.fetchone()
             if not provider:
-                raise HTTPException(status_code=404, detail="프로바이더를 찾을 수 없습니다.")
+                raise not_found("프로바이더를 찾을 수 없습니다.")
             ptype = type_ or provider["type"]
             cur.execute(
                 "UPDATE llm_providers SET is_default = FALSE WHERE type = %s",
@@ -3676,7 +3642,7 @@ def test_provider(provider_id: str, _=Depends(require_admin_access)):
             cur.execute("SELECT * FROM llm_providers WHERE id = %s", (provider_id,))
             provider = cur.fetchone()
             if not provider:
-                raise HTTPException(status_code=404, detail="프로바이더를 찾을 수 없습니다.")
+                raise not_found("프로바이더를 찾을 수 없습니다.")
 
     import httpx
     start = time.monotonic()
@@ -3796,7 +3762,7 @@ def test_provider(provider_id: str, _=Depends(require_admin_access)):
 
     latency_ms = int((time.monotonic() - start) * 1000)
     result_str = "success" if success_flag else "error"
-    tested_at = datetime.now(timezone.utc)
+    tested_at = utcnow()
 
     with get_db() as conn:
         with conn.cursor() as cur:
@@ -3863,7 +3829,7 @@ def list_prompts(
     page_size: int = Query(default=20, ge=1, le=100),
     _=Depends(require_admin_access),
 ):
-    offset = (page - 1) * page_size
+    page, page_size, offset = paginate_page(page, page_size)
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) AS total FROM prompts")
@@ -3898,7 +3864,7 @@ def get_prompt(prompt_id: str, _=Depends(require_admin_access)):
             )
             row = cur.fetchone()
             if not row:
-                raise HTTPException(status_code=404, detail="프롬프트를 찾을 수 없습니다.")
+                raise not_found("프롬프트를 찾을 수 없습니다.")
             cur.execute(
                 "SELECT * FROM prompt_versions WHERE prompt_id = %s ORDER BY version_number",
                 (prompt_id,),
@@ -3934,7 +3900,7 @@ def create_prompt(
                 VALUES (%s, 1, %s, %s, TRUE)
                 RETURNING *
                 """,
-                (prompt_id, body.content, str(actor.actor_id) if actor.actor_id else None),
+                (prompt_id, body.content, uuid_str_or_none(actor.actor_id)),
             )
             ver = cur.fetchone()
             cur.execute(
@@ -3962,7 +3928,7 @@ def create_prompt_version(
         with conn.cursor() as cur:
             cur.execute("SELECT id FROM prompts WHERE id = %s", (prompt_id,))
             if not cur.fetchone():
-                raise HTTPException(status_code=404, detail="프롬프트를 찾을 수 없습니다.")
+                raise not_found("프롬프트를 찾을 수 없습니다.")
             cur.execute(
                 "SELECT COALESCE(MAX(version_number), 0) + 1 AS next_ver FROM prompt_versions WHERE prompt_id = %s",
                 (prompt_id,),
@@ -3974,7 +3940,7 @@ def create_prompt_version(
                 VALUES (%s, %s, %s, %s, FALSE)
                 RETURNING *
                 """,
-                (prompt_id, next_ver, body.content, str(actor.actor_id) if actor.actor_id else None),
+                (prompt_id, next_ver, body.content, uuid_str_or_none(actor.actor_id)),
             )
             ver = cur.fetchone()
     return success_response(data=_prompt_version_row(ver))
@@ -3993,7 +3959,7 @@ def activate_prompt_version(
                 (version_id, prompt_id),
             )
             if not cur.fetchone():
-                raise HTTPException(status_code=404, detail="버전을 찾을 수 없습니다.")
+                raise not_found("버전을 찾을 수 없습니다.")
             cur.execute(
                 "UPDATE prompt_versions SET is_active = FALSE WHERE prompt_id = %s",
                 (prompt_id,),
@@ -4032,7 +3998,7 @@ def set_prompt_ab_test(
             )
             prompt = cur.fetchone()
             if not prompt:
-                raise HTTPException(status_code=404, detail="프롬프트를 찾을 수 없습니다.")
+                raise not_found("프롬프트를 찾을 수 없습니다.")
             cur.execute(
                 "SELECT version_number FROM prompt_versions WHERE id = %s",
                 (prompt["active_version_id"],) if prompt["active_version_id"] else (None,),

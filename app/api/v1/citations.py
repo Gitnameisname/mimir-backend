@@ -25,6 +25,7 @@ from app.api.rate_limit import limiter
 from app.db import get_db
 from app.schemas.citation import CitationContentResponse, CitationVerifyResponse
 from app.services.retrieval.citation_service import CitationService
+from app.utils.http_errors import not_found
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +75,7 @@ def verify_citation(
             span_offset=span_offset,
         )
     if result is None:
-        raise HTTPException(status_code=404, detail="Citation not found")
+        raise not_found("Citation not found")
     return result
 
 
@@ -105,7 +106,7 @@ def get_citation_content(
             actor_role=actor.role if actor else None,
         )
     if result is None:
-        raise HTTPException(status_code=404, detail="Citation not found")
+        raise not_found("Citation not found")
     return result
 
 

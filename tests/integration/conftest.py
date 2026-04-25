@@ -401,14 +401,21 @@ def save_initial_draft(client, auth_author_header):
         headers: dict[str, str] | None = None,
     ) -> str:
         h = dict(headers or auth_author_header)
+        # Phase 1 FG 1-1 이후 content_snapshot 은 ProseMirror 표준 포맷 강제.
+        # (type=="doc", content: list, block 노드에 attrs.node_id)
         body = {
             "title": title,
             "summary": "초안 요약",
             "change_summary": "initial draft for integration test",
             "content_snapshot": {
-                "type": "document",
-                "children": [
-                    {"type": "paragraph", "content": paragraph_text},
+                "type": "doc",
+                "schema_version": 1,
+                "content": [
+                    {
+                        "type": "paragraph",
+                        "attrs": {"node_id": "11111111-1111-4111-8111-111111111111"},
+                        "content": [{"type": "text", "text": paragraph_text}],
+                    },
                 ],
             },
         }

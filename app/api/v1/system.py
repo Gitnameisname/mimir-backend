@@ -34,6 +34,8 @@ from app.api.errors import (
 from app.api.responses import SuccessResponse, success_response
 from app.config import settings
 from app.observability.metrics import generate_metrics_text
+from app.utils.strings import normalize_lower
+from app.utils.time import utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +58,8 @@ def _detect_pgvector() -> bool:
       2. DB pg_extension 직접 조회 (런타임 자동 감지)
       3. 기본값 False (DB 연결 불가 시 안전한 폴백)
     """
-    env_val = os.environ.get("PGVECTOR_ENABLED", "").strip().lower()
+    # 도서관 §1.4 BE-G1 (2026-04-25): normalize_lower (None 이 안 옴 → str)
+    env_val = normalize_lower(os.environ.get("PGVECTOR_ENABLED", "")) or ""
     if env_val in ("true", "1", "yes"):
         return True
     if env_val in ("false", "0", "no"):
@@ -235,7 +238,7 @@ def _get_full_capabilities() -> dict:
 
     Tier 2, Tier 3 모두 이 함수를 거쳐 캐시된 데이터를 사용한다.
     """
-    now = datetime.now(timezone.utc)
+    now = utcnow()
     with _cap_lock:
         if _cap_cache["data"] is None or now >= _cap_cache["expires"]:
             _cap_cache["data"] = _build_capabilities()

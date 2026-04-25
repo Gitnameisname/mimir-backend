@@ -20,6 +20,7 @@ from uuid import UUID, uuid4
 import psycopg2.extensions
 
 from app.models.node import Node
+from app.utils.json_utils import dumps_ko
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +79,7 @@ class NodesRepository:
                         item.get("order_index", 0),
                         item.get("title"),
                         item.get("content"),
-                        json.dumps(item.get("metadata", {}), ensure_ascii=False),
+                        dumps_ko(item.get("metadata", {})),
                     ),
                 )
                 row = cur.fetchone()
@@ -152,7 +153,7 @@ class NodesRepository:
                         item.get("order_index", 0),
                         item.get("title"),
                         item.get("content"),
-                        json.dumps(item.get("metadata", {}), ensure_ascii=False),
+                        dumps_ko(item.get("metadata", {})),
                     ),
                 )
                 row = cur.fetchone()

@@ -23,7 +23,7 @@ Phase 14: 인증 엔드포인트.
 """
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from urllib.parse import urlencode
 
 import psycopg2
@@ -57,6 +57,9 @@ from app.config import settings
 from app.db import get_db
 from app.repositories.users_repository import users_repository
 from app.services.email_service import email_service
+from app.utils.time import utcnow
+from app.utils.http_errors import bad_request, conflict, unprocessable_entity
+from app.utils.strings import normalize_lower
 
 logger = logging.getLogger(__name__)
 
@@ -185,29 +188,30 @@ def register(body: RegisterRequest, request: Request):
     # 1. 비밀번호 복잡도 검증
     pw_errors = validate_password_strength(body.password)
     if pw_errors:
-        raise HTTPException(status_code=422, detail={"errors": pw_errors})
+        raise unprocessable_entity({"errors": pw_errors})
 
     # 2. 표시 이름 검증
     name_errors = validate_display_name(body.display_name)
     if name_errors:
-        raise HTTPException(status_code=422, detail={"errors": name_errors})
+        raise unprocessable_entity({"errors": name_errors})
 
-    email_lower = body.email.lower().strip()
+    # 도서관 §1.4 BE-G1 (2026-04-25): body.email 은 str → 결과도 str
+    email_lower = normalize_lower(body.email) or ""
 
     # 3. 아이디(username) 검증 (입력된 경우에만)
     username_value: str | None = None
     if body.username and body.username.strip():
         un_errors = validate_username(body.username)
         if un_errors:
-            raise HTTPException(status_code=422, detail={"errors": un_errors})
+            raise unprocessable_entity({"errors": un_errors})
         username_value = body.username.strip()
 
     with get_db() as conn:
         # 4. 이메일/아이디 중복 검사
         if users_repository.get_by_email(conn, email_lower):
-            raise HTTPException(status_code=409, detail="이미 사용 중인 이메일입니다")
+            raise conflict("이미 사용 중인 이메일입니다")
         if username_value and users_repository.get_by_username(conn, username_value):
-            raise HTTPException(status_code=409, detail="이미 사용 중인 아이디입니다")
+            raise conflict("이미 사용 중인 아이디입니다")
 
         # 5. bcrypt 해싱 + 사용자 생성
         #    TOCTOU: 사전 존재 검사와 INSERT 사이의 레이스로 인해 UNIQUE 제약 위반이
@@ -243,8 +247,8 @@ def register(body: RegisterRequest, request: Request):
             # 롤백 후 어느 쪽이 충돌했는지 재조회
             conn.rollback()
             if users_repository.get_by_email(conn, email_lower):
-                raise HTTPException(status_code=409, detail="이미 사용 중인 이메일입니다")
-            raise HTTPException(status_code=409, detail="이미 사용 중인 아이디입니다")
+                raise conflict("이미 사용 중인 이메일입니다")
+            raise conflict("이미 사용 중인 아이디입니다")
 
     audit_emitter.emit(
         event_type="user.registered",
@@ -331,7 +335,7 @@ def login(body: LoginRequest, request: Request, response: Response):
             raise HTTPException(status_code=403, detail="비활성 또는 정지된 계정입니다")
 
         # 4. DB 수준 잠금 확인
-        if user.locked_until and user.locked_until > datetime.now(timezone.utc):
+        if user.locked_until and user.locked_until > utcnow():
             dummy_verify()
             raise HTTPException(
                 status_code=429,
@@ -458,7 +462,7 @@ def logout(
         if at_payload:
             jti = at_payload.get("jti", "")
             exp = at_payload.get("exp", 0)
-            now_ts = int(datetime.now(timezone.utc).timestamp())
+            now_ts = int(utcnow().timestamp())
             remaining_ttl = max(int(exp) - now_ts, 0)
             if jti and remaining_ttl > 0:
                 try:
@@ -553,7 +557,7 @@ def oauth_gitlab_callback(
         )
 
     if not code or not state:
-        raise HTTPException(status_code=400, detail="code 및 state 파라미터가 필요합니다")
+        raise bad_request("code 및 state 파라미터가 필요합니다")
 
     valkey = get_valkey()
 
@@ -611,7 +615,8 @@ def forgot_password(body: ForgotPasswordRequest, request: Request):
     사용자 존재 여부와 무관하게 동일한 200 응답을 반환한다 (이메일 열거 방지).
     """
     req_id, trace_id = get_request_ids(request)
-    email_lower = body.email.lower().strip()
+    # 도서관 §1.4 BE-G1 (2026-04-25): body.email 은 str → 결과도 str
+    email_lower = normalize_lower(body.email) or ""
 
     with get_db() as conn:
         user = users_repository.get_by_email(conn, email_lower)
@@ -661,25 +666,25 @@ def reset_password(body: ResetPasswordRequest, request: Request):
     # 1. 토큰 디코딩 + 목적 검증
     payload = decode_purpose_token(body.token, expected_purpose="password_reset")
     if payload is None:
-        raise HTTPException(status_code=400, detail="유효하지 않거나 만료된 토큰입니다")
+        raise bad_request("유효하지 않거나 만료된 토큰입니다")
 
     jti = payload.get("jti", "")
     user_id = payload.get("sub", "")
 
     # 2. 1회성 확인
     if check_token_used(valkey, jti):
-        raise HTTPException(status_code=400, detail="이미 사용된 토큰입니다")
+        raise bad_request("이미 사용된 토큰입니다")
 
     # 3. 새 비밀번호 복잡도 검증
     pw_errors = validate_password_strength(body.new_password)
     if pw_errors:
-        raise HTTPException(status_code=422, detail={"errors": pw_errors})
+        raise unprocessable_entity({"errors": pw_errors})
 
     with get_db() as conn:
         # 4. 사용자 확인
         user = users_repository.get_by_id(conn, user_id)
         if not user or user.status != "ACTIVE":
-            raise HTTPException(status_code=400, detail="유효하지 않은 토큰입니다")
+            raise bad_request("유효하지 않은 토큰입니다")
 
         # 5. bcrypt 해싱 + password_hash 업데이트
         new_hash = hash_password(body.new_password)
@@ -727,20 +732,20 @@ def verify_email(body: VerifyEmailRequest, request: Request):
     # 1. 토큰 디코딩 + 목적 검증
     payload = decode_purpose_token(body.token, expected_purpose="email_verify")
     if payload is None:
-        raise HTTPException(status_code=400, detail="유효하지 않거나 만료된 토큰입니다")
+        raise bad_request("유효하지 않거나 만료된 토큰입니다")
 
     jti = payload.get("jti", "")
     user_id = payload.get("sub", "")
 
     # 2. 1회성 확인
     if check_token_used(valkey, jti):
-        raise HTTPException(status_code=400, detail="이미 사용된 토큰입니다")
+        raise bad_request("이미 사용된 토큰입니다")
 
     with get_db() as conn:
         # 3. 사용자 확인
         user = users_repository.get_by_id(conn, user_id)
         if not user:
-            raise HTTPException(status_code=400, detail="유효하지 않은 토큰입니다")
+            raise bad_request("유효하지 않은 토큰입니다")
 
         # 이미 인증된 경우
         if user.email_verified:

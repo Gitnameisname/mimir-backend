@@ -17,6 +17,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Literal, Optional
+from app.utils.converters import uuid_str_or_none
 
 logger = logging.getLogger(__name__)
 
@@ -202,7 +203,7 @@ def get_vectorization_status(
         return None
 
     latest = meta.get("current_published_version_id")
-    latest_str: Optional[str] = str(latest) if latest else None
+    latest_str: Optional[str] = uuid_str_or_none(latest)
     created_by = meta.get("created_by")
 
     indexed_ids, chunk_count, last_at = _fetch_index_state(conn, document_id)

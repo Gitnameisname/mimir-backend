@@ -90,6 +90,17 @@ def _mute_audit(monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def _mock_rebuild_nodes(monkeypatch):
+    """Phase 1 FG 1-1: propose_draft 가 호출하는 snapshot_sync_service.rebuild_nodes_from_snapshot 은
+    실 nodes_repository 를 호출해 _CursorStub.fetchone() = None → dict(None) 경로를 만든다.
+    본 파일 mock conn 은 그 경로를 지원하지 않으므로 no-op 으로 교체한다.
+    (rebuild 자체 검증은 test_snapshot_sync_service_fg11.py / test_agent_proposal_service_fg11.py 에서 수행)
+    """
+    import app.services.snapshot_sync_service as snap_mod
+    monkeypatch.setattr(snap_mod, "rebuild_nodes_from_snapshot", lambda *a, **kw: [])
+
+
 # ---------------------------------------------------------------------------
 # 1. _assert_agent_active
 # ---------------------------------------------------------------------------

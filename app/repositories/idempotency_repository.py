@@ -18,6 +18,7 @@ from typing import Any, Optional
 import psycopg2.extensions
 
 from app.models.idempotency_record import IdempotencyRecord
+from app.utils.json_utils import dumps_ko
 
 logger = logging.getLogger(__name__)
 
@@ -146,7 +147,7 @@ class IdempotencyRepository:
                 sql,
                 (
                     response_status_code,
-                    json.dumps(response_body, ensure_ascii=False, default=str),
+                    dumps_ko(response_body, default=str),
                     resource_id,
                     idempotency_key,
                     _actor_key(actor_id),

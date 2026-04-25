@@ -15,7 +15,7 @@ Refresh Token 서비스 (Phase 14).
 
 import hashlib
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -23,6 +23,7 @@ import psycopg2.extensions
 
 from app.api.auth.tokens import create_access_token, create_refresh_token, generate_family_id
 from app.config import settings
+from app.utils.time import utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +71,7 @@ class RefreshTokenService:
 
         # Refresh Token 발급
         raw_rt, rt_hash = create_refresh_token()
-        rt_expires_at = datetime.now(timezone.utc) + timedelta(days=settings.jwt_refresh_expire_days)
+        rt_expires_at = utcnow() + timedelta(days=settings.jwt_refresh_expire_days)
 
         # DB에 RT 저장 (해시만)
         self._store_refresh_token(
@@ -135,7 +136,7 @@ class RefreshTokenService:
             return None
 
         # 3. 만료 확인
-        if rt_record["expires_at"] < datetime.now(timezone.utc):
+        if rt_record["expires_at"] < utcnow():
             logger.info("refresh_rotate: token expired, family=%s", rt_record["family_id"])
             return None
 
