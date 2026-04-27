@@ -69,6 +69,22 @@ class ScopeDefinition:
 
 
 @dataclass
+class ScopeProfileSettings:
+    """ScopeProfile 운영 설정 (settings_json 컬럼의 dataclass 표현).
+
+    S3 Phase 3 FG 3-2 (2026-04-27): 첫 키는 ``expose_viewers``.
+    후속 라운드에서 다른 키 (allow_agent_actions, default_visibility 등) 가 추가될 수 있으므로
+    repository 가 dataclass 필드만 추출 + 알 수 없는 키는 raw 에 보존하는 패턴 사용.
+
+    Attributes:
+        expose_viewers : Contributors 패널 (FG 3-1) 의 viewers 섹션 노출 정책.
+                         False 면 정책 게이트 (`should_expose_viewers`) 가 강제 false 반환.
+                         기본값 False — 보수적 (개인정보 / 사생활 우선).
+    """
+    expose_viewers: bool = False
+
+
+@dataclass
 class ScopeProfile:
     """에이전트에 바인딩되는 ACL 필터 템플릿."""
     id: str
@@ -78,3 +94,5 @@ class ScopeProfile:
     created_at: datetime
     updated_at: datetime
     scopes: list[ScopeDefinition] = field(default_factory=list)
+    # S3 Phase 3 FG 3-2 (2026-04-27): 운영 설정 (viewers 노출 등). default 빈 settings.
+    settings: ScopeProfileSettings = field(default_factory=ScopeProfileSettings)

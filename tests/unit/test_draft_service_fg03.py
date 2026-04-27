@@ -230,7 +230,8 @@ class TestSaveDraft:
         from app.api.errors.exceptions import ApiNotFoundError
 
         mocked.docs.get_by_id.return_value = None
-        with pytest.raises(ApiNotFoundError, match="Document"):
+        # B-N4 (2026-04-25): 영문 "Document" → 한국어 "문서" 마이그레이션. OR 확장.
+        with pytest.raises(ApiNotFoundError, match="(문서|Document)"):
             draft_service.save_draft(
                 conn=MagicMock(), document_id=DOC_ID,
                 request=_draft_save_request(),

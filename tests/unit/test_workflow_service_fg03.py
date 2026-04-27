@@ -240,7 +240,9 @@ class TestErrorPaths:
         conn, _ = _make_conn_with_cursor()
 
         mock_repos.docs.get_by_id.return_value = None
-        with pytest.raises(ApiNotFoundError, match="Document"):
+        # B-N4 (2026-04-25): 영문 "Document" → 한국어 "문서" 마이그레이션 (단일 리소스 경로). OR 확장.
+        # test_version_not_found_raises_404 의 "Version" 은 이중 컨텍스트 ("in document") 라 영문 유지.
+        with pytest.raises(ApiNotFoundError, match="(문서|Document)"):
             workflow_service.submit_review(conn, DOC_ID, VER_ID, actor_role="AUTHOR")
 
     def test_version_not_found_raises_404(self, mock_repos):

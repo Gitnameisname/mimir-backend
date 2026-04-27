@@ -27,7 +27,9 @@ from app.models.collection import Collection
 from app.repositories.collections_repository import collections_repository
 from app.repositories.documents_repository import documents_repository
 from app.services.documents_service import _resolve_viewer_scope_profile_ids
+from app.utils.actor import require_actor_id
 from app.utils.strings import normalize_display_name
+from app.utils.http_errors import not_found_resource
 
 logger = logging.getLogger(__name__)
 
@@ -63,10 +65,12 @@ def _validate_description(desc: Optional[str]) -> Optional[str]:
 
 
 def _require_actor(actor: Optional[ActorContext]) -> str:
-    """actor 검증 + owner_id 반환. 미인증/익명 거부."""
-    if actor is None or actor.actor_id is None:
-        raise ApiValidationError("인증된 사용자만 컬렉션을 관리할 수 있습니다")
-    return str(actor.actor_id)
+    """actor 검증 + owner_id 반환 — 도서관 §1.10 BE-G6 (2026-04-25): require_actor_id 위임.
+
+    기존 호출지 호환을 위한 thin wrapper. 메시지는 helper 표준 "인증된 컬렉션만
+    작업을 수행할 수 있습니다" 로 변경.
+    """
+    return require_actor_id(actor, label="컬렉션")
 
 
 class CollectionsService:
@@ -108,7 +112,7 @@ class CollectionsService:
             conn, collection_id, owner_id=owner_id,
         )
         if coll is None:
-            raise ApiNotFoundError(f"Collection '{collection_id}' not found")
+            raise not_found_resource("컬렉션", collection_id)
         return coll
 
     def list_collections(
@@ -150,7 +154,7 @@ class CollectionsService:
                 f"같은 이름의 컬렉션이 이미 존재합니다: '{normalized_name}'",
             ) from exc
         if updated is None:
-            raise ApiNotFoundError(f"Collection '{collection_id}' not found")
+            raise not_found_resource("컬렉션", collection_id)
         return updated
 
     def delete_collection(

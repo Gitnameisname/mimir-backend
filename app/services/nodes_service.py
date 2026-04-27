@@ -22,6 +22,7 @@ from app.models.node import Node
 from app.repositories.nodes_repository import nodes_repository
 from app.repositories.versions_repository import versions_repository
 from app.schemas.nodes import NodeResponse
+from app.utils.http_errors import not_found_resource
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +60,7 @@ class NodesService:
         """
         version = versions_repository.get_by_id(conn, version_id)
         if version is None:
-            raise ApiNotFoundError(f"Version '{version_id}' not found")
+            raise not_found_resource("버전", version_id)
 
         nodes = nodes_repository.list_by_version_id(conn, version_id)
         return [_to_response(node) for node in nodes]
@@ -81,7 +82,7 @@ class NodesService:
         """
         version = versions_repository.get_by_id(conn, version_id)
         if version is None:
-            raise ApiNotFoundError(f"Version '{version_id}' not found")
+            raise not_found_resource("버전", version_id)
 
         node = nodes_repository.get_by_id_and_version_id(conn, node_id, version_id)
         if node is None:

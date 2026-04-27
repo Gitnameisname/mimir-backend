@@ -275,6 +275,12 @@ def _dispatch_tool(tool_name: str, body: dict, actor: ActorContext, conn) -> Any
         from app.schemas.mcp import VectorizationStatusToolRequest
         req = VectorizationStatusToolRequest(**body)
         return tool_vectorization_status(req, actor, conn)
+    # S3 Phase 3 FG 3-3 (2026-04-27): 주석 조회 Tool — 읽기 전용
+    if tool_name == "read_annotations":
+        from app.mcp.tools import tool_read_annotations
+        from app.schemas.mcp import ReadAnnotationsRequest
+        req = ReadAnnotationsRequest(**body)
+        return tool_read_annotations(req, actor, conn)
     raise ValueError(f"Unknown tool: {tool_name}")
 
 

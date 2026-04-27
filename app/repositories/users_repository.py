@@ -96,6 +96,46 @@ class UsersRepository:
     def get_by_id(self, conn: psycopg2.extensions.connection, user_id: str) -> Optional[User]:
         return fetch_one_as(conn, "SELECT * FROM users WHERE id = %s", (user_id,), lambda row: _row_to_user(row))
 
+    def get_many_by_ids(
+        self,
+        conn: psycopg2.extensions.connection,
+        user_ids: list[str],
+    ) -> dict[str, User]:
+        """user_id 리스트를 받아 ``{user_id: User}`` 매핑 반환.
+
+        S3 Phase 3 FG 3-1 (2026-04-27): Contributors 패널이 카테고리별 actor_id 를 한 번에
+        해석하기 위해 N+1 회피용 batch fetch.
+
+        - 비어있거나 모두 invalid UUID 인 경우 빈 dict 반환.
+        - 존재하지 않는 id 는 결과 dict 에 키가 없음 (호출자 책임).
+        """
+        if not user_ids:
+            return {}
+        # invalid UUID 형식은 silently skip — psycopg2 가 invalid input 으로 raise 하는 것을 방지.
+        # actor_id 가 agent / system 도메인 문자열 (UUID 가 아닌 경우) 일 수 있음.
+        valid_uuid_ids: list[str] = []
+        for raw in user_ids:
+            if not raw:
+                continue
+            try:
+                from uuid import UUID
+                UUID(str(raw))
+                valid_uuid_ids.append(str(raw))
+            except (ValueError, TypeError):
+                continue
+        if not valid_uuid_ids:
+            return {}
+        result: dict[str, User] = {}
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM users WHERE id = ANY(%s::uuid[])",
+                (valid_uuid_ids,),
+            )
+            for row in cur.fetchall():
+                user = _row_to_user(row)
+                result[user.id] = user
+        return result
+
     def get_by_email(self, conn: psycopg2.extensions.connection, email: str) -> Optional[User]:
         return fetch_one_as(conn, "SELECT * FROM users WHERE email = %s", (email,), lambda row: _row_to_user(row))
 

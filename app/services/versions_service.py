@@ -28,6 +28,7 @@ from app.repositories.documents_repository import documents_repository
 from app.repositories.nodes_repository import nodes_repository
 from app.repositories.versions_repository import versions_repository
 from app.schemas.versions import VersionCreateRequest, VersionResponse
+from app.utils.http_errors import not_found_resource
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +94,7 @@ class VersionsService:
         """
         doc = documents_repository.get_by_id(conn, document_id)
         if doc is None:
-            raise ApiNotFoundError(f"Document '{document_id}' not found")
+            raise not_found_resource("문서", document_id)
 
         # ParsedListQuery에서 sort/page 추출
         sort_field = "created_at"
@@ -140,7 +141,7 @@ class VersionsService:
         """
         doc = documents_repository.get_by_id(conn, document_id)
         if doc is None:
-            raise ApiNotFoundError(f"Document '{document_id}' not found")
+            raise not_found_resource("문서", document_id)
 
         next_number = versions_repository.get_next_version_number(conn, document_id)
 
@@ -183,7 +184,7 @@ class VersionsService:
         """버전을 조회한다. 존재하지 않으면 ApiNotFoundError."""
         version = versions_repository.get_by_id(conn, version_id)
         if version is None:
-            raise ApiNotFoundError(f"Version '{version_id}' not found")
+            raise not_found_resource("버전", version_id)
         return _to_response(version)
 
 

@@ -36,10 +36,12 @@ from app.schemas.folders import SetDocumentFolderRequest  # S3 Phase 2 FG 2-1
 from app.schemas.render import RenderDocument
 from app.schemas.versions import DraftNodeSaveRequest, DraftSaveRequest, PublishRequest, RestoreRequest, VersionCreateRequest
 from app.audit.emitter import audit_emitter
+from app.audit.viewed_throttle import should_emit_view
 from app.services.documents_service import documents_service
 from app.services.draft_service import draft_service
 from app.services.render_service import render_service
 from app.services.versions_service import versions_service
+from app.utils.http_errors import not_found_resource
 
 router = APIRouter()
 
@@ -243,6 +245,20 @@ def get_document(
 
     with get_db() as conn:
         doc = documents_service.get_document(conn, document_id, actor=actor)
+
+    # S3 Phase 3 FG 3-1 (task3-1): document.viewed 감사 이벤트.
+    # Contributors 패널의 "최근 열람자" 섹션이 의존. throttle helper 가
+    # per (actor_id, document_id) 5분 dedup 적용.
+    if should_emit_view(getattr(actor, "actor_id", None) if getattr(actor, "is_authenticated", False) else None, doc.id):
+        audit_emitter.emit_for_actor(
+            event_type="document.viewed",
+            action="document.read",
+            actor=actor,
+            resource_type="document",
+            resource_id=doc.id,
+            request_id=request_id,
+            trace_id=trace_id,
+        )
 
     return success_response(
         data=doc.model_dump(),
@@ -1004,7 +1020,7 @@ def render_version_endpoint(
     with get_db() as conn:
         doc = documents_repository.get_by_id(conn, document_id)
         if doc is None:
-            raise ApiNotFoundError(f"Document '{document_id}' not found")
+            raise not_found_resource("문서", document_id)
 
         version = versions_repository.get_by_document_and_version_id(
             conn, document_id, version_id

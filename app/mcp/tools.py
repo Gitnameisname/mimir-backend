@@ -541,3 +541,109 @@ def tool_vectorization_status(
         last_error=last_error_code,
         can_reindex=False,
     )
+
+
+# ---------------------------------------------------------------------------
+# S3 Phase 3 FG 3-3: read_annotations Tool
+# ---------------------------------------------------------------------------
+
+def tool_read_annotations(
+    request: "ReadAnnotationsRequest",
+    actor: ActorContext,
+    conn,
+) -> "ReadAnnotationsResponse":
+    """read_annotations 도구 — 문서의 인라인 주석을 읽기 전용으로 반환.
+
+    ACL:
+      - documents_service.get_document(actor=actor) 가 viewer scope 밖 문서를 404 처리.
+      - 에이전트 actor 의 ScopeProfile 이 문서 접근을 허용해야 함.
+
+    쓰기 (생성/수정/삭제) 는 본 Tool 에 노출되지 않는다 (read-only).
+    에이전트가 주석 생성이 필요하면 향후 별 ADR 로 별도 Tool 신설 검토.
+    """
+    from app.schemas.mcp import ReadAnnotationItem, ReadAnnotationsResponse
+    from app.services.annotations_service import annotations_service as _ann_svc
+
+    _check_agent_write_blocked(actor)
+
+    # UUID 기본 검증
+    import re
+    _UUID_RE = re.compile(
+        r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        re.IGNORECASE,
+    )
+    if not _UUID_RE.match(request.document_id):
+        raise MCPError(
+            MCPErrorCode.INVALID_PARAMS,
+            "document_id 는 유효한 UUID 여야 합니다.",
+            400,
+        )
+
+    # document.read 권한 재검증 (IDOR 방어 — vectorization_status 와 동일 패턴)
+    try:
+        from app.api.auth import ResourceRef, authorization_service  # noqa: WPS433
+        authorization_service.authorize(
+            actor=actor,
+            action="document.read",
+            resource=ResourceRef(resource_type="document", resource_id=request.document_id),
+            require_authenticated=True,
+        )
+    except Exception as exc:
+        raise MCPError(
+            MCPErrorCode.UNAUTHORIZED,
+            f"문서 조회 권한이 없습니다: {type(exc).__name__}",
+            403,
+        )
+
+    try:
+        items = _ann_svc.list_for_document(
+            conn,
+            actor=actor,
+            document_id=request.document_id,
+            include_resolved=request.include_resolved,
+            include_orphans=request.include_orphans,
+            limit=request.limit,
+        )
+    except Exception as exc:
+        # ACL 차단 (ApiNotFoundError) 또는 기타 → MCP 에러로 매핑
+        from app.api.errors.exceptions import ApiNotFoundError
+        if isinstance(exc, ApiNotFoundError):
+            raise MCPError(MCPErrorCode.NOT_FOUND, "문서를 찾을 수 없습니다.", 404)
+        logger.error("mcp.read_annotations failed: %s", exc)
+        raise MCPError(MCPErrorCode.INTERNAL_ERROR, f"주석 조회 오류: {exc}", 500)
+
+    _emit_audit(
+        event_type="mcp.tool.read_annotations",
+        action="mcp.read_annotations",
+        actor=actor,
+        metadata={
+            "document_id": request.document_id,
+            "count": len(items),
+            "include_resolved": request.include_resolved,
+            "include_orphans": request.include_orphans,
+        },
+    )
+
+    return ReadAnnotationsResponse(
+        document_id=request.document_id,
+        annotations=[
+            ReadAnnotationItem(
+                id=a.id,
+                document_id=a.document_id,
+                node_id=a.node_id,
+                span_start=a.span_start,
+                span_end=a.span_end,
+                author_id=a.author_id,
+                actor_type=a.actor_type,
+                content=a.content,
+                status=a.status,
+                parent_id=a.parent_id,
+                is_orphan=a.is_orphan,
+                created_at=a.created_at.isoformat() if a.created_at else "",
+                updated_at=a.updated_at.isoformat() if a.updated_at else "",
+                mentioned_user_ids=list(a.mentioned_user_ids or []),
+            )
+            for a in items
+        ],
+        truncated=(len(items) >= request.limit),
+    )

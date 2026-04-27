@@ -241,6 +241,48 @@ TOOL_SCHEMAS: list[dict] = [
         },
     },
     {
+        # S3 Phase 3 FG 3-3 (2026-04-27): 에이전트가 문서의 인라인 주석을 읽을 수 있도록
+        # read_annotations Tool 표면 추가. 읽기 전용 (쓰기는 본 FG 에서 노출 안 함).
+        "name": "read_annotations",
+        "description": (
+            "Read inline annotations attached to a document. "
+            "Read-only — agents cannot create / modify / delete annotations via this tool. "
+            "ACL is enforced via the agent's Scope Profile (404 if document is out of scope)."
+        ),
+        "authentication": {
+            "method": "oauth2_client_credentials",
+            "scope_profile_required": True,
+            "delegation": "delegate:read",
+        },
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "document_id": {
+                    "type": "string",
+                    "format": "uuid",
+                    "description": "주석을 조회할 문서 ID",
+                },
+                "include_resolved": {
+                    "type": "boolean",
+                    "description": "resolved 주석 포함 여부 (기본 true)",
+                    "default": True,
+                },
+                "include_orphans": {
+                    "type": "boolean",
+                    "description": "orphan 주석 포함 여부 (기본 true)",
+                    "default": True,
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 500,
+                    "default": 200,
+                },
+            },
+            "required": ["document_id"],
+        },
+    },
+    {
         # FG 0-5 (2026-04-23): 에이전트가 RAG 답변 부재 원인을 스스로 진단할 수 있게
         # 문서 벡터화 상태를 읽기 전용으로 노출. 재벡터화 실행은 Tool 에 노출하지 않는다
         # (운영 안전 — 사람 명시적 클릭만).
@@ -268,6 +310,40 @@ TOOL_SCHEMAS: list[dict] = [
         },
     },
 ]
+
+
+# S3 Phase 3 FG 3-3: read_annotations Tool 의 Request / Response 스키마
+class ReadAnnotationsRequest(BaseModel):
+    document_id: str = Field(..., description="문서 UUID")
+    include_resolved: bool = Field(default=True)
+    include_orphans: bool = Field(default=True)
+    limit: int = Field(default=200, ge=1, le=500)
+
+
+class ReadAnnotationItem(BaseModel):
+    id: str
+    document_id: str
+    node_id: str
+    span_start: Optional[int] = None
+    span_end: Optional[int] = None
+    author_id: str
+    actor_type: str
+    content: str
+    status: str
+    parent_id: Optional[str] = None
+    is_orphan: bool
+    created_at: str
+    updated_at: str
+    mentioned_user_ids: list[str] = Field(default_factory=list)
+
+
+class ReadAnnotationsResponse(BaseModel):
+    document_id: str
+    annotations: list[ReadAnnotationItem] = Field(default_factory=list)
+    truncated: bool = Field(
+        default=False,
+        description="응답이 limit 으로 잘렸는지 (limit 와 동일 길이면 추가 데이터 가능성)",
+    )
 
 
 # FG 0-5: mimir.vectorization.status Tool 의 Request / Response 스키마

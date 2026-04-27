@@ -35,14 +35,12 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-_ADMIN_ROLES = frozenset({"ORG_ADMIN", "SUPER_ADMIN"})
+# 도서관 §1.10 BE-G6 (2026-04-25): ADMIN_ROLES + require_admin 위임.
+# 기존 _ADMIN_ROLES 모듈 상수와 _require_admin 함수는 thin re-export 로 호환 유지.
+from app.utils.actor import ADMIN_ROLES as _ADMIN_ROLES, require_admin as _require_admin  # noqa: F401
+
 _ALLOWED_STATUS = frozenset({"pending", "approved", "rejected", "withdrawn"})
 _ALLOWED_PROPOSAL_TYPE = frozenset({"draft", "transition"})
-
-
-def _require_admin(actor: ActorContext) -> None:
-    if not actor.is_authenticated or actor.role not in _ADMIN_ROLES:
-        raise ApiPermissionDeniedError("관리자 권한이 필요합니다.")
 
 
 def _require_authenticated(actor: ActorContext) -> None:

@@ -191,7 +191,8 @@ class TestGetDocument:
         from app.services.documents_service import documents_service
         from app.api.errors.exceptions import ApiNotFoundError
         mock_repo.get_by_id.return_value = None
-        with pytest.raises(ApiNotFoundError, match="not found"):
+        # B-N4 (2026-04-25): 영문 "not found" → 한국어 "찾을 수 없습니다" 마이그레이션. OR 확장.
+        with pytest.raises(ApiNotFoundError, match="(찾을 수 없습니다|not found)"):
             documents_service.get_document(MagicMock(), "missing-id")
 
 

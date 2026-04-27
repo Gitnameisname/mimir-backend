@@ -28,6 +28,7 @@ from app.api.query.models import ParsedListQuery
 from app.models.document import Document
 from app.repositories.documents_repository import documents_repository
 from app.schemas.documents import DocumentCreateRequest, DocumentResponse, DocumentUpdateRequest
+from app.utils.http_errors import not_found_resource
 
 logger = logging.getLogger(__name__)
 
@@ -180,7 +181,7 @@ class DocumentsService:
             conn, document_id, viewer_scope_profile_ids=viewer_ids,
         )
         if doc is None:
-            raise ApiNotFoundError(f"Document '{document_id}' not found")
+            raise not_found_resource("문서", document_id)
 
         # 배치 상태 채우기 — owner 범위에서만 (Scope 어휘 하드코딩 아닌 owner 기반 격리)
         document_tags: list[dict[str, Any]] = []
@@ -278,7 +279,7 @@ class DocumentsService:
             updated_by=actor_id,
         )
         if updated is None:
-            raise ApiNotFoundError(f"Document '{document_id}' not found")
+            raise not_found_resource("문서", document_id)
 
         # S3 Phase 2 FG 2-2 (2026-04-25): metadata 가 교체된 경우 frontmatter 기반
         # 태그가 바뀔 수 있으므로 document_tags 를 재계산한다. 인라인 태그 보존을 위해

@@ -132,6 +132,7 @@ class AgentProposalService:
         # 즉시 파생 동기화한다. (INSERT 직후 FK 유효성 확보 + render_service /
         # vectorization_service 가 동일 데이터 관측)
         from app.services.snapshot_sync_service import (
+            rebuild_annotation_anchoring,
             rebuild_nodes_from_snapshot,
             rebuild_tags_for_document,
         )
@@ -143,6 +144,10 @@ class AgentProposalService:
             document_id=document_id,
             snapshot=content_snapshot,
             metadata=metadata,
+        )
+        # S3 Phase 3 FG 3-3 (2026-04-27): annotation anchoring 재계산.
+        rebuild_annotation_anchoring(
+            conn, document_id=document_id, snapshot=content_snapshot,
         )
 
         # MCP Task 생성 (비동기 승인 플로우)

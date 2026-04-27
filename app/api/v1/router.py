@@ -41,6 +41,9 @@ from app.api.v1 import extraction_evaluations  # S2 Phase 8 (FG8.3): 추출 품�
 from app.api.v1 import collections as collections_router  # S3 Phase 2 (FG 2-1)
 from app.api.v1 import folders as folders_router  # S3 Phase 2 (FG 2-1)
 from app.api.v1 import tags as tags_router  # S3 Phase 2 (FG 2-2)
+from app.api.v1 import contributors as contributors_router  # S3 Phase 3 (FG 3-1)
+from app.api.v1 import annotations as annotations_router_module  # S3 Phase 3 (FG 3-3)
+from app.api.v1 import notifications as notifications_router_module  # S3 Phase 3 (FG 3-3)
 
 v1_router = APIRouter()
 
@@ -138,3 +141,32 @@ v1_router.include_router(folders_router.router, prefix="/folders", tags=["folder
 
 # S3 Phase 2 (FG 2-2): 태그 동적 그룹 (서버 파서가 정본, 뷰 레이어)
 v1_router.include_router(tags_router.router, prefix="/tags", tags=["tags"])
+
+# S3 Phase 3 (FG 3-1): Contributors 패널 (작성자/편집자/승인자/열람자 4 카테고리)
+# /api/v1/documents/{document_id}/contributors
+v1_router.include_router(
+    contributors_router.router,
+    prefix="/documents",
+    tags=["documents", "contributors"],
+)
+
+# S3 Phase 3 (FG 3-3): 인라인 주석
+# - /api/v1/documents/{document_id}/annotations  (목록 / 생성)
+# - /api/v1/annotations/{annotation_id}          (단건 / 수정 / 해결 / 재오픈 / 삭제)
+v1_router.include_router(
+    annotations_router_module.documents_annotations_router,
+    prefix="/documents",
+    tags=["annotations"],
+)
+v1_router.include_router(
+    annotations_router_module.annotations_router,
+    prefix="/annotations",
+    tags=["annotations"],
+)
+
+# S3 Phase 3 (FG 3-3): In-app 알림 (멘션 등)
+v1_router.include_router(
+    notifications_router_module.router,
+    prefix="/notifications",
+    tags=["notifications"],
+)

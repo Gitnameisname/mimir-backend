@@ -133,3 +133,97 @@ def test_returns_not_raises(factory) -> None:
 def test_korean_detail_preserved() -> None:
     exc = unprocessable_entity("문서 타입이 유효하지 않습니다 (UPPER_SNAKE).")
     assert exc.detail == "문서 타입이 유효하지 않습니다 (UPPER_SNAKE)."
+
+
+# ---------------------------------------------------------------------------
+# 6. B-N4 (2026-04-25) — not_found_resource 도메인 변형
+# ---------------------------------------------------------------------------
+#
+# not_found (HTTPException) 와는 다른 계층 — ApiNotFoundError 인스턴스를 만든다.
+# handlers.api_error_handler 가 404 + error_code="resource_not_found" 응답으로 변환.
+
+
+from app.api.errors.exceptions import ApiNotFoundError  # noqa: E402
+
+from app.utils.http_errors import not_found_resource  # noqa: E402
+
+
+def test_not_found_resource_returns_api_not_found_error() -> None:
+    """HTTPException 이 아닌 ApiNotFoundError 를 반환해야 한다."""
+    exc = not_found_resource("문서", "doc-42")
+    assert isinstance(exc, ApiNotFoundError)
+    assert not isinstance(exc, HTTPException)
+
+
+def test_not_found_resource_message_format_korean() -> None:
+    """표준 메시지 포맷: ``{label_ko}을(를) 찾을 수 없습니다: {resource_id}``."""
+    exc = not_found_resource("문서", "doc-42")
+    assert exc.message == "문서을(를) 찾을 수 없습니다: doc-42"
+
+
+def test_not_found_resource_http_status_404() -> None:
+    exc = not_found_resource("버전", "ver-1")
+    assert exc.http_status == 404
+
+
+def test_not_found_resource_default_error_code() -> None:
+    """error_code 미지정 시 ApiNotFoundError 클래스 default 사용."""
+    exc = not_found_resource("폴더", "fld-7")
+    assert exc.error_code == "resource_not_found"
+
+
+def test_not_found_resource_error_code_override() -> None:
+    """error_code 지정 시 인스턴스 attribute 로 override."""
+    exc = not_found_resource(
+        "컬렉션",
+        "col-3",
+        error_code="NOT_FOUND_COLLECTION",
+    )
+    assert exc.error_code == "NOT_FOUND_COLLECTION"
+    # 클래스 default 는 변하지 않음
+    assert ApiNotFoundError.error_code == "resource_not_found"
+
+
+def test_not_found_resource_details_structure() -> None:
+    """details 에 field/reason/label/resource_id 4 키가 들어 있다."""
+    exc = not_found_resource("문서", "doc-99")
+    assert isinstance(exc.details, list)
+    assert len(exc.details) == 1
+    detail = exc.details[0]
+    assert detail == {
+        "field": "resource_id",
+        "reason": "not found",
+        "label": "문서",
+        "resource_id": "doc-99",
+    }
+
+
+@pytest.mark.parametrize(
+    ("label_ko", "resource_id"),
+    [
+        ("문서", "doc-1"),
+        ("버전", "ver-2"),
+        ("폴더", "fld-3"),
+        ("컬렉션", "col-4"),
+        ("스키마", "sch-5"),
+    ],
+)
+def test_not_found_resource_24_사이트_라벨_시나리오(label_ko, resource_id) -> None:
+    """24 사이트 도메인 라벨 (Document/Version/Folder/Collection/기타) 시나리오."""
+    exc = not_found_resource(label_ko, resource_id)
+    assert exc.message == f"{label_ko}을(를) 찾을 수 없습니다: {resource_id}"
+    assert exc.details[0]["label"] == label_ko
+    assert exc.details[0]["resource_id"] == resource_id
+
+
+def test_not_found_resource_keyword_only_error_code() -> None:
+    """error_code 는 keyword-only — positional 호출은 TypeError."""
+    with pytest.raises(TypeError):
+        not_found_resource("문서", "doc-1", "POSITIONAL_CODE")  # type: ignore[misc]
+
+
+def test_not_found_resource_does_not_raise() -> None:
+    """본 함수는 인스턴스만 만들고 raise 는 호출자 책임."""
+    exc = not_found_resource("문서", "doc-1")
+    assert isinstance(exc, ApiNotFoundError)
+    # raise 되지 않았음 — 호출 자체가 통과

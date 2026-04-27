@@ -73,7 +73,10 @@ def test_get_node_version_not_found_raises(monkeypatch):
         ns_mod.versions_repository, "get_by_id", lambda conn, vid: None
     )
     svc = NodesService()
-    with pytest.raises(ApiNotFoundError, match="Version"):
+    # B-N4 (2026-04-25): 영문 "Version" → 한국어 "버전" 마이그레이션 (단일 리소스 경로). OR 확장.
+    # 주의: get_node 의 Node-not-found 분기는 이중 컨텍스트 ("Node 'X' not found in version 'Y'") 라
+    # 영문 그대로 — 아래 test_get_node_node_not_found_raises 는 그대로 유지.
+    with pytest.raises(ApiNotFoundError, match="(버전|Version)"):
         svc.get_node(MagicMock(), "v1", "n1")
 
 

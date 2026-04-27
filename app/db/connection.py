@@ -1043,6 +1043,17 @@ CREATE INDEX IF NOT EXISTS idx_scope_profiles_name
     ON scope_profiles(name);
 """
 
+# S3 Phase 3 FG 3-2 (2026-04-27): scope_profiles.settings_json 신설.
+#   - 본 컬럼은 Scope Profile 단위 운영 설정의 단일 진실점.
+#   - 첫 키: expose_viewers (Contributors 패널의 viewers 섹션 노출 정책).
+#     기본값 false (보수적) — DEFAULT '{}'::jsonb 가 채워지면 dataclass 가 false 로 fallback.
+#   - 알 수 없는 키는 raw dict 에 보존 (forward compatibility) — repository load/save 가
+#     dataclass 추출 + raw merge 패턴으로 처리.
+_SCOPE_PROFILES_SETTINGS_JSON_MIGRATION_DDL = """
+ALTER TABLE scope_profiles
+    ADD COLUMN IF NOT EXISTS settings_json JSONB NOT NULL DEFAULT '{}'::jsonb;
+"""
+
 _SCOPE_DEFINITIONS_DDL = """
 CREATE TABLE IF NOT EXISTS scope_definitions (
     id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1765,6 +1776,86 @@ CREATE INDEX IF NOT EXISTS idx_extraction_evaluations_candidate
 """
 
 
+# ---------------------------------------------------------------------------
+# S3 Phase 3 FG 3-3 (2026-04-27): 인라인 주석 + 멘션 + 알림
+# ---------------------------------------------------------------------------
+
+# annotations — 노드 단위 인라인 주석 + 답글 스레드.
+#   ACL 은 documents.scope_profile_id (FG 2-0) 가 결정. annotations 자체는 ACL 무관.
+#   anchoring 은 node_id 기반 (Phase 1 안정성 위에 얹힘).
+#   span_start/end 가 NULL 이면 노드 전체 주석. 둘 다 있으면 span_start < span_end.
+_ANNOTATIONS_DDL = """
+CREATE TABLE IF NOT EXISTS annotations (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    document_id     UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    version_id      UUID NULL REFERENCES versions(id) ON DELETE SET NULL,
+    node_id         UUID NOT NULL,
+    span_start      INT NULL,
+    span_end        INT NULL,
+    author_id       VARCHAR(255) NOT NULL,
+    actor_type      VARCHAR(32) NOT NULL DEFAULT 'user',
+    content         TEXT NOT NULL,
+    status          VARCHAR(16) NOT NULL DEFAULT 'open',
+    resolved_at     TIMESTAMPTZ NULL,
+    resolved_by     VARCHAR(255) NULL,
+    parent_id       UUID NULL REFERENCES annotations(id) ON DELETE CASCADE,
+    is_orphan       BOOLEAN NOT NULL DEFAULT false,
+    orphaned_at     TIMESTAMPTZ NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT annotations_content_length CHECK (length(content) BETWEEN 1 AND 10000),
+    CONSTRAINT annotations_status CHECK (status IN ('open', 'resolved')),
+    CONSTRAINT annotations_actor_type CHECK (actor_type IN ('user', 'agent', 'system')),
+    CONSTRAINT annotations_span_order CHECK (
+        span_start IS NULL OR span_end IS NULL OR span_start < span_end
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_annotations_document_id
+    ON annotations(document_id);
+CREATE INDEX IF NOT EXISTS idx_annotations_node_id
+    ON annotations(node_id);
+CREATE INDEX IF NOT EXISTS idx_annotations_parent_id
+    ON annotations(parent_id) WHERE parent_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_annotations_status_open
+    ON annotations(document_id, status) WHERE status = 'open';
+CREATE INDEX IF NOT EXISTS idx_annotations_author
+    ON annotations(author_id);
+"""
+
+# annotation_mentions — 한 주석 안의 @user 멘션 매핑.
+#   알림 enqueue 시 정본. 작성자 본인이 자기 자신을 멘션해도 알림은 service 가 skip.
+_ANNOTATION_MENTIONS_DDL = """
+CREATE TABLE IF NOT EXISTS annotation_mentions (
+    annotation_id       UUID NOT NULL REFERENCES annotations(id) ON DELETE CASCADE,
+    mentioned_user_id   VARCHAR(255) NOT NULL,
+    notified_at         TIMESTAMPTZ NULL,
+    PRIMARY KEY (annotation_id, mentioned_user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_annotation_mentions_user
+    ON annotation_mentions(mentioned_user_id);
+"""
+
+# notifications — 최소 in-app 알림 시스템. S2 에 알림 시스템 부재로 본 FG 가 신설.
+#   향후 별도 알림 모듈로 흡수 가능하도록 enqueue API 1 곳 (notifications_service) 격리.
+_NOTIFICATIONS_DDL = """
+CREATE TABLE IF NOT EXISTS notifications (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id     VARCHAR(255) NOT NULL,
+    kind        VARCHAR(32) NOT NULL,
+    payload     JSONB NOT NULL DEFAULT '{}'::jsonb,
+    read_at     TIMESTAMPTZ NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_notifications_user_unread
+    ON notifications(user_id, created_at DESC) WHERE read_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_notifications_user_created
+    ON notifications(user_id, created_at DESC);
+"""
+
+
 def init_db() -> None:
     """앱 시작 시 모든 테이블을 생성하고 마이그레이션을 적용한다 (idempotent).
 
@@ -1825,6 +1916,8 @@ def init_db() -> None:
         ("RETENTION_POLICIES_DDL", _RETENTION_POLICIES_DDL),
         # S2 Phase 4
         ("SCOPE_PROFILES_DDL", _SCOPE_PROFILES_DDL),
+        # S3 Phase 3 FG 3-2 (2026-04-27): scope_profiles.settings_json
+        ("SCOPE_PROFILES_SETTINGS_JSON_MIGRATION", _SCOPE_PROFILES_SETTINGS_JSON_MIGRATION_DDL),
         ("SCOPE_DEFINITIONS_DDL", _SCOPE_DEFINITIONS_DDL),
         ("AGENTS_DDL", _AGENTS_DDL),
         ("API_KEYS_AGENT_MIGRATION", _API_KEYS_AGENT_MIGRATION_DDL),
@@ -1855,6 +1948,10 @@ def init_db() -> None:
         ("GOLDEN_EXTRACTION_SETS_DDL", _GOLDEN_EXTRACTION_SETS_DDL),
         ("GOLDEN_EXTRACTION_ITEMS_DDL", _GOLDEN_EXTRACTION_ITEMS_DDL),
         ("EXTRACTION_EVALUATIONS_DDL", _EXTRACTION_EVALUATIONS_DDL),
+        # S3 Phase 3 FG 3-3 (2026-04-27): 인라인 주석 + 멘션 + 알림
+        ("ANNOTATIONS_DDL", _ANNOTATIONS_DDL),
+        ("ANNOTATION_MENTIONS_DDL", _ANNOTATION_MENTIONS_DDL),
+        ("NOTIFICATIONS_DDL", _NOTIFICATIONS_DDL),
     ]
 
     skipped: list[str] = []

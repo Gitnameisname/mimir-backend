@@ -39,6 +39,7 @@ from app.repositories.documents_repository import documents_repository
 from app.repositories.versions_repository import versions_repository
 from app.repositories.workflow_repository import workflow_repository
 from app.utils.time import utcnow
+from app.utils.http_errors import not_found_resource
 
 logger = logging.getLogger(__name__)
 
@@ -131,7 +132,7 @@ class WorkflowService:
         # 1. 문서/버전 존재 확인
         doc = documents_repository.get_by_id(conn, document_id)
         if doc is None:
-            raise ApiNotFoundError(f"Document '{document_id}' not found")
+            raise not_found_resource("문서", document_id)
 
         version = versions_repository.get_by_document_and_version_id(
             conn, document_id, version_id
@@ -384,7 +385,7 @@ class WorkflowService:
         """워크플로 이력을 반환한다."""
         doc = documents_repository.get_by_id(conn, document_id)
         if doc is None:
-            raise ApiNotFoundError(f"Document '{document_id}' not found")
+            raise not_found_resource("문서", document_id)
 
         return workflow_repository.list_workflow_history(
             conn, document_id, version_id=version_id, limit=limit, offset=offset

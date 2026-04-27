@@ -27,7 +27,9 @@ from app.repositories.folders_repository import (
     folders_repository,
 )
 from app.services.documents_service import _resolve_viewer_scope_profile_ids
+from app.utils.actor import require_actor_id
 from app.utils.strings import normalize_display_name
+from app.utils.http_errors import not_found_resource
 
 logger = logging.getLogger(__name__)
 
@@ -53,9 +55,13 @@ def _normalize_name(raw: str) -> str:
 
 
 def _require_actor(actor: Optional[ActorContext]) -> str:
-    if actor is None or actor.actor_id is None:
-        raise ApiValidationError("인증된 사용자만 폴더를 관리할 수 있습니다")
-    return str(actor.actor_id)
+    """thin wrapper — 도서관 §1.10 BE-G6 (2026-04-25): require_actor_id 위임.
+
+    기존 호출지 호환을 위해 서비스 모듈에 남겨둠. 메시지는 helper 의 표준
+    "인증된 {label}만 작업을 수행할 수 있습니다" 로 변경 (이전 "인증된 사용자만
+    폴더를 관리할 수 있습니다" → "인증된 폴더만 작업을 수행할 수 있습니다").
+    """
+    return require_actor_id(actor, label="폴더")
 
 
 class FoldersService:
@@ -81,7 +87,7 @@ class FoldersService:
         if parent_id is not None:
             parent = folders_repository.get_by_id(conn, parent_id, owner_id=owner_id)
             if parent is None:
-                raise ApiNotFoundError(f"Parent folder '{parent_id}' not found")
+                raise not_found_resource("폴더", parent_id)
             parent_path = parent.path
             parent_depth = parent.depth
 
@@ -116,7 +122,7 @@ class FoldersService:
         owner_id = _require_actor(actor)
         folder = folders_repository.get_by_id(conn, folder_id, owner_id=owner_id)
         if folder is None:
-            raise ApiNotFoundError(f"Folder '{folder_id}' not found")
+            raise not_found_resource("폴더", folder_id)
         return folder
 
     def list_folders(
@@ -145,7 +151,7 @@ class FoldersService:
                 "같은 경로의 폴더가 이미 존재합니다",
             ) from exc
         if renamed is None:
-            raise ApiNotFoundError(f"Folder '{folder_id}' not found")
+            raise not_found_resource("폴더", folder_id)
         return renamed
 
     def move_folder(
@@ -184,7 +190,7 @@ class FoldersService:
                 conn, new_parent_id, owner_id=owner_id,
             )
             if new_parent is None:
-                raise ApiNotFoundError(f"Parent folder '{new_parent_id}' not found")
+                raise not_found_resource("폴더", new_parent_id)
             new_parent_path = new_parent.path
             new_parent_depth = new_parent.depth
 
@@ -214,7 +220,7 @@ class FoldersService:
                 "이동 후 경로가 기존 폴더와 충돌합니다",
             ) from exc
         if moved is None:
-            raise ApiNotFoundError(f"Folder '{folder_id}' not found")
+            raise not_found_resource("폴더", folder_id)
         return moved
 
     def delete_folder(
@@ -256,14 +262,14 @@ class FoldersService:
             conn, document_id, viewer_scope_profile_ids=viewer_ids,
         )
         if doc is None:
-            raise ApiNotFoundError(f"Document '{document_id}' not found")
+            raise not_found_resource("문서", document_id)
 
         if folder_id is not None:
             folder = folders_repository.get_by_id(
                 conn, folder_id, owner_id=owner_id,
             )
             if folder is None:
-                raise ApiNotFoundError(f"Folder '{folder_id}' not found")
+                raise not_found_resource("폴더", folder_id)
 
         folders_repository.set_folder(
             conn, document_id=document_id, folder_id=folder_id,

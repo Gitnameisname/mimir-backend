@@ -52,12 +52,9 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-_ADMIN_ROLES = frozenset({"ORG_ADMIN", "SUPER_ADMIN"})
-
-
-def _require_admin(actor: ActorContext) -> None:
-    if not actor.is_authenticated or actor.role not in _ADMIN_ROLES:
-        raise ApiPermissionDeniedError("관리자 권한이 필요합니다.")
+# 도서관 §1.10 BE-G6 (2026-04-25): ADMIN_ROLES + require_admin 위임.
+# 기존 _ADMIN_ROLES 모듈 상수와 _require_admin 함수는 thin re-export 로 호환 유지.
+from app.utils.actor import ADMIN_ROLES as _ADMIN_ROLES, require_admin as _require_admin  # noqa: F401
 
 
 def _get_affected_agents(conn, profile_id: str) -> list[dict]:
@@ -88,6 +85,9 @@ def _agent_response(agent) -> AgentResponse:
 
 
 def _profile_response(profile) -> ScopeProfileResponse:
+    # S3 Phase 3 FG 3-2 (2026-04-27): settings (ScopeProfileSettings dataclass) → schema
+    from app.schemas.agent import ScopeProfileSettingsSchema  # 지연 import 회피
+
     return ScopeProfileResponse(
         id=profile.id,
         name=profile.name,
@@ -106,6 +106,9 @@ def _profile_response(profile) -> ScopeProfileResponse:
             )
             for s in profile.scopes
         ],
+        settings=ScopeProfileSettingsSchema(
+            expose_viewers=bool(profile.settings.expose_viewers),
+        ),
     )
 
 
@@ -124,12 +127,19 @@ def create_scope_profile(
     actor: ActorContext = Depends(resolve_current_actor),
 ):
     _require_admin(actor)
+    # S3 Phase 3 FG 3-2 (2026-04-27): create 시 settings 도 함께 전달 (옵셔널).
+    from app.models.scope_profile import ScopeProfileSettings  # 지연 import
+    settings_arg = (
+        ScopeProfileSettings(expose_viewers=bool(body.settings.expose_viewers))
+        if body.settings is not None else None
+    )
     with get_db() as conn:
         repo = ScopeProfileRepository(conn)
         profile = repo.create(
             name=body.name,
             description=body.description,
             organization_id=body.organization_id,
+            settings=settings_arg,
         )
     audit_emitter.emit(
         event_type="scope_profile.created",
@@ -196,10 +206,29 @@ def update_scope_profile(
     actor: ActorContext = Depends(resolve_current_actor),
 ):
     _require_admin(actor)
+
+    # S3 Phase 3 FG 3-2 (2026-04-27): settings PATCH 처리.
+    settings_patch: Optional[dict] = None
+    settings_before: Optional[dict] = None
+    if body.settings is not None:
+        settings_patch = {"expose_viewers": bool(body.settings.expose_viewers)}
+
     with get_db() as conn:
         affected_agents = _get_affected_agents(conn, profile_id)
         repo = ScopeProfileRepository(conn)
-        profile = repo.update(profile_id, name=body.name, description=body.description)
+        # settings.changed audit 를 위해 변경 전 값 캡쳐
+        if settings_patch is not None:
+            existing = repo.get_by_id(profile_id)
+            if existing is not None:
+                settings_before = {
+                    "expose_viewers": bool(existing.settings.expose_viewers),
+                }
+        profile = repo.update(
+            profile_id,
+            name=body.name,
+            description=body.description,
+            settings_patch=settings_patch,
+        )
     if not profile:
         raise not_found("Scope Profile을 찾을 수 없습니다.")
     audit_emitter.emit(
@@ -212,6 +241,23 @@ def update_scope_profile(
         result="success",
         metadata={"affected_agents": affected_agents},
     )
+    # S3 Phase 3 FG 3-2 (2026-04-27): settings 변경 별도 audit + 정책 캐시 invalidate.
+    if settings_patch is not None:
+        from app.services.scope_profile_policy import invalidate_cache
+        invalidate_cache(profile_id)
+        audit_emitter.emit(
+            event_type="scope_profile.settings.changed",
+            action="scope_profile.settings.update",
+            actor_id=actor.resolved_id,
+            actor_type=actor.audit_actor_type,
+            resource_type="scope_profile",
+            resource_id=profile_id,
+            result="success",
+            metadata={
+                "before": settings_before or {},
+                "after": settings_patch,
+            },
+        )
     return _profile_response(profile)
 
 

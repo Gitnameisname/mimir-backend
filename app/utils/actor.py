@@ -1,11 +1,14 @@
-"""ActorContext → 감사 로그용 actor_type 매핑 유틸.
+"""ActorContext → 감사 로그용 actor_type 매핑 + 권한 가드.
 
-본 모듈은 ``docs/함수도서관/backend.md`` §1.6 BE-G4 에 등록된 공통 유틸이다.
+본 모듈은 ``docs/함수도서관/backend.md`` §1.6 BE-G4 + §1.10 BE-G6 에 등록된 공통 유틸이다.
 
 제공 함수:
-    - :func:`actor_type_str` — ``ActorContext`` 의 4분류
-      (anonymous/user/agent/service) 를 ``AuditEmitter`` Literal 3분류
-      (``"user"``/``"agent"``/``"system"``) 로 매핑.
+    - :func:`actor_type_str` — ``ActorContext`` 4분류 → AuditEmitter Literal 3분류 매핑 (BE-G4).
+    - :func:`require_actor_id` — 인증된 actor 의 ``actor_id`` 를 보장 (BE-G6).
+    - :func:`require_admin` — admin 권한 가드 (BE-G6).
+
+상수:
+    - :data:`ADMIN_ROLES` — admin 으로 간주되는 role 이름 frozenset (BE-G6).
 
 도입 배경 (보안):
     - ``app.audit.emitter.AuditEmitter.emit`` 의 ``actor_type`` 인자는
@@ -35,8 +38,25 @@ from __future__ import annotations
 from typing import Any, Literal
 
 from app.api.auth.models import ActorContext, ActorType
+from app.api.errors.exceptions import ApiPermissionDeniedError, ApiValidationError
 
-__all__ = ["AuditActorType", "actor_type_str"]
+__all__ = [
+    "AuditActorType",
+    "actor_type_str",
+    # BE-G6 (2026-04-25):
+    "ADMIN_ROLES",
+    "require_actor_id",
+    "require_admin",
+]
+
+
+# ===========================================================================
+# BE-G6 (2026-04-25) — 권한 가드
+# ===========================================================================
+
+# proposal_queue + scope_profiles 등에서 반복되던 `_ADMIN_ROLES = {"ORG_ADMIN", "SUPER_ADMIN"}`
+# 모듈 상수의 단일 진실점. frozenset 으로 immutable 보장.
+ADMIN_ROLES: frozenset[str] = frozenset({"ORG_ADMIN", "SUPER_ADMIN"})
 
 
 # AuditEmitter 와 동일한 Literal 타입 (단일 진실점).
@@ -83,3 +103,58 @@ def actor_type_str(actor: ActorContext | None) -> AuditActorType:
         return "system"
     # USER + ANONYMOUS + 알 수 없는 값 → "user" (감사 기본값)
     return "user"
+
+
+def require_actor_id(
+    actor: ActorContext | None,
+    *,
+    label: str = "사용자",
+) -> str:
+    """인증된 actor 의 ``actor_id`` 를 보장하고 반환한다.
+
+    folders_service / collections_service 의 `_require_actor` 보일러를 통합한
+    단일 진입점. label 인자로 도메인 메시지 (예: "폴더", "컬렉션") 를 명시.
+
+    :param actor: ``ActorContext`` 또는 ``None``. ``None`` / ``actor_id`` 미설정 시
+        ``ApiValidationError`` 를 던진다.
+    :param label: 에러 메시지에 들어갈 도메인 라벨 (기본 ``"사용자"``).
+    :returns: ``str(actor.actor_id)`` — 인증된 사용자의 정규화 id.
+    :raises ApiValidationError: actor 가 None 이거나 actor_id 가 None 일 때.
+        메시지 포맷: ``"인증된 {label}만 ... 관리할 수 있습니다"`` 와 호환되도록
+        ``f"인증된 {label}만 작업을 수행할 수 있습니다"`` 형태.
+
+    >>> from app.api.auth.models import ActorContext, ActorType, AuthMethod
+    >>> u = ActorContext(actor_type=ActorType.USER, actor_id="u1", is_authenticated=True,
+    ...                  auth_method=AuthMethod.SESSION, tenant_id=None)
+    >>> require_actor_id(u)
+    'u1'
+
+    .. note::
+        호출자가 직접 메시지를 명시하고 싶으면 본 helper 대신 인라인 검사를 유지.
+        본 helper 는 "인증된 {label}만 ..." 메시지 패턴이 적합한 도메인용.
+    """
+    if actor is None or actor.actor_id is None:
+        raise ApiValidationError(f"인증된 {label}만 작업을 수행할 수 있습니다")
+    return str(actor.actor_id)
+
+
+def require_admin(actor: ActorContext) -> None:
+    """admin 권한을 검증한다 (보안 가드).
+
+    proposal_queue / scope_profiles 의 `_require_admin` 보일러를 통합. ``actor.role``
+    이 :data:`ADMIN_ROLES` 에 속해야 한다.
+
+    :param actor: ``ActorContext`` 인스턴스.
+    :raises ApiPermissionDeniedError: 미인증 또는 admin role 이 아닌 경우.
+        메시지: ``"관리자 권한이 필요합니다."``
+
+    >>> # admin OK 케이스는 ActorContext 인스턴스 필요 — 테스트 참조
+
+    .. note::
+        본 helper 는 단순 role 기반 가드. policy engine 기반 세분화된 권한 검증
+        (예: ``authorization_service.authorize(ctx, action, resource)``) 은 별도.
+        admin 가드 + 추가 검증이 필요한 라우터는 본 helper 호출 후 정책 검증을
+        추가한다.
+    """
+    if not actor.is_authenticated or actor.role not in ADMIN_ROLES:
+        raise ApiPermissionDeniedError("관리자 권한이 필요합니다.")

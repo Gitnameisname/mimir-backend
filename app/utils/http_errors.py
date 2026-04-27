@@ -46,6 +46,8 @@ __all__ = [
     "bad_request",
     "unprocessable_entity",
     "conflict",
+    # B-N4 (2026-04-25): ApiNotFoundError 변형 — handlers 가 404 로 변환
+    "not_found_resource",
 ]
 
 # 헤더 키 — Shared Error Contract 의 error_code 를 wire 에 노출하는 임시 통로.
@@ -145,3 +147,73 @@ def conflict(
         detail=detail,
         headers=_build_headers(error_code, headers),
     )
+
+
+# ===========================================================================
+# B-N4 (2026-04-25) — 도메인 not_found (ApiNotFoundError 변형)
+# ===========================================================================
+#
+# 위 4종 (not_found / bad_request / ...) 은 FastAPI ``HTTPException`` 인스턴스를
+# 만든다. handlers.py 가 직접 처리.
+#
+# 본 helper 는 다른 계층 — :class:`ApiNotFoundError` (플랫폼 비즈니스 예외) 를
+# 만든다. handlers.py 의 :func:`api_error_handler` 가 ApiError 계층을 응답으로
+# 변환할 때 ``http_status=404`` + ``error_code="resource_not_found"`` 를 사용.
+#
+# 시맨틱 차이:
+#   - ``not_found(detail)``           → ``HTTPException(404, detail=str)`` (단순)
+#   - ``not_found_resource(label, id)`` → ``ApiNotFoundError`` (구조화 + 한국어 표준 메시지)
+#
+# 라우터에서 영문 ``f"X '{id}' not found"`` 패턴 24 사이트를 통일.
+
+# ApiNotFoundError 를 직접 import (지연 import 로 순환 회피).
+def not_found_resource(
+    label_ko: str,
+    resource_id: str,
+    *,
+    error_code: str | None = None,
+):
+    """도메인 리소스 not_found 표준 :class:`ApiNotFoundError` 인스턴스를 만든다.
+
+    24 사이트 영문 패턴 (`f"Document '{id}' not found"`) 의 한국어 통일 버전.
+
+    :param label_ko: 한국어 라벨 (예: ``"문서"``, ``"버전"``, ``"폴더"``, ``"컬렉션"``).
+        호출자가 명시 — 도메인 사전 매핑은 의도적으로 하지 않음 (helper 가 도메인을 모름).
+    :param resource_id: 리소스 식별자 (UUID 문자열 등). 메시지에 그대로 포함됨.
+    :param error_code: 선택. 백엔드 ``error.code`` 필드. 미지정 시 ApiNotFoundError 의
+        클래스 default ``"resource_not_found"`` 사용.
+
+    :returns: :class:`ApiNotFoundError` 인스턴스 — 호출자가 ``raise`` 한다.
+    :raises: 본 helper 자체는 raise 안 함. 인스턴스만 반환.
+
+    >>> exc = not_found_resource("문서", "doc-42")
+    >>> exc.message
+    '문서을(를) 찾을 수 없습니다: doc-42'
+    >>> exc.http_status
+    404
+
+    .. note::
+        - **메시지 표준**: ``f"{label_ko}을(를) 찾을 수 없습니다: {resource_id}"``.
+          한국어 조사가 도메인 단어 받침에 따라 어색할 수 있어 ``"을(를)"`` 양립.
+        - error_code 자동 생성 (예: ``f"NOT_FOUND_{label_ko_upper}"``) 은 한국어
+          라벨이라 의미 없음 → 호출자 명시.
+        - 정확히 같은 패턴 (`f"{Resource} '{id}' not found"` 영문) 24 사이트:
+          Document 15 / Version 3 / Folder 3 / Collection 2 / 기타 1.
+    """
+    # 지연 import — utils/http_errors → api/errors/exceptions 순환 회피.
+    from app.api.errors.exceptions import ApiNotFoundError
+
+    err = ApiNotFoundError(
+        f"{label_ko}을(를) 찾을 수 없습니다: {resource_id}",
+        details=[
+            {
+                "field": "resource_id",
+                "reason": "not found",
+                "label": label_ko,
+                "resource_id": resource_id,
+            }
+        ],
+    )
+    if error_code:
+        err.error_code = error_code  # 인스턴스 attribute override
+    return err

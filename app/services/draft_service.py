@@ -43,6 +43,7 @@ from app.schemas.versions import (
     VersionSummaryResponse,
 )
 from app.utils.time import utcnow
+from app.utils.http_errors import not_found_resource
 
 logger = logging.getLogger(__name__)
 
@@ -140,7 +141,7 @@ class DraftService:
         """
         doc = documents_repository.get_by_id(conn, document_id)
         if doc is None:
-            raise ApiNotFoundError(f"Document '{document_id}' not found")
+            raise not_found_resource("문서", document_id)
 
         title_snap = request.title or doc.title
         summary_snap = request.summary if request.summary is not None else doc.summary
@@ -226,6 +227,7 @@ class DraftService:
         # nodes 를 그대로 읽으며 `_parse_nodes_from_snapshot` 의 fallback 경로는
         # "snapshot 은 있는데 nodes 가 비어있는" 레거시 버전에만 의미가 있다.
         from app.services.snapshot_sync_service import (
+            rebuild_annotation_anchoring,
             rebuild_nodes_from_snapshot,
             rebuild_tags_for_document,
         )
@@ -237,6 +239,11 @@ class DraftService:
             document_id=document_id,
             snapshot=request.content_snapshot,
             metadata=doc.metadata,
+        )
+        # S3 Phase 3 FG 3-3 (2026-04-27): annotation anchoring 재계산.
+        # node_id 가 사라진 annotation → orphan, 다시 등장한 → 복구.
+        rebuild_annotation_anchoring(
+            conn, document_id=document_id, snapshot=request.content_snapshot,
         )
 
         # documents.title 동기화 — 에디터에서 제목 변경 시 목록 뷰에도 즉시 반영
@@ -270,7 +277,7 @@ class DraftService:
         """
         doc = documents_repository.get_by_id(conn, document_id)
         if doc is None:
-            raise ApiNotFoundError(f"Document '{document_id}' not found")
+            raise not_found_resource("문서", document_id)
 
         if doc.current_draft_version_id is None:
             raise ApiConflictError(
@@ -315,7 +322,7 @@ class DraftService:
         """
         doc = documents_repository.get_by_id(conn, document_id)
         if doc is None:
-            raise ApiNotFoundError(f"Document '{document_id}' not found")
+            raise not_found_resource("문서", document_id)
 
         if doc.current_draft_version_id is None:
             raise ApiConflictError(
@@ -395,7 +402,7 @@ class DraftService:
         """
         doc = documents_repository.get_by_id(conn, document_id)
         if doc is None:
-            raise ApiNotFoundError(f"Document '{document_id}' not found")
+            raise not_found_resource("문서", document_id)
 
         target = versions_repository.get_by_document_and_version_id(
             conn, document_id, version_id
@@ -474,7 +481,7 @@ class DraftService:
         """버전 목록을 is_current_* 플래그 및 can_restore와 함께 반환한다."""
         doc = documents_repository.get_by_id(conn, document_id)
         if doc is None:
-            raise ApiNotFoundError(f"Document '{document_id}' not found")
+            raise not_found_resource("문서", document_id)
 
         sort_field = "version_number"
         sort_dir = "DESC"
@@ -522,7 +529,7 @@ class DraftService:
         """버전 상세를 actions, is_current_* 플래그와 함께 반환한다."""
         doc = documents_repository.get_by_id(conn, document_id)
         if doc is None:
-            raise ApiNotFoundError(f"Document '{document_id}' not found")
+            raise not_found_resource("문서", document_id)
 
         version = versions_repository.get_by_document_and_version_id(
             conn, document_id, version_id
@@ -607,7 +614,7 @@ class DraftService:
         # version_id 가 현재 Draft 인지 검증 (기존 에러 메시지 호환)
         doc = documents_repository.get_by_id(conn, document_id)
         if doc is None:
-            raise ApiNotFoundError(f"Document '{document_id}' not found")
+            raise not_found_resource("문서", document_id)
 
         if doc.current_draft_version_id != version_id:
             raise ApiConflictError(

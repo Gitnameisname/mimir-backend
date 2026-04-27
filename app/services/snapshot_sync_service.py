@@ -467,6 +467,44 @@ def rebuild_tags_for_document(
     return extracted
 
 
+def rebuild_annotation_anchoring(
+    conn: Any,
+    document_id: str,
+    snapshot: Any,
+) -> tuple[int, int]:
+    """S3 Phase 3 FG 3-3 — annotation 의 node_id anchoring 재계산.
+
+    snapshot 에서 살아있는 node_id 집합을 추출해
+    ``annotations_repository.mark_orphans`` 에 위임:
+      - 살아있지 않은 node_id 의 annotation → is_orphan=true
+      - 다시 살아난 node_id 의 annotation → orphan 해제 (is_orphan=false)
+
+    호출 시점: ``rebuild_nodes_from_snapshot`` / ``rebuild_tags_for_document`` 직후
+    (같은 트랜잭션 안). 별도 시점 호출도 안전 (idempotent).
+
+    Returns:
+        (newly_orphaned_count, recovered_count)
+    """
+    # 순환 import 회피
+    from app.repositories.annotations_repository import annotations_repository
+
+    flat_nodes = nodes_from_prosemirror(snapshot)
+    live_node_ids: set[str] = set()
+    for n in flat_nodes:
+        nid = n.get("id") or n.get("node_id")
+        if nid:
+            live_node_ids.add(str(nid))
+    newly_orphaned, recovered = annotations_repository.mark_orphans(
+        conn, document_id, live_node_ids,
+    )
+    if newly_orphaned or recovered:
+        logger.info(
+            "rebuild_annotation_anchoring — document_id=%s, newly_orphaned=%d, recovered=%d",
+            document_id, newly_orphaned, recovered,
+        )
+    return newly_orphaned, recovered
+
+
 # ---------------------------------------------------------------------------
 # 순수 텍스트 → 최소 doc
 # ---------------------------------------------------------------------------
@@ -495,5 +533,6 @@ __all__ = [
     "nodes_from_prosemirror",
     "rebuild_nodes_from_snapshot",
     "rebuild_tags_for_document",
+    "rebuild_annotation_anchoring",
     "prosemirror_from_text",
 ]

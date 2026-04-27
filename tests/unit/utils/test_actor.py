@@ -12,7 +12,13 @@ from __future__ import annotations
 import pytest
 
 from app.api.auth.models import ActorContext, ActorType, AuthMethod
-from app.utils.actor import actor_type_str
+from app.api.errors.exceptions import ApiPermissionDeniedError, ApiValidationError
+from app.utils.actor import (
+    ADMIN_ROLES,
+    actor_type_str,
+    require_actor_id,
+    require_admin,
+)
 
 
 def _make(actor_type: ActorType, *, is_authenticated: bool = True) -> ActorContext:
@@ -106,3 +112,109 @@ def test_audit_actor_type_property_uses_helper(actor_type, expected) -> None:
     actor = _make(actor_type, is_authenticated=(actor_type != ActorType.ANONYMOUS))
     assert actor.audit_actor_type == expected
     assert actor.audit_actor_type == actor_type_str(actor)
+
+
+# ===========================================================================
+# BE-G6 (2026-04-25) — require_actor_id
+# ===========================================================================
+
+
+def _make_with_role(role: str | None, is_authenticated: bool = True) -> ActorContext:
+    return ActorContext(
+        actor_type=ActorType.USER,
+        actor_id="user-1" if is_authenticated else None,
+        is_authenticated=is_authenticated,
+        auth_method=AuthMethod.SESSION if is_authenticated else None,
+        tenant_id=None,
+        role=role,
+    )
+
+
+class TestRequireActorId:
+    def test_authenticated_actor_returns_id(self) -> None:
+        actor = _make(ActorType.USER, is_authenticated=True)
+        assert require_actor_id(actor) == "test-id"
+
+    def test_none_actor_raises(self) -> None:
+        with pytest.raises(ApiValidationError) as exc_info:
+            require_actor_id(None)
+        assert "인증된 사용자만" in exc_info.value.message
+
+    def test_anonymous_actor_raises(self) -> None:
+        actor = _make(ActorType.ANONYMOUS, is_authenticated=False)
+        with pytest.raises(ApiValidationError):
+            require_actor_id(actor)
+
+    def test_custom_label_in_message(self) -> None:
+        with pytest.raises(ApiValidationError) as exc_info:
+            require_actor_id(None, label="폴더")
+        assert "인증된 폴더만" in exc_info.value.message
+
+    def test_keyword_only_label(self) -> None:
+        actor = _make(ActorType.USER)
+        with pytest.raises(TypeError):
+            require_actor_id(actor, "폴더")  # type: ignore[misc]
+
+    def test_returns_str(self) -> None:
+        actor = _make(ActorType.USER)
+        result = require_actor_id(actor)
+        assert isinstance(result, str)
+
+
+# ===========================================================================
+# BE-G6 (2026-04-25) — require_admin
+# ===========================================================================
+
+
+class TestRequireAdmin:
+    def test_org_admin_passes(self) -> None:
+        actor = _make_with_role("ORG_ADMIN")
+        # 예외 없이 반환
+        assert require_admin(actor) is None
+
+    def test_super_admin_passes(self) -> None:
+        actor = _make_with_role("SUPER_ADMIN")
+        assert require_admin(actor) is None
+
+    def test_viewer_role_raises(self) -> None:
+        actor = _make_with_role("VIEWER")
+        with pytest.raises(ApiPermissionDeniedError) as exc_info:
+            require_admin(actor)
+        assert "관리자 권한" in str(exc_info.value)
+
+    def test_author_role_raises(self) -> None:
+        actor = _make_with_role("AUTHOR")
+        with pytest.raises(ApiPermissionDeniedError):
+            require_admin(actor)
+
+    def test_unauthenticated_raises(self) -> None:
+        actor = _make_with_role("ORG_ADMIN", is_authenticated=False)
+        with pytest.raises(ApiPermissionDeniedError):
+            require_admin(actor)
+
+    def test_no_role_raises(self) -> None:
+        actor = _make_with_role(None)
+        with pytest.raises(ApiPermissionDeniedError):
+            require_admin(actor)
+
+
+# ===========================================================================
+# BE-G6 (2026-04-25) — ADMIN_ROLES 상수
+# ===========================================================================
+
+
+class TestAdminRoles:
+    def test_contains_org_admin(self) -> None:
+        assert "ORG_ADMIN" in ADMIN_ROLES
+
+    def test_contains_super_admin(self) -> None:
+        assert "SUPER_ADMIN" in ADMIN_ROLES
+
+    def test_excludes_lower_roles(self) -> None:
+        for role in ["VIEWER", "AUTHOR", "REVIEWER", "APPROVER"]:
+            assert role not in ADMIN_ROLES
+
+    def test_immutable_frozenset(self) -> None:
+        assert isinstance(ADMIN_ROLES, frozenset)
+        with pytest.raises(AttributeError):
+            ADMIN_ROLES.add("NEW_ROLE")  # type: ignore[attr-defined]
