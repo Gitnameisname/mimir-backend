@@ -189,7 +189,11 @@ class TestMCPResponseStructure:
         )
 
     def test_mcp_search_result_includes_citation(self):
-        """MCP search_documents가 실제 citation 필드를 전달한다."""
+        """MCP search_documents가 실제 citation 필드를 전달한다.
+
+        S3 Phase 4 FG 4-0 §2.1.6 (2026-04-28): 본 테스트는 citation 필드 전달
+        검증이 목적이므로 tool-level ACL 게이트는 mock 으로 우회.
+        """
         from app.api.auth.models import ActorContext, ActorType
         from app.mcp.tools import tool_search_documents
         from app.schemas.citation import Citation
@@ -204,6 +208,9 @@ class TestMCPResponseStructure:
             tenant_id=None,
             role="VIEWER",
         )
+        # FG 4-0 §2.1.6: ACL 게이트 우회 (본 테스트는 citation 검증 목적)
+        original_can_call = ActorContext.can_call_tool
+        ActorContext.can_call_tool = lambda self, tool_name, conn=None: True
         citation = Citation.from_chunk("11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222", "33333333-3333-3333-3333-333333333333", "chunk text")
         fake_result = DocumentSearchResult(
             id="11111111-1111-1111-1111-111111111111",
@@ -238,6 +245,8 @@ class TestMCPResponseStructure:
         finally:
             if original_search_service is not None:
                 svc_module.SearchService = original_search_service
+            # FG 4-0 §2.1.6: ACL 게이트 복원
+            ActorContext.can_call_tool = original_can_call
 
         assert result.results[0].citation is not None
         assert result.results[0].citation.content_hash == citation.content_hash
@@ -332,7 +341,11 @@ class TestMCPSecurity:
             scope_filter_module.ScopeProfileRepository = original_repo
 
     def test_verify_citation_uses_chunk_source_text_hash(self):
-        """MCP verify_citation은 nodes.content가 아니라 chunk source_text를 기준으로 검증해야 한다."""
+        """MCP verify_citation은 nodes.content가 아니라 chunk source_text를 기준으로 검증해야 한다.
+
+        S3 Phase 4 FG 4-0 §2.1.6 (2026-04-28): 본 테스트는 citation hash 검증
+        목적이므로 tool-level ACL 게이트는 mock 으로 우회.
+        """
         from app.api.auth.models import ActorContext, ActorType
         from app.mcp.tools import tool_verify_citation
         from app.schemas.citation import Citation
@@ -346,6 +359,9 @@ class TestMCPSecurity:
             tenant_id=None,
             role="VIEWER",
         )
+        # FG 4-0 §2.1.6: ACL 게이트 우회 (본 테스트는 hash 검증 목적)
+        original_can_call = ActorContext.can_call_tool
+        ActorContext.can_call_tool = lambda self, tool_name, conn=None: True
         citation = Citation.from_chunk(
             "11111111-1111-1111-1111-111111111111",
             "22222222-2222-2222-2222-222222222222",
@@ -363,7 +379,10 @@ class TestMCPSecurity:
         cursor = MagicMock()
         cursor.__enter__.return_value = cursor
         cursor.__exit__.return_value = False
-        cursor.fetchone.side_effect = [{"id": str(citation.version_id)}]
+        # FG 4-3 (2026-04-28): version row 가 status="published" 를 포함해야 pinned 검사 통과.
+        cursor.fetchone.side_effect = [
+            {"id": str(citation.version_id), "status": "published"},
+        ]
         conn.cursor.return_value = cursor
 
         import app.mcp.tools as tools
@@ -379,5 +398,7 @@ class TestMCPSecurity:
             result = tool_verify_citation(request, actor, conn)
         finally:
             tools._fetch_accessible_chunk = original_fetch_chunk
+            # FG 4-0 §2.1.6: ACL 게이트 복원
+            ActorContext.can_call_tool = original_can_call
 
         assert result.verified is True

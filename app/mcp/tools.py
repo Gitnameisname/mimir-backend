@@ -47,6 +47,7 @@ def tool_search_documents(
     """search_documents 도구 — FTS/Hybrid 검색 + Scope ACL 적용."""
     start = time.monotonic()
     _check_agent_write_blocked(actor)
+    _check_tool_allowed(actor, "search_documents", conn=conn)
 
     from app.services.search_service import SearchService
     svc = SearchService()
@@ -158,6 +159,7 @@ def tool_fetch_node(
 ) -> FetchNodeData:
     """fetch_node 도구 — 특정 문서 노드 전문 조회."""
     _check_agent_write_blocked(actor)
+    _check_tool_allowed(actor, "fetch_node", conn=conn)
     acl_extra = _resolve_acl_filter(actor, None, request.access_context, conn)
     _ensure_document_allowed(conn, request.document_id, acl_extra)
     chunk_row = _fetch_accessible_chunk(
@@ -242,30 +244,68 @@ def tool_verify_citation(
     request: VerifyCitationRequest,
     actor: ActorContext,
     conn,
-) -> VerifyCitationData:
-    """verify_citation 도구 — Citation 5-tuple content_hash 검증."""
+):
+    """verify_citation 도구 — Citation 5중 검증 (S3 Phase 4 FG 4-3 강화).
+
+    검사 단계 (모두 통과해야 ``verified=True``):
+      1. **exists**: document/version/node 모두 존재
+      2. **pinned**: ``version_id`` 가 ``"latest"`` 가 아닌 구체값
+      3. **hash_matches**: ``citation_basis`` 에 따라 node_content 또는 rendered_text hash 비교
+      4. **quoted_text_in_content**: ``quoted_text`` 입력 시 정본 텍스트에 포함되는지 (None = 미입력)
+      5. **span_valid**: ``span_offset`` + ``span_length`` 입력 시 정본 텍스트 범위 내 (None = 미입력)
+
+    R3 강제: ``version_id="latest"`` 즉시 거부 (MCPError INVALID_PARAMS, HTTP 400).
+    """
+    from app.schemas.mcp import VerifyCitationChecks
+
     _check_agent_write_blocked(actor)
+    _check_tool_allowed(actor, "verify_citation", conn=conn)
+
+    # R3: latest 거부 — 도구 진입점에서 즉시 차단
+    if request.version_id == "latest":
+        raise MCPError(
+            MCPErrorCode.INVALID_REQUEST,
+            "verify_citation 은 pinned 버전(vN/UUID)만 수용합니다. 'latest' 는 인용 시점에 resolve 후 저장하세요.",
+            400,
+        )
+
     acl_extra = _resolve_acl_filter(actor, None, request.access_context, conn)
     _ensure_document_allowed(conn, request.document_id, acl_extra)
 
+    # 검사 1: 존재성 (version)
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT id FROM versions WHERE id = %s AND document_id = %s",
+            "SELECT id, status FROM versions WHERE id = %s AND document_id = %s",
             (request.version_id, request.document_id),
         )
-        version_valid = cur.fetchone() is not None
+        version_row = cur.fetchone()
+    version_exists = version_row is not None
+    version_status = version_row.get("status") if version_row else None
 
-    if not version_valid:
+    if not version_exists:
         _emit_audit("mcp.verify_citation", "mcp.tool.call", actor,
-                    metadata={"result": "version_not_found"})
+                    metadata={"result": "version_not_found", "verified": False})
         return VerifyCitationData(
             verified=False,
+            checks=VerifyCitationChecks(
+                exists=False, pinned=True, hash_matches=False,
+            ),
             current_hash=None,
             hash_matches=False,
-            content_snapshot=None,
             version_valid=False,
+            content_snapshot=None,
             message="버전이 유효하지 않습니다.",
         )
+
+    # 검사 2: pinned — 'latest' 거부 통과 + version 이 published 또는 archived (draft 가 아님)
+    # FG 4-3 의 pinned 정의: "draft 가 아닌 인용 가능 상태" (published 상태)
+    pinned = version_status in ("published", "archived")
+
+    # 검사 3 / 4 / 5: 정본 텍스트 + hash + 텍스트 포함 + span
+    text_for_check: str = ""
+    current_hash: Optional[str] = None
+    rendered_snapshot: Optional[str] = None
+    node_snapshot: Optional[str] = None
 
     chunk_row = _fetch_accessible_chunk(
         conn,
@@ -275,40 +315,130 @@ def tool_verify_citation(
         request.node_id,
         request.access_context,
     )
-    if not chunk_row:
-        _emit_audit("mcp.verify_citation", "mcp.tool.call", actor,
-                    metadata={"result": "node_not_found"})
-        return VerifyCitationData(
-            verified=False,
-            current_hash=None,
-            hash_matches=False,
-            content_snapshot=None,
-            version_valid=True,
-            message="노드를 찾을 수 없습니다.",
+
+    if request.citation_basis == "rendered_text":
+        # rendered_text 기반 — render_service 위임
+        try:
+            from app.repositories.versions_repository import VersionsRepository
+            from app.services.render_service import render_service
+
+            versions_repo = VersionsRepository()
+            version_obj = versions_repo.get_by_document_and_version_id(
+                conn, request.document_id, request.version_id
+            )
+            if version_obj is None:
+                rendered = ""
+            else:
+                rdoc = render_service.render_version(version_obj)
+                # FG 4-2 의 _walk_blocks_for_text 와 동일 패턴
+                rendered_text, _ = _walk_blocks_for_text(
+                    rdoc.blocks, format="plain_text", include_anchors=False,
+                )
+                rendered = rendered_text
+        except Exception as exc:
+            logger.warning("verify_citation rendered_text 계산 실패: %s", exc)
+            rendered = ""
+        text_for_check = rendered
+        current_hash = _compute_content_hash(rendered) if rendered else None
+        if request.span_offset is not None and rendered:
+            start = max(0, request.span_offset)
+            length = request.span_length if request.span_length else 200
+            rendered_snapshot = rendered[start: start + length]
+    else:
+        # node_content 기반 — 기존 동작 (chunk source_text)
+        if chunk_row is None:
+            _emit_audit("mcp.verify_citation", "mcp.tool.call", actor,
+                        metadata={"result": "node_not_found", "verified": False})
+            return VerifyCitationData(
+                verified=False,
+                checks=VerifyCitationChecks(
+                    exists=False, pinned=pinned, hash_matches=False,
+                ),
+                current_hash=None,
+                hash_matches=False,
+                version_valid=True,
+                content_snapshot=None,
+                message="노드를 찾을 수 없습니다.",
+            )
+        node_text = chunk_row.get("source_text") or ""
+        text_for_check = node_text
+        current_hash = _compute_content_hash(node_text)
+        if request.span_offset is not None and node_text:
+            start = max(0, request.span_offset)
+            length = request.span_length if request.span_length else 200
+            node_snapshot = node_text[start: start + length]
+
+    hash_matches = current_hash is not None and current_hash == request.content_hash
+
+    # 검사 4: 텍스트 포함
+    quoted_in: Optional[bool] = None
+    if request.quoted_text:
+        quoted_in = request.quoted_text in text_for_check
+
+    # 검사 5: span 유효성
+    span_valid: Optional[bool] = None
+    if request.span_offset is not None and request.span_length is not None:
+        span_end = request.span_offset + request.span_length
+        span_valid = (
+            request.span_offset >= 0
+            and request.span_length > 0
+            and span_end <= len(text_for_check)
         )
 
-    content = chunk_row.get("source_text") or ""
-    current_hash = _compute_content_hash(content)
-    hash_matches = current_hash == request.content_hash
+    # 종합: 강제 검사 (1/2/3) + 선택 검사 (4/5 — 입력 시 통과 필요)
+    verified = (
+        version_exists
+        and pinned
+        and hash_matches
+        and (quoted_in if quoted_in is not None else True)
+        and (span_valid if span_valid is not None else True)
+    )
 
-    # span_offset 기반 스니펫 추출 (선택)
-    snapshot: Optional[str] = None
-    if request.span_offset is not None and content:
-        start = max(0, request.span_offset)
-        snapshot = content[start: start + 200]
+    if verified:
+        message = "검증 성공."
+    elif not pinned:
+        message = "버전이 published 가 아닙니다 (draft 또는 unknown)."
+    elif not hash_matches:
+        message = "콘텐츠 해시가 일치하지 않습니다 — 문서가 수정되었을 수 있습니다."
+    elif quoted_in is False:
+        message = "인용된 텍스트가 본문에 포함되어 있지 않습니다."
+    elif span_valid is False:
+        message = "span_offset / span_length 가 본문 범위를 벗어났습니다."
+    else:
+        message = "검증 실패."
 
-    verified = version_valid and hash_matches
-
-    _emit_audit("mcp.verify_citation", "mcp.tool.call", actor,
-                metadata={"verified": verified, "hash_matches": hash_matches})
+    _emit_audit(
+        "mcp.verify_citation", "mcp.tool.call", actor,
+        metadata={
+            "verified": verified,
+            "citation_basis": request.citation_basis,
+            "checks": {
+                "exists": version_exists,
+                "pinned": pinned,
+                "hash_matches": hash_matches,
+                "quoted_text_in_content": quoted_in,
+                "span_valid": span_valid,
+            },
+        },
+    )
 
     return VerifyCitationData(
         verified=verified,
+        checks=VerifyCitationChecks(
+            exists=version_exists,
+            pinned=pinned,
+            hash_matches=hash_matches,
+            quoted_text_in_content=quoted_in,
+            span_valid=span_valid,
+        ),
         current_hash=current_hash,
+        rendered_snapshot=rendered_snapshot,
+        node_snapshot=node_snapshot,
+        # 백워드 호환 필드
+        content_snapshot=node_snapshot or rendered_snapshot,
         hash_matches=hash_matches,
-        content_snapshot=snapshot,
-        version_valid=version_valid,
-        message="검증 성공." if verified else "콘텐츠 해시가 일치하지 않습니다 — 문서가 수정되었을 수 있습니다.",
+        version_valid=version_exists,
+        message=message,
     )
 
 
@@ -329,6 +459,26 @@ def _check_agent_write_blocked(actor: ActorContext) -> None:
     # 읽기 도구이므로 킬스위치는 쓰기에만 적용 (Phase 5에서 쓰기 도구 추가 시 활용)
     # 현재는 AGENT가 비활성 상태면 인증 단계에서 이미 차단됨
     pass
+
+
+def _check_tool_allowed(actor: ActorContext, tool_name: str, conn=None) -> None:
+    """ScopeProfile.allowed_tools 게이트 — 에이전트가 본 도구 호출 허가받았는가.
+
+    S3 Phase 4 FG 4-0 §2.1.6 (2026-04-28). task3-3.md §[129,223–225,318] 흡수.
+    모든 MCP `tool_*` 진입점 첫 줄 (`_check_agent_write_blocked` 다음) 에서 호출.
+
+    - actor_type ≠ AGENT → 통과 (사람/시스템 호출은 본 게이트 비대상; 별 게이트가 처리).
+    - actor_type == AGENT 이고 ScopeProfile.allowed_tools 에 ``tool_name`` 포함 → 통과.
+    - 외 모든 경우 → ``MCPError(UNAUTHORIZED, 403)``.
+
+    ``conn`` 전달 시 동일 트랜잭션에서 ScopeProfile 조회 (성능 + 일관성).
+    """
+    if not actor.can_call_tool(tool_name, conn=conn):
+        raise MCPError(
+            MCPErrorCode.UNAUTHORIZED,
+            f"본 ScopeProfile 은 도구 '{tool_name}' 을 허용하지 않습니다.",
+            403,
+        )
 
 
 def _resolve_acl_filter(
@@ -467,6 +617,7 @@ def tool_vectorization_status(
       - last_error 는 내부 호스트 정보 노출을 피하기 위해 **요약 코드만** 노출.
     """
     _check_agent_write_blocked(actor)
+    _check_tool_allowed(actor, "mimir.vectorization.status", conn=conn)
 
     # 최소 유효성 — UUID 형식 점검
     import re
@@ -565,6 +716,7 @@ def tool_read_annotations(
     from app.services.annotations_service import annotations_service as _ann_svc
 
     _check_agent_write_blocked(actor)
+    _check_tool_allowed(actor, "read_annotations", conn=conn)
 
     # UUID 기본 검증
     import re
@@ -646,4 +798,438 @@ def tool_read_annotations(
             for a in items
         ],
         truncated=(len(items) >= request.limit),
+    )
+
+
+# ===========================================================================
+# S3 Phase 4 FG 4-2 (2026-04-28) — 신규 read 도구 3종
+# ===========================================================================
+
+# --------------------------------------------------------------------------- #
+# search_nodes — 노드 단위 검색
+# --------------------------------------------------------------------------- #
+
+
+def tool_search_nodes(request, actor: ActorContext, conn):
+    """search_nodes 도구 — 노드 그래뉼래리티 검색.
+
+    SearchService.search_nodes 위임 + ScopeProfile ACL post-filter +
+    document_ids / node_kinds Python post-filter + content_hash 부착.
+    """
+    from app.schemas.mcp import SearchNodeItem, SearchNodesData
+    from app.services.search_service import SearchService
+
+    _check_agent_write_blocked(actor)
+    _check_tool_allowed(actor, "search_nodes", conn=conn)
+
+    # ScopeProfile ACL — search_documents 와 동일 패턴
+    acl_extra = _resolve_acl_filter(actor, request.scope, request.access_context, conn)
+    allowed_doc_ids: Optional[set] = None
+    if acl_extra.get("sql") and acl_extra.get("params") is not None:
+        allowed_doc_ids = _fetch_allowed_doc_ids(conn, acl_extra)
+
+    # 단일 document_id 가 주어지면 SQL 필터로 좁힘 — 외 SQL 무필터 후 Python 후처리
+    single_doc = (
+        request.document_ids[0]
+        if request.document_ids and len(request.document_ids) == 1
+        else None
+    )
+
+    svc = SearchService()
+    try:
+        # oversample 후 post-filter — top_k * 2, max 100
+        oversample_limit = min(max(request.top_k * 2, request.top_k), 100)
+        raw = svc.search_nodes(
+            conn=conn,
+            q=request.query,
+            document_id=single_doc,
+            actor_role=actor.role,
+            limit=oversample_limit,
+        )
+    except Exception as exc:
+        logger.error("mcp.search_nodes failed: %s", exc)
+        raise MCPError(MCPErrorCode.INTERNAL_ERROR, f"검색 오류: {exc}", 500)
+
+    raw_items = raw.results if hasattr(raw, "results") else (raw or [])
+    requested_doc_ids = set(request.document_ids or [])
+    requested_kinds = set(request.node_kinds or [])
+
+    items: list[SearchNodeItem] = []
+    total_matched = len(raw_items)
+    for node in raw_items:
+        doc_id = str(getattr(node, "document_id", "") or "")
+        if not doc_id:
+            continue
+        # ScopeProfile ACL
+        if allowed_doc_ids is not None and doc_id not in allowed_doc_ids:
+            continue
+        # document_ids 다중 필터 (단일은 SQL 단계에서 이미 적용)
+        if requested_doc_ids and doc_id not in requested_doc_ids:
+            continue
+        # node_kinds 필터
+        node_kind = str(getattr(node, "node_type", "") or "")
+        if requested_kinds and node_kind not in requested_kinds:
+            continue
+        node_id = str(getattr(node, "node_id", "") or "")
+        version_id = str(getattr(node, "version_id", "") or "") or None
+        snippet = str(
+            getattr(node, "content_snippet", "")
+            or getattr(node, "title", "")
+            or ""
+        )
+        score = float(getattr(node, "rank", 0) or 0.0)
+        items.append(
+            SearchNodeItem(
+                document_id=doc_id,
+                version_id=version_id,
+                node_id=node_id,
+                node_kind=node_kind,
+                snippet=snippet,
+                score=score,
+                content_hash=_compute_content_hash(snippet),
+            )
+        )
+        if len(items) >= request.top_k:
+            break
+
+    truncated_at = request.top_k if total_matched > request.top_k else None
+
+    _emit_audit(
+        event_type="mcp.search_nodes",
+        action="mcp.tool.call",
+        actor=actor,
+        metadata={"query": request.query[:100], "items": len(items)},
+    )
+
+    return SearchNodesData(
+        items=items,
+        total_matched=total_matched,
+        truncated_at=truncated_at,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# read_document_render — 렌더링 텍스트 + node_anchors + render_hash
+# --------------------------------------------------------------------------- #
+
+
+def _walk_blocks_for_text(
+    blocks,
+    *,
+    format: str,
+    include_anchors: bool,
+):
+    """RenderBlock 트리를 walk 하여 (rendered_text, node_anchors) 반환.
+
+    format: 'plain_text' (단순 텍스트 + 줄바꿈) 또는 'markdown' (heading/list 보존).
+    """
+    parts: list[str] = []
+    anchors: list = []
+    cursor = 0
+
+    def _emit_node(node_id: str, text: str) -> None:
+        nonlocal cursor
+        if not text:
+            return
+        if include_anchors and node_id:
+            anchors.append({
+                "node_id": node_id,
+                "offset_start": cursor,
+                "offset_end": cursor + len(text),
+            })
+        parts.append(text)
+        cursor += len(text)
+
+    def _emit_separator(sep: str) -> None:
+        nonlocal cursor
+        parts.append(sep)
+        cursor += len(sep)
+
+    def _g(b, key: str, default=None):
+        """dict / object 양쪽에서 안전하게 속성 추출."""
+        if isinstance(b, dict):
+            return b.get(key, default)
+        return getattr(b, key, default)
+
+    def _walk(items):
+        for b in items or []:
+            block_type = _g(b, "block_type", "")
+            block_id = _g(b, "block_id", "")
+            content = _g(b, "content")
+            heading_level = _g(b, "heading_level")
+            ordered = _g(b, "ordered")
+            children = _g(b, "children") or []
+            text = str(content or "")
+            if format == "markdown":
+                if block_type == "heading":
+                    level = int(heading_level or 1)
+                    rendered = ("#" * max(1, min(6, level))) + " " + text + "\n"
+                elif block_type == "list_item":
+                    bullet = "- " if not ordered else "1. "
+                    rendered = bullet + text + "\n"
+                elif block_type == "paragraph":
+                    rendered = text + "\n"
+                elif block_type == "quote":
+                    rendered = "> " + text + "\n"
+                elif block_type in ("section", "appendix"):
+                    rendered = "## " + text + "\n" if text else ""
+                else:
+                    rendered = text + ("\n" if text else "")
+            else:
+                rendered = text + ("\n" if text else "")
+            _emit_node(block_id, rendered)
+            if children:
+                _walk(children)
+
+    _walk(blocks)
+    if format == "markdown":
+        # 트레일링 줄바꿈 정리
+        text = "".join(parts).rstrip("\n") + "\n"
+    else:
+        text = "".join(parts).rstrip("\n")
+    # cursor 와 text length 가 일치해야 anchors 가 유효
+    if len(text) != cursor:
+        # rstrip 으로 길이가 줄었을 때 anchors 가 텍스트 끝을 넘으면 클램프
+        anchors = [
+            {**a, "offset_end": min(a["offset_end"], len(text)), "offset_start": min(a["offset_start"], len(text))}
+            for a in anchors
+        ]
+    return text, anchors
+
+
+def tool_read_document_render(request, actor: ActorContext, conn):
+    """read_document_render 도구 — 렌더링 텍스트 + node_anchors + render_hash.
+
+    R3 (pinned): version_id='latest' 입력 시 즉시 vN 으로 resolve.
+    응답의 version_id 는 항상 구체 (UUID).
+    """
+    from app.schemas.mcp import NodeAnchor, ReadDocumentRenderData
+    from app.mcp.uri_builder import resolve_version_id
+    from app.services.render_service import render_service
+    from app.repositories.versions_repository import VersionsRepository
+
+    _check_agent_write_blocked(actor)
+    _check_tool_allowed(actor, "read_document_render", conn=conn)
+
+    # ACL — fetch_node 와 동일 (document.read 재검증)
+    acl_extra = _resolve_acl_filter(actor, None, request.access_context, conn)
+    _ensure_document_allowed(conn, request.document_id, acl_extra)
+
+    # version 결정 — 'latest' 또는 None 이면 published 로 resolve
+    resolved_version_id = resolve_version_id(conn, request.document_id, request.version_id)
+    if not resolved_version_id:
+        raise not_found(f"문서 {request.document_id} 의 published 버전을 찾을 수 없습니다.")
+
+    # version 객체 조회
+    versions_repo = VersionsRepository()
+    version = versions_repo.get_by_document_and_version_id(
+        conn, request.document_id, resolved_version_id
+    )
+    if version is None:
+        raise not_found(f"버전을 찾을 수 없습니다: {resolved_version_id}")
+
+    # render
+    try:
+        rendered_doc = render_service.render_version(version)
+    except Exception as exc:
+        logger.error("mcp.read_document_render failed: %s", exc)
+        raise MCPError(MCPErrorCode.INTERNAL_ERROR, f"렌더링 오류: {exc}", 500)
+
+    # blocks → text + anchors
+    rendered_text, anchors_dicts = _walk_blocks_for_text(
+        rendered_doc.blocks,
+        format=request.format,
+        include_anchors=request.include_node_anchors,
+    )
+    render_hash = _compute_content_hash(rendered_text)
+
+    _emit_audit(
+        event_type="mcp.read_document_render",
+        action="mcp.tool.call",
+        actor=actor,
+        metadata={
+            "document_id": request.document_id,
+            "version_id": resolved_version_id,
+            "format": request.format,
+            "len": len(rendered_text),
+        },
+    )
+
+    return ReadDocumentRenderData(
+        document_id=request.document_id,
+        version_id=resolved_version_id,
+        format=request.format,
+        rendered_text=rendered_text,
+        render_hash=render_hash,
+        node_anchors=[NodeAnchor(**a) for a in anchors_dicts] if request.include_node_anchors else [],
+    )
+
+
+# --------------------------------------------------------------------------- #
+# resolve_document_reference — 자연어 → document_id + version_ref
+# --------------------------------------------------------------------------- #
+
+
+def tool_resolve_document_reference(request, actor: ActorContext, conn):
+    """resolve_document_reference 도구 — 5단계 해소.
+
+    R3 보장: version_ref 는 'vN' 또는 'latest_published' — 'latest' 단독 절대 미반환.
+    """
+    from app.schemas.mcp import ResolveCandidate, ResolveDocumentReferenceData
+    from app.services.document_resolver_service import resolve_reference
+
+    _check_agent_write_blocked(actor)
+    _check_tool_allowed(actor, "resolve_document_reference", conn=conn)
+
+    # ScopeProfile ACL — 후보가 통과 문서만으로
+    acl_extra = _resolve_acl_filter(actor, request.scope, request.access_context, conn)
+    allowed_doc_ids: Optional[set] = None
+    if acl_extra.get("sql") and acl_extra.get("params") is not None:
+        allowed_doc_ids = _fetch_allowed_doc_ids(conn, acl_extra)
+
+    recent = []
+    if request.context and request.context.recent_document_ids:
+        recent = list(request.context.recent_document_ids)
+
+    result = resolve_reference(
+        conn,
+        request.reference,
+        recent_document_ids=recent,
+        preferred_doc_types=request.preferred_doc_types,
+        max_candidates=request.max_candidates,
+        confidence_threshold=request.confidence_threshold,
+        allowed_doc_ids=allowed_doc_ids,
+    )
+
+    def _to_schema(c):
+        return ResolveCandidate(
+            document_id=c.document_id,
+            version_ref=c.version_ref,
+            title=c.title,
+            confidence=c.confidence,
+            match_kind=c.match_kind,
+        )
+
+    _emit_audit(
+        event_type="mcp.resolve_document_reference",
+        action="mcp.tool.call",
+        actor=actor,
+        metadata={
+            "reference": request.reference[:100],
+            "resolved": result.resolved,
+            "candidates": len(result.candidates),
+        },
+    )
+
+    return ResolveDocumentReferenceData(
+        resolved=result.resolved,
+        needs_disambiguation=result.needs_disambiguation,
+        best_match=_to_schema(result.best_match) if result.best_match else None,
+        candidates=[_to_schema(c) for c in result.candidates],
+    )
+
+
+# ===========================================================================
+# S3 Phase 4 FG 4-6 (2026-04-28) — L2 write 도구 (save_draft)
+# MCP 표면 최초 쓰기 도구. propose 만 — 사람 reviewer 승인 후 별도 trigger 로 머지.
+# 4 사전 조건: idempotency / human approval / impact preview / 감사 로그 4종.
+# ===========================================================================
+
+
+def tool_save_draft(request, actor: ActorContext, conn):
+    """save_draft 도구 — L2 propose 전용 (자동 머지 0).
+
+    R3 / R4 보존. R1 (L4 차단) 그대로 — 본 도구는 L2 (가역).
+    propose 만 — agent 가 self-approve 불가 (agent_proposal_service 가 검사).
+    """
+    from app.schemas.mcp import (
+        DraftImpactPreview,
+        SaveDraftData,
+        SaveDraftRequest,
+    )
+    from app.services.agent_proposal_service import agent_proposal_service
+
+    _check_agent_write_blocked(actor)
+    _check_tool_allowed(actor, "save_draft", conn=conn)
+
+    # ACL: 다른 scope 의 문서에 draft 못 만듦 (기존 문서 케이스만)
+    if request.document_id:
+        acl_extra = _resolve_acl_filter(actor, request.scope, request.access_context, conn)
+        _ensure_document_allowed(conn, request.document_id, acl_extra)
+
+    # FG 4-6 §2.1.3: impact preview 사전 계산
+    impact_dict = agent_proposal_service.compute_draft_impact(
+        conn,
+        document_id=request.document_id,
+        content_snapshot=request.content_snapshot,
+    )
+    impact = DraftImpactPreview(**impact_dict)
+
+    # FG 4-6 §2.1.5: idempotent propose
+    # agent_id 는 actor.agent_id (None 이면 actor.actor_id fallback)
+    agent_id = actor.agent_id or actor.actor_id
+    if agent_id is None:
+        raise MCPError(
+            MCPErrorCode.UNAUTHORIZED,
+            "save_draft 는 agent_id 가 식별된 actor 만 사용 가능합니다.",
+            403,
+        )
+
+    try:
+        result = agent_proposal_service.propose_draft(
+            conn,
+            agent_id=agent_id,
+            acting_on_behalf_of=actor.acting_on_behalf_of,
+            document_id=request.document_id,
+            document_type_id=request.document_type_id,
+            title=request.title,
+            content="",  # content_snapshot 우선
+            content_snapshot=request.content_snapshot,
+            metadata=request.metadata or {},
+            reason=request.reason or "agent draft proposal (FG 4-6)",
+            idempotency_key=request.idempotency_key,
+        )
+    except Exception as exc:
+        from app.api.errors.exceptions import (
+            ApiConflictError,
+            ApiNotFoundError,
+            ApiPermissionDeniedError,
+        )
+        if isinstance(exc, ApiNotFoundError):
+            raise MCPError(MCPErrorCode.NOT_FOUND, str(exc), 404)
+        if isinstance(exc, ApiPermissionDeniedError):
+            raise MCPError(MCPErrorCode.UNAUTHORIZED, str(exc), 403)
+        if isinstance(exc, ApiConflictError):
+            raise MCPError(MCPErrorCode.INVALID_REQUEST, str(exc), 409)
+        logger.error("mcp.save_draft failed: %s", exc)
+        raise MCPError(MCPErrorCode.INTERNAL_ERROR, f"draft 제안 오류: {exc}", 500)
+
+    # FG 4-6 §2.1.4: 감사 로그 — agent_proposal.requested
+    _emit_audit(
+        event_type="agent_proposal.requested",
+        action="mcp.save_draft",
+        actor=actor,
+        metadata={
+            "document_id": result.get("document_id"),
+            "version_id": result.get("version_id"),
+            "proposal_id": result.get("draft_id"),
+            "idempotency_key": request.idempotency_key,
+            "idempotent_replay": result.get("idempotent_replay", False),
+            "impact": impact_dict,
+        },
+    )
+
+    return SaveDraftData(
+        proposal_id=result.get("draft_id") or "",
+        status=result.get("status") or "proposed",
+        document_id=result.get("document_id") or "",
+        version_id=result.get("version_id") or "",
+        impact=impact,
+        requires_human_approval=True,
+        audit_event="agent_proposal.requested",
+        message=(
+            "기존 draft 와 동일 (idempotent replay) — reviewer approval 대기."
+            if result.get("idempotent_replay")
+            else "draft 가 제안되었습니다. reviewer approval 후 적용됩니다."
+        ),
     )

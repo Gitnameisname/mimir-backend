@@ -4007,3 +4007,45 @@ def set_prompt_ab_test(
     prompt_dict = dict(prompt)
     prompt_dict["active_version_number"] = ver_row["version_number"] if ver_row else None
     return success_response(data=_prompt_row(prompt_dict))
+
+
+# ===========================================================================
+# S3 Phase 4 FG 4-5 (2026-04-28) — MCP 도구 manifest (운영자 전용)
+# ===========================================================================
+
+
+@router.get(
+    "/mcp/manifest",
+    summary="MCP 도구 전체 manifest 조회 (운영자 전용)",
+)
+def admin_mcp_manifest(
+    actor: ActorContext = Depends(resolve_current_actor),
+):
+    """8 MCP 도구의 전체 manifest 를 반환 — `default_enabled` / `policy_profile` 등
+    운영자 전용 필드 포함.
+
+    Admin UI 가 동적 fetch 하여 `KNOWN_MCP_TOOLS` 정적 상수 제거 (FG 4-0 §7 #6 후속).
+    """
+    authorization_service.authorize(
+        actor=actor,
+        action="admin.read",
+        resource=ResourceRef(resource_type="admin"),
+        require_authenticated=True,
+    )
+    from app.schemas.mcp import (
+        MIMIR_EXTENSIONS,
+        TOOL_SCHEMAS,
+        is_tool_mcp_exposed,
+        mcp_admin_full_view,
+    )
+
+    tools = [
+        {**mcp_admin_full_view(s), "is_mcp_exposed": is_tool_mcp_exposed(s)}
+        for s in TOOL_SCHEMAS
+    ]
+    return success_response(
+        data={
+            "tools": tools,
+            "extensions": MIMIR_EXTENSIONS,
+        }
+    )

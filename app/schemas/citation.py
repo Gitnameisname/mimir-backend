@@ -1,22 +1,34 @@
 """
-Citation 5-tuple 스키마 — Phase 2 FG2.1
+Citation 5-tuple 스키마 — Phase 2 FG2.1 / S3 Phase 4 FG 4-3 갱신.
 
 검색 결과의 근거를 검증 가능한 좌표로 표준화한다.
 
 S1 rag.Citation (index, chunk_id, ...)과 이름이 같지만 별도 모듈이므로 충돌 없음.
 S2 클라이언트는 이 모듈을 사용하고, S1 클라이언트는 schemas.rag.Citation을 그대로 사용.
+
+S3 Phase 4 FG 4-3 (2026-04-28): ``citation_basis`` 필드 신설 — node_content vs rendered_text 분기.
+Disagreement Record (`docs/disagreements/2026-04-28-fg43-citations-table-absence.md`):
+``citations`` 테이블 부재로 작업지시서의 Alembic 마이그레이션은 미적용. 본 모델만 갱신.
 """
 from __future__ import annotations
 
 import hashlib
-from typing import Optional
+from typing import Literal, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, Field
 
 
+CitationBasis = Literal["node_content", "rendered_text"]
+"""Citation 의 정본 텍스트 원천.
+
+- ``node_content``: 청크 / 노드 본문 (``document_chunks.source_text``) 기준
+- ``rendered_text``: 렌더링된 텍스트 (FG 4-2 ``read_document_render``) 기준
+"""
+
+
 class Citation(BaseModel):
-    """검색 결과의 검증 가능한 위치 좌표 (5-tuple).
+    """검색 결과의 검증 가능한 위치 좌표 (5-tuple + basis).
 
     Attributes:
         document_id: 근거 문서 UUID
@@ -24,6 +36,7 @@ class Citation(BaseModel):
         node_id: 문서 내 섹션 UUID (위치 추적)
         span_offset: 청크 내 문자 오프셋 — 단락 단위 인용 시 None
         content_hash: SHA-256(청크 원문) — 내용 변조 감지용
+        citation_basis: 정본 텍스트 종류 (S3 Phase 4 FG 4-3 신설). default ``node_content``.
     """
 
     document_id: UUID
@@ -31,6 +44,7 @@ class Citation(BaseModel):
     node_id: UUID
     span_offset: Optional[int] = Field(None, ge=0)
     content_hash: str = Field(..., min_length=64, max_length=64)
+    citation_basis: CitationBasis = "node_content"
 
     model_config = {"frozen": True}
 

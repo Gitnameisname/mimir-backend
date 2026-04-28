@@ -61,17 +61,31 @@ class AgentProposalService:
         document_id: Optional[str],
         document_type_id: Optional[str],
         title: Optional[str],
-        content: str,
+        content: str = "",
+        content_snapshot: Optional[dict[str, Any]] = None,
         metadata: dict[str, Any],
         reason: str,
         request_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> dict[str, Any]:
         """에이전트가 proposed 상태의 Draft를 생성한다.
 
         새 문서(document_id=None) 또는 기존 문서(document_id 지정) 모두 지원.
         생성된 Version의 workflow_status는 항상 'proposed'.
+
+        S3 Phase 4 FG 4-6 (2026-04-28): 신규 인자
+            content_snapshot: ProseMirror doc 표준 dict (snapshot 단일 정본).
+                              명시 입력 시 ``content`` 의 prosemirror_from_text 변환 skip.
+            idempotency_key: 같은 ``(agent_id, idempotency_key)`` 재호출 시 같은 proposal 반환.
+                             ``None`` 이면 매번 새 INSERT (기존 동작).
         """
         self._assert_agent_active(conn, agent_id)
+
+        # FG 4-6 §2.1.2: idempotency 사전 검사 — 같은 (agent, key) 가 이미 있으면 재사용
+        if idempotency_key:
+            existing = self._lookup_idempotent_proposal(conn, agent_id, idempotency_key)
+            if existing is not None:
+                return existing
 
         # 새 문서 생성인 경우 document 레코드 먼저 생성
         if document_id is None:
@@ -95,8 +109,11 @@ class AgentProposalService:
         # Phase 1 FG 1-1: content_snapshot 은 ProseMirror doc 표준 포맷이어야 한다.
         # 과거 ``{type:"text", content: ...}`` 는 비표준이라 schemas/versions.py
         # validator 를 통과하지 못한다. snapshot_sync_service 로 표준 변환.
-        from app.services.snapshot_sync_service import prosemirror_from_text
-        content_snapshot = prosemirror_from_text(content)
+        # FG 4-6 (2026-04-28): content_snapshot 명시 입력 시 변환 skip — tool_save_draft 가
+        # ProseMirror dict 를 직접 전달.
+        if content_snapshot is None:
+            from app.services.snapshot_sync_service import prosemirror_from_text
+            content_snapshot = prosemirror_from_text(content)
 
         # Version 생성 (workflow_status = proposed)
         version_id = str(uuid.uuid4())
@@ -160,16 +177,17 @@ class AgentProposalService:
             agent_id=agent_id,
         )
 
-        # agent_proposals 통합 큐에 등록 (FG5.2)
+        # agent_proposals 통합 큐에 등록 (FG5.2 + FG 4-6 idempotency_key)
         proposal_queue_id = str(uuid.uuid4())
         with conn.cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO agent_proposals
-                    (id, agent_id, proposal_type, reference_id, status, created_at, updated_at)
-                VALUES (%s, %s, 'draft', %s, 'pending', %s, %s)
+                    (id, agent_id, proposal_type, reference_id, status,
+                     idempotency_key, created_at, updated_at)
+                VALUES (%s, %s, 'draft', %s, 'pending', %s, %s, %s)
                 """,
-                (proposal_queue_id, agent_id, version_id, now, now),
+                (proposal_queue_id, agent_id, version_id, idempotency_key, now, now),
             )
 
         # 감사 로그
@@ -807,6 +825,186 @@ class AgentProposalService:
                 )
         except Exception as exc:
             logger.warning("acting_on_behalf_of 역기록 실패: %s", exc)
+
+    # ------------------------------------------------------------------
+    # S3 Phase 4 FG 4-6 (2026-04-28) — idempotency + impact preview
+    # ------------------------------------------------------------------
+
+    def _lookup_idempotent_proposal(
+        self,
+        conn: psycopg2.extensions.connection,
+        agent_id: str,
+        idempotency_key: str,
+    ) -> Optional[dict[str, Any]]:
+        """``(agent_id, idempotency_key)`` 로 기존 proposal 조회.
+
+        Returns:
+            기존 proposal 의 propose_draft 반환 형태와 동일한 dict,
+            또는 None (해당 key 부재).
+
+        FG 4-6: 같은 key 재호출 시 새 INSERT 없이 같은 결과 보장.
+        """
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT ap.id AS proposal_id, ap.reference_id AS version_id,
+                       ap.status, ap.created_at,
+                       v.document_id, v.workflow_status
+                FROM agent_proposals ap
+                LEFT JOIN versions v ON v.id = ap.reference_id
+                WHERE ap.agent_id = %s
+                  AND ap.idempotency_key = %s
+                  AND ap.proposal_type = 'draft'
+                LIMIT 1
+                """,
+                (agent_id, idempotency_key),
+            )
+            row = cur.fetchone()
+        if row is None:
+            return None
+        return {
+            "draft_id": str(row["version_id"]),
+            "status": row.get("workflow_status") or "proposed",
+            "created_by_agent": True,
+            "created_at": row["created_at"],
+            "document_id": str(row["document_id"]) if row.get("document_id") else None,
+            "version_id": str(row["version_id"]),
+            "proposal_url": f"/documents/{row['document_id']}/versions/{row['version_id']}",
+            "mcp_task_id": None,  # 기존 proposal — 이미 큐에 있음
+            "idempotent_replay": True,
+        }
+
+    def compute_draft_impact(
+        self,
+        conn: psycopg2.extensions.connection,
+        *,
+        document_id: Optional[str],
+        content_snapshot: dict[str, Any],
+    ) -> dict[str, Any]:
+        """save_draft 적용 시 발생할 영향 사전 계산 (FG 4-6 §2.1.3).
+
+        실제 DB 변경 없이 diff 만 산출. 신규 문서 (document_id=None) 와 기존 문서를
+        구분하여 다음을 반환:
+
+        - ``target_version_id``: 기존 draft 가 있으면 그 id, 없으면 None
+        - ``overwrites_existing_draft``: 기존 draft 덮어쓸지
+        - ``nodes_added`` / ``nodes_modified`` / ``nodes_deleted``: ProseMirror 노드 수 차이
+        - ``chars_added`` / ``chars_removed``: 텍스트 길이 차이
+        - ``summary``: 자연어 요약
+
+        본 FG (1라운드 experimental) 는 단순 차이만 — 정밀 NodeDiff 는 별 라운드.
+        """
+        new_text = self._extract_text_from_snapshot(content_snapshot)
+        new_node_count = self._count_nodes(content_snapshot)
+
+        target_version_id: Optional[str] = None
+        existing_text = ""
+        existing_node_count = 0
+        overwrites = False
+
+        if document_id:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, content_snapshot
+                    FROM versions
+                    WHERE document_id = %s AND status = 'draft'
+                    ORDER BY version_number DESC
+                    LIMIT 1
+                    """,
+                    (document_id,),
+                )
+                row = cur.fetchone()
+            if row is not None:
+                target_version_id = str(row["id"])
+                overwrites = True
+                snap = row.get("content_snapshot")
+                if isinstance(snap, str):
+                    try:
+                        snap = json.loads(snap)
+                    except Exception:
+                        snap = None
+                if isinstance(snap, dict):
+                    existing_text = self._extract_text_from_snapshot(snap)
+                    existing_node_count = self._count_nodes(snap)
+
+        chars_added = max(0, len(new_text) - len(existing_text))
+        chars_removed = max(0, len(existing_text) - len(new_text))
+        node_delta = new_node_count - existing_node_count
+
+        # 단순화: 본 FG 는 모든 변화를 added/deleted 로 처리. 정밀 NodeDiff 는 별 라운드.
+        nodes_added = max(0, node_delta) if node_delta >= 0 else 0
+        nodes_deleted = max(0, -node_delta) if node_delta < 0 else 0
+        nodes_modified = min(new_node_count, existing_node_count) if existing_node_count else 0
+
+        if document_id is None:
+            summary = f"신규 문서 생성 — 노드 {new_node_count}개, 본문 {len(new_text)}자."
+        elif overwrites:
+            summary = (
+                f"기존 draft 덮어쓰기 — 노드 {existing_node_count} → {new_node_count}, "
+                f"본문 길이 {len(existing_text)} → {len(new_text)}자 (+{chars_added}/-{chars_removed})."
+            )
+        else:
+            summary = (
+                f"신규 draft 생성 (기존 published 문서) — 노드 {new_node_count}개, "
+                f"본문 {len(new_text)}자."
+            )
+
+        return {
+            "document_id": document_id,
+            "target_version_id": target_version_id,
+            "overwrites_existing_draft": overwrites,
+            "nodes_added": nodes_added,
+            "nodes_modified": nodes_modified,
+            "nodes_deleted": nodes_deleted,
+            "chars_added": chars_added,
+            "chars_removed": chars_removed,
+            "summary": summary,
+        }
+
+    @staticmethod
+    def _extract_text_from_snapshot(snapshot: dict[str, Any]) -> str:
+        """ProseMirror snapshot → 평문 (text 합산). 단순 walker — 본 FG 의 impact 산출용."""
+        if not isinstance(snapshot, dict):
+            return ""
+        parts: list[str] = []
+
+        def _walk(node: Any) -> None:
+            if isinstance(node, dict):
+                t = node.get("text")
+                if isinstance(t, str):
+                    parts.append(t)
+                children = node.get("content") or node.get("children") or []
+                for c in children:
+                    _walk(c)
+            elif isinstance(node, list):
+                for c in node:
+                    _walk(c)
+
+        _walk(snapshot)
+        return "".join(parts)
+
+    @staticmethod
+    def _count_nodes(snapshot: dict[str, Any]) -> int:
+        """ProseMirror snapshot 의 block 노드 수 (root 'document' 제외)."""
+        if not isinstance(snapshot, dict):
+            return 0
+        count = 0
+
+        def _walk(node: Any, is_root: bool = False) -> None:
+            nonlocal count
+            if isinstance(node, dict):
+                if not is_root:
+                    count += 1
+                children = node.get("content") or node.get("children") or []
+                for c in children:
+                    _walk(c, is_root=False)
+            elif isinstance(node, list):
+                for c in node:
+                    _walk(c, is_root=False)
+
+        _walk(snapshot, is_root=True)
+        return count
 
 
 agent_proposal_service = AgentProposalService()

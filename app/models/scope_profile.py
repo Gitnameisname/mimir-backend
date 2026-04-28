@@ -96,3 +96,8 @@ class ScopeProfile:
     scopes: list[ScopeDefinition] = field(default_factory=list)
     # S3 Phase 3 FG 3-2 (2026-04-27): 운영 설정 (viewers 노출 등). default 빈 settings.
     settings: ScopeProfileSettings = field(default_factory=ScopeProfileSettings)
+    # S3 Phase 4 FG 4-0 §2.1.6 (2026-04-28): MCP tool-level ACL 화이트리스트.
+    # task3-3.md §[129,223–225,318] 흡수 — read_annotations 뿐 아니라 모든 MCP tool 게이트.
+    # 빈 배열 = default-deny (운영자 명시 등록 전까지 모든 도구 거부).
+    # 등록 가능 도구: `app.schemas.mcp.known_tool_names()` 만 (manifest 정합).
+    allowed_tools: list[str] = field(default_factory=list)

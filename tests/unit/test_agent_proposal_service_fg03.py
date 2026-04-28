@@ -48,6 +48,10 @@ class _CursorStub:
         self._fetchone = fetchone_queue
         self._fetchall = fetchall_queue
         self.execute_calls = []
+        # FG 3-3 (annotations_repository.mark_orphans) 가 cur.rowcount 를 읽음.
+        # 0 이면 "live 노드와 일치하는 annotation 없음" 시맨틱 — agent_proposal
+        # 시나리오 (annotation 이 없는 신규/기존 문서) 에 안전한 기본값.
+        self.rowcount = 0
 
     def __enter__(self):
         return self

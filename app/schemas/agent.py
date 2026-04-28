@@ -47,6 +47,15 @@ class ScopeProfileResponse(BaseModel):
     settings: "ScopeProfileSettingsSchema" = Field(
         default_factory=lambda: ScopeProfileSettingsSchema()
     )
+    # S3 Phase 4 FG 4-0 §2.1.6 (2026-04-28): MCP tool-level ACL 화이트리스트
+    allowed_tools: list[str] = Field(
+        default_factory=list,
+        description=(
+            "에이전트가 호출 가능한 MCP 도구 화이트리스트. "
+            "빈 배열 = default-deny (모든 도구 거부). "
+            "등록 가능: app.schemas.mcp.known_tool_names()"
+        ),
+    )
 
 
 # S3 Phase 3 FG 3-2 (2026-04-27)
@@ -71,6 +80,14 @@ class ScopeProfileCreate(BaseModel):
         default=None,
         description="운영 설정. 미지정 시 모든 키 default(보수적)로 채워짐.",
     )
+    # S3 Phase 4 FG 4-0 §2.1.6 (2026-04-28): 신규 profile 생성 시 allowed_tools 지정 (옵셔널)
+    allowed_tools: Optional[list[str]] = Field(
+        default=None,
+        description=(
+            "MCP tool 호출 화이트리스트. 미지정 / 빈 배열 = default-deny. "
+            "known_tool_names() 외 도구 이름은 422."
+        ),
+    )
 
 
 class ScopeProfileUpdate(BaseModel):
@@ -80,6 +97,15 @@ class ScopeProfileUpdate(BaseModel):
     settings: Optional[ScopeProfileSettingsSchema] = Field(
         default=None,
         description="settings 부분 갱신. 명시된 키만 반영, 미지의 키는 raw 보존.",
+    )
+    # S3 Phase 4 FG 4-0 §2.1.6 (2026-04-28): allowed_tools 전체 교체 (PUT 시맨틱)
+    allowed_tools: Optional[list[str]] = Field(
+        default=None,
+        description=(
+            "MCP tool 화이트리스트 전체 교체. None = 미수정. "
+            "빈 배열 [] = default-deny 로 재설정. "
+            "known_tool_names() 외 도구 이름은 422."
+        ),
     )
 
 

@@ -106,3 +106,40 @@ class ActorContext:
         from app.utils.actor import actor_type_str
 
         return actor_type_str(self)
+
+    def can_call_tool(self, tool_name: str, conn=None) -> bool:
+        """MCP tool-level 권한 게이트 — 본 actor 가 ``tool_name`` 호출 가능한가.
+
+        S3 Phase 4 FG 4-0 §2.1.6 (2026-04-28). task3-3.md §[129,223–225,318] 흡수.
+
+        분기:
+          - actor_type ≠ AGENT → ``True`` (사람/시스템/anonymous 는 본 게이트 비대상.
+            인증·권한은 별 게이트가 처리).
+          - actor_type == AGENT 이고 ``scope_profile_id`` 없음 → ``False`` (default-deny).
+          - actor_type == AGENT 이고 ``scope_profile.allowed_tools`` 에 ``tool_name`` 포함 → ``True``.
+          - 외 모든 경우 (조회 실패 포함) → ``False`` (fail-closed).
+
+        ``conn`` 은 선택. 미지정 시 자체적으로 새 연결을 연다 (test 용이).
+        지연 import 로 순환 참조 회피 (auth → repositories → services → auth).
+        """
+        if self.actor_type != ActorType.AGENT:
+            return True
+        if not self.scope_profile_id:
+            return False
+        try:
+            from app.repositories.scope_profile_repository import ScopeProfileRepository
+
+            if conn is not None:
+                repo = ScopeProfileRepository(conn)
+                profile = repo.get_by_id(self.scope_profile_id)
+            else:
+                from app.db.connection import get_db
+                with get_db() as auto_conn:
+                    repo = ScopeProfileRepository(auto_conn)
+                    profile = repo.get_by_id(self.scope_profile_id)
+            if profile is None:
+                return False
+            return tool_name in (profile.allowed_tools or [])
+        except Exception:
+            # fail-closed — 조회 실패는 거부 (R1 정합)
+            return False

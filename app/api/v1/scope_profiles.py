@@ -86,6 +86,7 @@ def _agent_response(agent) -> AgentResponse:
 
 def _profile_response(profile) -> ScopeProfileResponse:
     # S3 Phase 3 FG 3-2 (2026-04-27): settings (ScopeProfileSettings dataclass) → schema
+    # S3 Phase 4 FG 4-0 §2.1.6 (2026-04-28): allowed_tools 노출
     from app.schemas.agent import ScopeProfileSettingsSchema  # 지연 import 회피
 
     return ScopeProfileResponse(
@@ -109,6 +110,7 @@ def _profile_response(profile) -> ScopeProfileResponse:
         settings=ScopeProfileSettingsSchema(
             expose_viewers=bool(profile.settings.expose_viewers),
         ),
+        allowed_tools=list(profile.allowed_tools or []),
     )
 
 
@@ -128,19 +130,24 @@ def create_scope_profile(
 ):
     _require_admin(actor)
     # S3 Phase 3 FG 3-2 (2026-04-27): create 시 settings 도 함께 전달 (옵셔널).
+    # S3 Phase 4 FG 4-0 §2.1.6 (2026-04-28): allowed_tools 도 함께 전달 (옵셔널).
     from app.models.scope_profile import ScopeProfileSettings  # 지연 import
     settings_arg = (
         ScopeProfileSettings(expose_viewers=bool(body.settings.expose_viewers))
         if body.settings is not None else None
     )
-    with get_db() as conn:
-        repo = ScopeProfileRepository(conn)
-        profile = repo.create(
-            name=body.name,
-            description=body.description,
-            organization_id=body.organization_id,
-            settings=settings_arg,
-        )
+    try:
+        with get_db() as conn:
+            repo = ScopeProfileRepository(conn)
+            profile = repo.create(
+                name=body.name,
+                description=body.description,
+                organization_id=body.organization_id,
+                settings=settings_arg,
+                allowed_tools=body.allowed_tools,
+            )
+    except ValueError as exc:
+        raise unprocessable_entity(str(exc))
     audit_emitter.emit(
         event_type="scope_profile.created",
         action="scope_profile.create",
@@ -213,22 +220,32 @@ def update_scope_profile(
     if body.settings is not None:
         settings_patch = {"expose_viewers": bool(body.settings.expose_viewers)}
 
-    with get_db() as conn:
-        affected_agents = _get_affected_agents(conn, profile_id)
-        repo = ScopeProfileRepository(conn)
-        # settings.changed audit 를 위해 변경 전 값 캡쳐
-        if settings_patch is not None:
-            existing = repo.get_by_id(profile_id)
-            if existing is not None:
-                settings_before = {
-                    "expose_viewers": bool(existing.settings.expose_viewers),
-                }
-        profile = repo.update(
-            profile_id,
-            name=body.name,
-            description=body.description,
-            settings_patch=settings_patch,
-        )
+    # S3 Phase 4 FG 4-0 §2.1.6 (2026-04-28): allowed_tools 변경 audit 를 위해 변경 전 값 캡쳐
+    allowed_tools_before: Optional[list[str]] = None
+
+    try:
+        with get_db() as conn:
+            affected_agents = _get_affected_agents(conn, profile_id)
+            repo = ScopeProfileRepository(conn)
+            # settings.changed / allowed_tools.changed audit 를 위해 변경 전 값 캡쳐
+            if settings_patch is not None or body.allowed_tools is not None:
+                existing = repo.get_by_id(profile_id)
+                if existing is not None:
+                    if settings_patch is not None:
+                        settings_before = {
+                            "expose_viewers": bool(existing.settings.expose_viewers),
+                        }
+                    if body.allowed_tools is not None:
+                        allowed_tools_before = list(existing.allowed_tools or [])
+            profile = repo.update(
+                profile_id,
+                name=body.name,
+                description=body.description,
+                settings_patch=settings_patch,
+                allowed_tools=body.allowed_tools,
+            )
+    except ValueError as exc:
+        raise unprocessable_entity(str(exc))
     if not profile:
         raise not_found("Scope Profile을 찾을 수 없습니다.")
     audit_emitter.emit(
@@ -241,6 +258,23 @@ def update_scope_profile(
         result="success",
         metadata={"affected_agents": affected_agents},
     )
+    # S3 Phase 4 FG 4-0 §2.1.6 (2026-04-28): allowed_tools 변경 별도 audit (보안 정책 변경 추적)
+    if body.allowed_tools is not None and allowed_tools_before is not None:
+        if sorted(allowed_tools_before) != sorted(profile.allowed_tools or []):
+            audit_emitter.emit(
+                event_type="scope_profile.allowed_tools.changed",
+                action="scope_profile.allowed_tools.update",
+                actor_id=actor.resolved_id,
+                actor_type=actor.audit_actor_type,
+                resource_type="scope_profile",
+                resource_id=profile_id,
+                result="success",
+                metadata={
+                    "before": allowed_tools_before,
+                    "after": list(profile.allowed_tools or []),
+                    "affected_agents": affected_agents,
+                },
+            )
     # S3 Phase 3 FG 3-2 (2026-04-27): settings 변경 별도 audit + 정책 캐시 invalidate.
     if settings_patch is not None:
         from app.services.scope_profile_policy import invalidate_cache

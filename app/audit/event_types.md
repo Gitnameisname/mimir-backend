@@ -74,6 +74,11 @@
 | 2026-04-27 | `scope_profile.settings.changed` | 신설 (S3 Phase 3 FG 3-2). PATCH /admin/scope-profiles/{id} 가 settings 변경 시 emit. metadata: `{before, after}` | task3-2 Step 4 |
 | 2026-04-27 | `annotation.created` / `annotation.updated` / `annotation.resolved` / `annotation.reopened` / `annotation.deleted` | 신설 (S3 Phase 3 FG 3-3). 주석 라이프사이클 5종. metadata: `{document_id, ...}` | task3-3 Step 2 |
 | 2026-04-27 | `mcp.tool.read_annotations` | 신설 (S3 Phase 3 FG 3-3). MCP read_annotations Tool 호출 시 emit | task3-3 Step 6 |
+| 2026-04-28 | `scope_profile.allowed_tools.changed` | 신설 (S3 Phase 4 FG 4-0 §2.1.6). PUT /admin/scope-profiles/{id} 가 allowed_tools 를 변경할 때 emit. metadata: `{before, after, affected_agents}`. tool-level ACL 변경 추적 — 보안 정책 audit. | task4-0 Step 7 |
+| 2026-04-28 | `agent_proposal.requested` | 신설 (S3 Phase 4 FG 4-6 §2.1.4). MCP `tool_save_draft` 가 propose 직후 emit. metadata: `{document_id, version_id, proposal_id, idempotency_key, idempotent_replay, impact}`. write 도구 audit chain 의 첫 단계. | task4-6 Step 4 |
+| 2026-04-28 | `agent_proposal.approved` | 신설 (S3 Phase 4 FG 4-6 §2.1.4). reviewer 가 proposed → approved 전이 시. metadata: `{proposal_id, approver_id, version_id_after}`. agent.draft.approved 와 다름 — agent_proposal 통합 큐 audit. | task4-6 Step 4 |
+| 2026-04-28 | `agent_proposal.merged` | 신설 (S3 Phase 4 FG 4-6 §2.1.4). approved → committed (실 draft 반영) 시. metadata: `{proposal_id, version_id, nodes_changed}`. | task4-6 Step 4 |
+| 2026-04-28 | `agent_proposal.rolled_back` | 신설 (S3 Phase 4 FG 4-6 §2.1.4). approved 후 rollback 시. metadata: `{proposal_id, reason, by_actor_id}`. | task4-6 Step 4 |
 
 ---
 

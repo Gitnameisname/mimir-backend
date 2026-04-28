@@ -1,19 +1,26 @@
 """
-MCP Resource URI 해석 — Phase 4 FG4.1.
+MCP Resource URI 해석 — Phase 4 FG4.1 / FG 4-1 갱신.
 
-URI 스킴: mimir://documents/{document_id}/versions/{version_id}/nodes/{node_id}
+URI 4 패턴 표준 (FG 4-1 §2.1.2):
+  - mimir://documents/{document_id}
+  - mimir://documents/{document_id}/versions/{version_id}
+  - mimir://documents/{document_id}/versions/{version_id}/nodes/{node_id}
+  - mimir://documents/{document_id}/versions/{version_id}/render
+
+본 모듈의 ``MimirResource`` / ``parse_resource_uri`` 는 **node URI 전용 백워드 호환**
+표면이다 (mcp_router 의 `/mcp/resources/read?uri=...` 엔드포인트가 사용). 4 패턴
+일반 파싱은 ``app.mcp.uri_builder.parse_uri`` / 빌더는 ``app.mcp.uri_builder``.
 """
 from __future__ import annotations
 
-import re
 from typing import Optional
 
-_RESOURCE_PATTERN = re.compile(
-    r"^mimir://documents/([^/]+)/versions/([^/]+)/nodes/([^/]+)$"
-)
+from app.mcp.uri_builder import build_node_uri, parse_uri
 
 
 class MimirResource:
+    """node-단위 URI 의 백워드 호환 래퍼 (FG 4-1 이전 인터페이스)."""
+
     def __init__(self, document_id: str, version_id: str, node_id: str) -> None:
         self.document_id = document_id
         self.version_id = version_id
@@ -21,7 +28,7 @@ class MimirResource:
 
     @property
     def uri(self) -> str:
-        return f"mimir://documents/{self.document_id}/versions/{self.version_id}/nodes/{self.node_id}"
+        return build_node_uri(self.document_id, self.version_id, self.node_id)
 
     @property
     def mime_type(self) -> str:
@@ -33,16 +40,21 @@ class MimirResource:
 
 
 def parse_resource_uri(uri: str) -> Optional[MimirResource]:
-    """mimir:// URI를 파싱하여 MimirResource를 반환한다.
+    """mimir:// node URI 를 파싱하여 MimirResource 를 반환한다 (백워드 호환).
+
+    4 패턴 중 ``node`` 만 매칭 — 다른 패턴 (document / version / render) 은 None 반환.
+    범용 파싱은 ``app.mcp.uri_builder.parse_uri`` 사용.
 
     Returns:
-        MimirResource 또는 URI가 올바르지 않으면 None
+        MimirResource (node URI) 또는 None (URI 가 node 패턴 아니거나 잘못된 형식).
     """
-    m = _RESOURCE_PATTERN.match(uri.strip())
-    if not m:
+    parts = parse_uri(uri)
+    if parts is None or parts.kind != "node":
         return None
+    assert parts.version_id is not None  # parse_uri 의 node 분기 보장
+    assert parts.node_id is not None
     return MimirResource(
-        document_id=m.group(1),
-        version_id=m.group(2),
-        node_id=m.group(3),
+        document_id=parts.document_id,
+        version_id=parts.version_id,
+        node_id=parts.node_id,
     )

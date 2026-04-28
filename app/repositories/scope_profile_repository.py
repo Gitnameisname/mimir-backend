@@ -23,6 +23,39 @@ logger = logging.getLogger(__name__)
 _KNOWN_SETTINGS_KEYS: frozenset[str] = frozenset({"expose_viewers"})
 
 
+# S3 Phase 4 FG 4-0 §2.1.6 (2026-04-28): allowed_tools 컬럼 — list[str] (MCP tool-level ACL).
+def _allowed_tools_from_raw(raw) -> list[str]:
+    """allowed_tools (str | list | None) → list[str].
+
+    - None / 파싱 실패 / 타입 불일치 → 빈 리스트 (default-deny).
+    - dict 등 비-list 타입 → 빈 리스트.
+    - 항목별 str() 강제 (DB 가 mixed 타입 들어가는 경우 방어).
+    """
+    if raw is None:
+        return []
+    parsed = loads_maybe(raw)
+    if not isinstance(parsed, list):
+        return []
+    return [str(x) for x in parsed if x is not None]
+
+
+def _allowed_tools_validate(tools: list[str]) -> list[str]:
+    """allowed_tools 등록 검증 — manifest 의 known_tool_names() 만 허용.
+
+    잘못된 값은 즉시 ValueError. 호출자 (CRUD) 가 사용자 입력 검증에 사용.
+    """
+    from app.schemas.mcp import known_tool_names
+    known = known_tool_names()
+    bad = [t for t in tools if t not in known]
+    if bad:
+        raise ValueError(
+            f"allowed_tools 에 알려지지 않은 도구 이름이 포함되어 있습니다: {bad}. "
+            f"등록 가능한 도구: {sorted(known)}"
+        )
+    # 중복 제거 + 결정성 위해 정렬
+    return sorted(set(tools))
+
+
 def _settings_from_raw(raw) -> ScopeProfileSettings:
     """settings_json (str | dict | None) → ScopeProfileSettings dataclass.
 
@@ -62,24 +95,39 @@ class ScopeProfileRepository:
         description: Optional[str] = None,
         organization_id: Optional[str] = None,
         settings: Optional[ScopeProfileSettings] = None,
+        allowed_tools: Optional[list[str]] = None,
+        use_defaults: bool = False,
     ) -> ScopeProfile:
         """ScopeProfile 신규 생성. settings 미지정 시 기본 ScopeProfileSettings (모두 false).
 
         S3 Phase 3 FG 3-2 (2026-04-27): settings 파라미터 추가. 기본값 보수적.
+        S3 Phase 4 FG 4-0 §2.1.6 (2026-04-28): allowed_tools 파라미터 추가.
+            None 또는 빈 리스트 = default-deny (모든 MCP tool 거부).
+            등록 시 known_tool_names() 검증.
+        S3 Phase 4 FG 4-5 §2.1.5 (2026-04-28): use_defaults 옵션.
+            allowed_tools 미입력 + use_defaults=True 시 ``default_enabled=True``
+            도구만 자동 등록. False (default) 면 default-deny 보존.
         """
         now = utcnow()
         pid = str(uuid4())
         settings_dict = _settings_to_raw(settings or ScopeProfileSettings())
+        if allowed_tools is None and use_defaults:
+            from app.schemas.mcp import default_enabled_tool_names
+            allowed_tools = list(default_enabled_tool_names())
+        validated_tools = _allowed_tools_validate(list(allowed_tools or []))
         with self._conn.cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO scope_profiles (
-                    id, name, description, organization_id, settings_json, created_at, updated_at
+                    id, name, description, organization_id, settings_json, allowed_tools,
+                    created_at, updated_at
                 )
-                VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s)
-                RETURNING id, name, description, organization_id, settings_json, created_at, updated_at
+                VALUES (%s, %s, %s, %s, %s::jsonb, %s::jsonb, %s, %s)
+                RETURNING id, name, description, organization_id, settings_json, allowed_tools,
+                          created_at, updated_at
                 """,
-                (pid, name, description, organization_id, dumps_ko(settings_dict), now, now),
+                (pid, name, description, organization_id, dumps_ko(settings_dict),
+                 dumps_ko(validated_tools), now, now),
             )
             row = cur.fetchone()
         return self._row_to_profile(row, scopes=[])
@@ -87,7 +135,8 @@ class ScopeProfileRepository:
     def get_by_id(self, profile_id: str) -> Optional[ScopeProfile]:
         with self._conn.cursor() as cur:
             cur.execute(
-                "SELECT id, name, description, organization_id, settings_json, created_at, updated_at"
+                "SELECT id, name, description, organization_id, settings_json, allowed_tools,"
+                " created_at, updated_at"
                 " FROM scope_profiles WHERE id = %s",
                 (profile_id,),
             )
@@ -107,14 +156,16 @@ class ScopeProfileRepository:
         with self._conn.cursor() as cur:
             if organization_id:
                 cur.execute(
-                    "SELECT id, name, description, organization_id, settings_json, created_at, updated_at"
+                    "SELECT id, name, description, organization_id, settings_json, allowed_tools,"
+                    " created_at, updated_at"
                     " FROM scope_profiles WHERE organization_id = %s"
                     " ORDER BY created_at DESC LIMIT %s OFFSET %s",
                     (organization_id, limit, offset),
                 )
             else:
                 cur.execute(
-                    "SELECT id, name, description, organization_id, settings_json, created_at, updated_at"
+                    "SELECT id, name, description, organization_id, settings_json, allowed_tools,"
+                    " created_at, updated_at"
                     " FROM scope_profiles ORDER BY created_at DESC LIMIT %s OFFSET %s",
                     (limit, offset),
                 )
@@ -143,6 +194,7 @@ class ScopeProfileRepository:
         name: Optional[str] = None,
         description: Optional[str] = None,
         settings_patch: Optional[dict] = None,
+        allowed_tools: Optional[list[str]] = None,
     ) -> Optional[ScopeProfile]:
         """ScopeProfile 부분 갱신.
 
@@ -150,6 +202,9 @@ class ScopeProfileRepository:
             - dataclass 필드만 추출해서 적용 (알 수 없는 키는 무시).
             - 기존 raw settings_json 과 머지 (forward compatibility — 기존 미지의 키 보존).
             - None 이면 settings 미수정.
+        S3 Phase 4 FG 4-0 §2.1.6 (2026-04-28): ``allowed_tools`` 추가.
+            - None 이면 미수정. 빈 리스트 [] 명시 시 default-deny 로 재설정.
+            - known_tool_names() 검증 — 잘못된 도구 이름은 ValueError.
         """
         sets: list[str] = ["updated_at = %s"]
         params: list = [utcnow()]
@@ -159,6 +214,10 @@ class ScopeProfileRepository:
         if description is not None:
             sets.append("description = %s")
             params.append(description)
+        if allowed_tools is not None:
+            validated_tools = _allowed_tools_validate(list(allowed_tools))
+            sets.append("allowed_tools = %s::jsonb")
+            params.append(dumps_ko(validated_tools))
         if settings_patch is not None:
             # 기존 row 의 settings_json 을 읽어 dataclass 필드만 patch 적용 후 머지.
             current = self.get_by_id(profile_id)
@@ -186,7 +245,8 @@ class ScopeProfileRepository:
         with self._conn.cursor() as cur:
             cur.execute(
                 f"UPDATE scope_profiles SET {', '.join(sets)} WHERE id = %s"
-                " RETURNING id, name, description, organization_id, settings_json, created_at, updated_at",
+                " RETURNING id, name, description, organization_id, settings_json, allowed_tools,"
+                " created_at, updated_at",
                 params,
             )
             row = cur.fetchone()
@@ -271,6 +331,7 @@ class ScopeProfileRepository:
             updated_at=row["updated_at"],
             scopes=scopes,
             settings=_settings_from_raw(row.get("settings_json")),
+            allowed_tools=_allowed_tools_from_raw(row.get("allowed_tools")),
         )
 
     @staticmethod
