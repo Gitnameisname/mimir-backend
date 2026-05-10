@@ -48,6 +48,7 @@ from app.api.v1 import document_links as document_links_router_module  # S3 Phas
 from app.api.v1 import document_graph as document_graph_router_module  # S3 Phase 2 (FG 2-4, 2026-05-10)
 from app.api.v1 import saved_views as saved_views_router_module  # S3 Phase 2 (FG 2-5, 2026-05-10)
 from app.api.v1 import vault_imports as vault_imports_router_module  # S3 Phase 2 (FG 2-6, 2026-05-11)
+from app.api.v1 import users_search as users_search_router_module  # S3 Phase 5 (FG 5-3, 2026-05-11)
 
 v1_router = APIRouter()
 
@@ -78,6 +79,12 @@ v1_router.include_router(
 # S3 Phase 2 (FG 2-6, 2026-05-11): 옵시디언 vault zip import
 v1_router.include_router(
     vault_imports_router_module.router, prefix="/vault-imports", tags=["vault-imports"],
+)
+
+# S3 Phase 5 (FG 5-3, 2026-05-11): 멘션 typeahead 사용자 검색 (viewer org scope)
+# `/admin/users` (admin.py) 와 path 충돌 없음 — 본 prefix 는 `/users` 단독 (viewer 호출).
+v1_router.include_router(
+    users_search_router_module.router, prefix="/users", tags=["users", "mentions"],
 )
 v1_router.include_router(versions.router, prefix="/versions", tags=["versions"])
 v1_router.include_router(nodes.router, prefix="/versions", tags=["nodes"])

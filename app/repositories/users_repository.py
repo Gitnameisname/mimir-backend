@@ -139,6 +139,61 @@ class UsersRepository:
     def get_by_email(self, conn: psycopg2.extensions.connection, email: str) -> Optional[User]:
         return fetch_one_as(conn, "SELECT * FROM users WHERE email = %s", (email,), lambda row: _row_to_user(row))
 
+    def search_by_display_name_in_orgs(
+        self,
+        conn: psycopg2.extensions.connection,
+        *,
+        viewer_user_id: str,
+        query: str,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """S3 Phase 5 FG 5-3 — 멘션 typeahead용 사용자 검색 (viewer organization scope).
+
+        viewer 가 속한 organization (user_org_roles JOIN) 안 사용자 중 display_name 이
+        prefix 매칭되는 항목을 반환. **email / role / status / 다른 메타는 응답에 포함하지
+        않는다** (R-A4 누설 차단).
+
+        Args:
+            viewer_user_id: 호출자 본인 user_id — keyword-only required (S2 ⑥ Scope 하드코딩 금지).
+                            **반드시 ActorContext 에서만 추출**. query / body 주입 금지.
+            query: 정규화된 prefix (호출자 측에서 trim 후 전달).
+            limit: 1~50 범위 (호출자 검증).
+
+        Returns:
+            [{user_id, display_name}] list. timing-safe 한 결과 — 같은 query 길이에서
+            결과 수에 따른 응답 시간 차이가 미미해야 한다 (LIMIT + INDEX 활용).
+        """
+        if not query:
+            return []
+        # ILIKE prefix 매칭. % 와 _ wildcard 는 escape (이미 호출자 측 normalize 가정하나 방어).
+        # NFC 정규화는 호출자 측 (frontend → backend body) 책임. 본 메서드는 raw 비교.
+        # SQL injection: psycopg2 placeholder 가 차단. 추가 방어: query 길이 상한 라우터에서.
+        prefix = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+        # viewer 가 속한 org_ids 중 같은 org 의 다른 사용자 검색.
+        # - user_org_roles JOIN 으로 같은 org 에 둘 이상이 속한 행만 반환
+        # - viewer 본인은 제외 (멘션 자기 자신은 의미 없음)
+        # - status = 'ACTIVE' 만 — 비활성 사용자는 노출 안 함
+        sql = """
+            SELECT DISTINCT u.id, u.display_name
+            FROM users u
+            JOIN user_org_roles target_uor ON target_uor.user_id = u.id
+            JOIN user_org_roles viewer_uor ON viewer_uor.org_id = target_uor.org_id
+            WHERE viewer_uor.user_id = %s
+              AND u.id != %s
+              AND u.status = 'ACTIVE'
+              AND u.display_name ILIKE %s ESCAPE '\\'
+            ORDER BY u.display_name ASC, u.id ASC
+            LIMIT %s
+        """
+        with conn.cursor() as cur:
+            cur.execute(sql, (viewer_user_id, viewer_user_id, prefix, limit))
+            rows = cur.fetchall()
+        return [
+            {"user_id": str(r["id"]), "display_name": r["display_name"]}
+            for r in rows
+        ]
+
     def get_by_username(
         self, conn: psycopg2.extensions.connection, username: str
     ) -> Optional[User]:
