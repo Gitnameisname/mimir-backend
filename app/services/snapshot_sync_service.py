@@ -21,6 +21,9 @@ Phase 1 FG 1-1 (D1) 결정에 따라 ``content_snapshot`` 을 **단일 정본** 
 * :func:`prosemirror_from_nodes` — flat nodes → ProseMirror doc
 * :func:`nodes_from_prosemirror`  — ProseMirror doc → flat node dicts
 * :func:`rebuild_nodes_from_snapshot` — snapshot 으로부터 nodes 테이블 재작성
+* :func:`rebuild_tags_for_document` — content_snapshot + metadata 에서 태그 추출 (FG 2-2)
+* :func:`rebuild_wikilinks_for_document` — ``[[문서명]]`` 토큰 추출·해결 (FG 2-3, 2026-05-10)
+* :func:`rebuild_annotation_anchoring` — annotation 의 node_id anchoring 재계산 (FG 3-3)
 * :func:`prosemirror_from_text` — 순수 텍스트 → 최소 유효 ProseMirror doc
 * :func:`is_valid_prosemirror_doc` — schemas/versions.py validator 용
 
@@ -423,11 +426,12 @@ def rebuild_tags_for_document(
     (``save_draft`` / ``publish_version`` / agent 승인) 에서
     ``rebuild_nodes_from_snapshot`` 직후 호출된다.
 
-    작업지시서 상호검증 §7 트랜잭션 규약:
-      1) ``rebuild_nodes_from_snapshot``  (FG 1-1)
-      2) ``rebuild_tags_for_document``     (FG 2-2, **이 함수**)
-      3) ``rebuild_wikilinks_for_document`` (FG 2-3, 후속)
-    세 함수 모두 동일 ``with get_db() as conn:`` 블록에서 호출되어야 한다.
+    작업지시서 상호검증 §7 트랜잭션 규약 (FG 2-3 / FG 3-3 흡수):
+      1) ``rebuild_nodes_from_snapshot``       (FG 1-1)
+      2) ``rebuild_tags_for_document``          (FG 2-2, **이 함수**)
+      3) ``rebuild_wikilinks_for_document``     (FG 2-3, 2026-05-10 도입)
+      4) ``rebuild_annotation_anchoring``       (FG 3-3)
+    네 함수 모두 동일 ``with get_db() as conn:`` 블록에서 호출되어야 한다.
 
     Returns:
         실제 연결된 ``[(name_normalized, source), ...]`` 목록.
@@ -465,6 +469,81 @@ def rebuild_tags_for_document(
         document_id, len(assignments),
     )
     return extracted
+
+
+def rebuild_wikilinks_for_document(
+    conn: Any,
+    document_id: str,
+    snapshot: Any,
+) -> int:
+    """S3 Phase 2 FG 2-3 — content_snapshot 의 ``[[문서명]]`` 토큰을
+    ``document_links`` 테이블에 **replace** 한다.
+
+    호출 순서 (작업지시서 상호검증 §7 트랜잭션 규약 — 본 함수가 1단계 마지막):
+      1) ``rebuild_nodes_from_snapshot``      (FG 1-1)
+      2) ``rebuild_tags_for_document``         (FG 2-2)
+      3) ``rebuild_wikilinks_for_document``    (FG 2-3, **이 함수**)
+      4) ``rebuild_annotation_anchoring``      (FG 3-3)
+
+    Scope set 결정
+    ---------------
+    task2-3.md §2.1 line 61 의 "작성자 본인의 scope set" 을 **출발 문서의
+    ``scope_profile_id``** 로 해석한다 — 즉 작성자가 본 문서를 작성할 때 가졌던
+    Scope 가 곧 그 문서의 ``scope_profile_id`` 이므로, 출발 문서 자체에서 추출.
+    이 결정으로 호출자가 actor 정보를 넘길 필요가 없어지고 (FG2-3_Pre-flight_갱신.md
+    §2.3) 다른 쓰기 경로에서 일관 동작한다.
+
+    읽기 시점 (`/backlinks` / `/links`) 에는 viewer 의 Scope 로 다시 필터되므로,
+    저장된 ``resolved_status`` 는 어디까지나 작성 시점 힌트 (task2-3.md §5 line 158).
+
+    Args:
+        conn: DB connection
+        document_id: 출발 문서 id
+        snapshot: ProseMirror doc (None / 부적합이면 빈 배열로 replace)
+
+    Returns:
+        실제 저장된 행 수 (resolved + ambiguous + missing 합계).
+    """
+    # 순환 import 회피
+    from app.repositories.document_links_repository import document_links_repository
+    from app.repositories.documents_repository import documents_repository
+    from app.services.wikilink_resolver import resolve_wikilinks
+    from app.services.wikilink_rules import extract_wikilinks_from_snapshot
+
+    extracted = extract_wikilinks_from_snapshot(snapshot)
+    if not extracted:
+        document_links_repository.replace_for_document(
+            conn, from_document_id=document_id, rows=[],
+        )
+        logger.info(
+            "rebuild_wikilinks_for_document — document_id=%s, links=0 (cleared)",
+            document_id,
+        )
+        return 0
+
+    # 출발 문서의 scope_profile_id 를 작성자 Scope 로 사용
+    from_doc = documents_repository.get_by_id(conn, document_id)
+    scope_ids: Optional[list[str]]
+    if from_doc is None or from_doc.scope_profile_id is None:
+        # 문서가 사라졌거나 scope 가 없으면 모든 후보 missing 처리 (안전 보수)
+        scope_ids = []
+    else:
+        scope_ids = [from_doc.scope_profile_id]
+
+    resolved_rows = resolve_wikilinks(
+        conn,
+        from_document_id=document_id,
+        links=extracted,
+        viewer_scope_profile_ids=scope_ids,
+    )
+    inserted = document_links_repository.replace_for_document(
+        conn, from_document_id=document_id, rows=resolved_rows,
+    )
+    logger.info(
+        "rebuild_wikilinks_for_document — document_id=%s, links=%d",
+        document_id, inserted,
+    )
+    return inserted
 
 
 def rebuild_annotation_anchoring(
@@ -533,6 +612,7 @@ __all__ = [
     "nodes_from_prosemirror",
     "rebuild_nodes_from_snapshot",
     "rebuild_tags_for_document",
+    "rebuild_wikilinks_for_document",
     "rebuild_annotation_anchoring",
     "prosemirror_from_text",
 ]

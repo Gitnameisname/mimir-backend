@@ -44,6 +44,10 @@ from app.api.v1 import tags as tags_router  # S3 Phase 2 (FG 2-2)
 from app.api.v1 import contributors as contributors_router  # S3 Phase 3 (FG 3-1)
 from app.api.v1 import annotations as annotations_router_module  # S3 Phase 3 (FG 3-3)
 from app.api.v1 import notifications as notifications_router_module  # S3 Phase 3 (FG 3-3)
+from app.api.v1 import document_links as document_links_router_module  # S3 Phase 2 (FG 2-3, 2026-05-10)
+from app.api.v1 import document_graph as document_graph_router_module  # S3 Phase 2 (FG 2-4, 2026-05-10)
+from app.api.v1 import saved_views as saved_views_router_module  # S3 Phase 2 (FG 2-5, 2026-05-10)
+from app.api.v1 import vault_imports as vault_imports_router_module  # S3 Phase 2 (FG 2-6, 2026-05-11)
 
 v1_router = APIRouter()
 
@@ -51,7 +55,30 @@ v1_router = APIRouter()
 v1_router.include_router(system.router, prefix="/system", tags=["system"])
 
 # 핵심 도메인 리소스
+# S3 Phase 2 (FG 2-3, 2026-05-10): 백링크 / 자동완성. /documents prefix 공유.
+# `/resolve` 가 documents 라우터의 `/{document_id}` 보다 **먼저 매칭**되어야 하므로
+# documents 보다 앞에 include. 본 라우터는 `/resolve` / `/{document_id}/backlinks` /
+# `/{document_id}/links` 만 가지며, 일반 `/{document_id}` 패턴이 없어 documents 라우터의
+# 동작에는 영향을 주지 않는다.
+v1_router.include_router(
+    document_links_router_module.router, prefix="/documents", tags=["wikilinks"]
+)
+# S3 Phase 2 (FG 2-4, 2026-05-10): 그래프 데이터. /graph 도 documents `/{document_id}` 보다
+# 먼저 매칭되어야 함. document_links 와 동일 패턴.
+v1_router.include_router(
+    document_graph_router_module.router, prefix="/documents", tags=["graph"]
+)
 v1_router.include_router(documents.router, prefix="/documents", tags=["documents"])
+
+# S3 Phase 2 (FG 2-5, 2026-05-10): 사용자 저장 뷰 (필터+정렬+레이아웃 + 공유 URL)
+v1_router.include_router(
+    saved_views_router_module.router, prefix="/saved-views", tags=["saved-views"],
+)
+
+# S3 Phase 2 (FG 2-6, 2026-05-11): 옵시디언 vault zip import
+v1_router.include_router(
+    vault_imports_router_module.router, prefix="/vault-imports", tags=["vault-imports"],
+)
 v1_router.include_router(versions.router, prefix="/versions", tags=["versions"])
 v1_router.include_router(nodes.router, prefix="/versions", tags=["nodes"])
 

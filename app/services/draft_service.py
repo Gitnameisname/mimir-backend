@@ -230,6 +230,7 @@ class DraftService:
             rebuild_annotation_anchoring,
             rebuild_nodes_from_snapshot,
             rebuild_tags_for_document,
+            rebuild_wikilinks_for_document,
         )
         rebuild_nodes_from_snapshot(conn, version.id, request.content_snapshot)
         # S3 Phase 2 FG 2-2 (2026-04-24): 태그 파생 동기화.
@@ -239,6 +240,11 @@ class DraftService:
             document_id=document_id,
             snapshot=request.content_snapshot,
             metadata=doc.metadata,
+        )
+        # S3 Phase 2 FG 2-3 (2026-05-10): 백링크 [[문서명]] 파생 동기화.
+        # 작성자의 Scope = 출발 문서의 scope_profile_id (FG2-3_Pre-flight_갱신 §2.3).
+        rebuild_wikilinks_for_document(
+            conn, document_id=document_id, snapshot=request.content_snapshot,
         )
         # S3 Phase 3 FG 3-3 (2026-04-27): annotation anchoring 재계산.
         # node_id 가 사라진 annotation → orphan, 다시 등장한 → 복구.

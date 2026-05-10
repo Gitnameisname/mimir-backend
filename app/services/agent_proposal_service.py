@@ -152,6 +152,7 @@ class AgentProposalService:
             rebuild_annotation_anchoring,
             rebuild_nodes_from_snapshot,
             rebuild_tags_for_document,
+            rebuild_wikilinks_for_document,
         )
         rebuild_nodes_from_snapshot(conn, version_id, content_snapshot)
         # S3 Phase 2 FG 2-2 (2026-04-24): 태그 파생 동기화.
@@ -161,6 +162,11 @@ class AgentProposalService:
             document_id=document_id,
             snapshot=content_snapshot,
             metadata=metadata,
+        )
+        # S3 Phase 2 FG 2-3 (2026-05-10): 백링크 [[문서명]] 파생 동기화.
+        # agent 제안에 wikilink 가 포함되면 출발 문서의 scope 안에서 해석.
+        rebuild_wikilinks_for_document(
+            conn, document_id=document_id, snapshot=content_snapshot,
         )
         # S3 Phase 3 FG 3-3 (2026-04-27): annotation anchoring 재계산.
         rebuild_annotation_anchoring(
