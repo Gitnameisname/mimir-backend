@@ -46,35 +46,45 @@ def _make_conn(*, fetchone_value=None, fetchall_value=None, raise_on_execute=Fal
 
 
 def _vec_row(**kw):
+    """PG document_chunks JOIN documents 결과 행 (Milvus 전환 후 — score 별 인자, metadata 컬럼 부재)."""
     base = {
         "chunk_id": uuidlib.UUID("aaaaaaaa-0000-0000-0000-000000000001"),
         "document_id": DOC_UUID, "version_id": VER_UUID, "node_id": NODE_UUID,
         "source_text": "청크 본문",
-        "metadata": {"k": 1},
         "document_type": "policy",
         "document_title": "Doc 1",
-        "score": 0.85,
     }
     base.update(kw)
     return base
 
 
+def _make_milvus(*, available=True, candidates=None, search_raises=False):
+    """Milvus stub — search_with_score 가 (chunk_id, similarity) 튜플 반환."""
+    fake = MagicMock()
+    fake.is_available = MagicMock(return_value=available)
+    if search_raises:
+        fake.search_with_score = MagicMock(side_effect=RuntimeError("milvus fail"))
+    else:
+        fake.search_with_score = MagicMock(return_value=candidates or [])
+    return fake
+
+
 class TestVectorRetrieverRowToResult:
     def test_happy(self):
         from app.services.retrieval.vector_retriever import VectorRetriever
-        r = VectorRetriever._row_to_result(_vec_row())
+        r = VectorRetriever._row_to_result(_vec_row(), score=0.85)
         assert r is not None
         assert r.score == pytest.approx(0.85)
         assert r.content == "청크 본문"
 
     def test_empty_source_text_returns_none(self):
         from app.services.retrieval.vector_retriever import VectorRetriever
-        assert VectorRetriever._row_to_result(_vec_row(source_text="")) is None
-        assert VectorRetriever._row_to_result(_vec_row(source_text=None)) is None
+        assert VectorRetriever._row_to_result(_vec_row(source_text=""), score=0.5) is None
+        assert VectorRetriever._row_to_result(_vec_row(source_text=None), score=0.5) is None
 
     def test_node_id_none_replaced_with_nil_uuid(self):
         from app.services.retrieval.vector_retriever import VectorRetriever
-        r = VectorRetriever._row_to_result(_vec_row(node_id=None))
+        r = VectorRetriever._row_to_result(_vec_row(node_id=None), score=0.5)
         assert r is not None
         assert r.node_id == uuidlib.UUID(int=0)
 
@@ -96,6 +106,99 @@ class TestVectorRetrieverRetrieve:
         )
         assert results == []
 
+    async def test_milvus_unavailable_returns_empty(self, monkeypatch):
+        """MILVUS_HOST 미설정 → NullClient. is_available()=False 면 빈 결과."""
+        from app.services.retrieval.vector_retriever import VectorRetriever
+
+        fake_provider = MagicMock()
+        fake_provider.embed_single = MagicMock(return_value=[0.1] * 10)
+        monkeypatch.setattr(
+            "app.services.embedding_service.get_embedding_provider",
+            lambda: fake_provider,
+        )
+        monkeypatch.setattr(
+            "app.db.milvus.get_milvus",
+            lambda: _make_milvus(available=False),
+        )
+
+        conn, _ = _make_conn()
+        r = VectorRetriever(conn)
+        results = await r.retrieve(
+            query="Q", document_type="policy", top_k=5,
+            filters={"actor_role": "VIEWER"},
+        )
+        assert results == []
+
+    async def test_milvus_search_failure_returns_empty(self, monkeypatch):
+        from app.services.retrieval.vector_retriever import VectorRetriever
+
+        fake_provider = MagicMock()
+        fake_provider.embed_single = MagicMock(return_value=[0.1] * 10)
+        monkeypatch.setattr(
+            "app.services.embedding_service.get_embedding_provider",
+            lambda: fake_provider,
+        )
+        monkeypatch.setattr(
+            "app.db.milvus.get_milvus",
+            lambda: _make_milvus(search_raises=True),
+        )
+
+        conn, _ = _make_conn()
+        r = VectorRetriever(conn)
+        results = await r.retrieve(
+            query="Q", document_type="policy", top_k=5,
+            filters={"actor_role": "VIEWER"},
+        )
+        assert results == []
+
+    async def test_milvus_empty_candidates_returns_empty(self, monkeypatch):
+        from app.services.retrieval.vector_retriever import VectorRetriever
+
+        fake_provider = MagicMock()
+        fake_provider.embed_single = MagicMock(return_value=[0.1] * 10)
+        monkeypatch.setattr(
+            "app.services.embedding_service.get_embedding_provider",
+            lambda: fake_provider,
+        )
+        monkeypatch.setattr(
+            "app.db.milvus.get_milvus",
+            lambda: _make_milvus(candidates=[]),
+        )
+
+        conn, _ = _make_conn()
+        r = VectorRetriever(conn)
+        results = await r.retrieve(
+            query="Q", document_type="policy", top_k=5,
+            filters={"actor_role": "VIEWER"},
+        )
+        assert results == []
+
+    async def test_threshold_filters_low_score_candidates(self, monkeypatch):
+        """similarity < threshold 후보는 PG 조회 전에 제거된다."""
+        from app.services.retrieval.vector_retriever import VectorRetriever
+
+        fake_provider = MagicMock()
+        fake_provider.embed_single = MagicMock(return_value=[0.1] * 10)
+        monkeypatch.setattr(
+            "app.services.embedding_service.get_embedding_provider",
+            lambda: fake_provider,
+        )
+        # 후보 모두 threshold 미만 (0.1 < 0.3)
+        monkeypatch.setattr(
+            "app.db.milvus.get_milvus",
+            lambda: _make_milvus(candidates=[("c1", 0.1), ("c2", 0.2)]),
+        )
+
+        conn, cur = _make_conn(fetchall_value=[])
+        r = VectorRetriever(conn, similarity_threshold=0.3)
+        results = await r.retrieve(
+            query="Q", document_type="policy", top_k=5,
+            filters={"actor_role": "VIEWER"},
+        )
+        assert results == []
+        # PG 쿼리 자체가 호출되지 않음 (threshold 단계에서 빈 결과)
+        assert cur.execute.call_count == 0
+
     async def test_happy_path_with_acl_and_type(self, monkeypatch):
         from app.services.retrieval.vector_retriever import VectorRetriever
 
@@ -105,8 +208,13 @@ class TestVectorRetrieverRetrieve:
             "app.services.embedding_service.get_embedding_provider",
             lambda: fake_provider,
         )
+        chunk_id = uuidlib.UUID("aaaaaaaa-0000-0000-0000-000000000001")
+        monkeypatch.setattr(
+            "app.db.milvus.get_milvus",
+            lambda: _make_milvus(candidates=[(str(chunk_id), 0.85)]),
+        )
 
-        rows = [_vec_row(), _vec_row(source_text="")]  # 빈 source_text 는 필터됨
+        rows = [_vec_row(chunk_id=chunk_id)]
         conn, cur = _make_conn(fetchall_value=rows)
         r = VectorRetriever(conn, similarity_threshold=0.3)
         results = await r.retrieve(
@@ -114,12 +222,15 @@ class TestVectorRetrieverRetrieve:
             filters={"actor_role": "VIEWER"},
         )
         assert len(results) == 1
+        # Milvus score 가 그대로 score 로
+        assert results[0].score == pytest.approx(0.85)
+
         sql = cur.execute.call_args.args[0]
-        # pgvector cosine operator
-        assert "dc.embedding <=> %s::vector" in sql
-        # threshold 조건 적용
-        assert "1 - (dc.embedding <=> %s::vector) >= %s" in sql
-        # ACL 절
+        # 새 SQL: chunk_id IN (chunk_ids) — pgvector `<=>` 제거 확인
+        assert "<=>" not in sql
+        assert "::vector" not in sql
+        assert "dc.id = ANY(%s::uuid[])" in sql
+        # ACL 절 보존
         assert "%s = ANY(dc.accessible_roles)" in sql
         # document_type 필터
         assert "dc.document_type = %s" in sql
@@ -133,6 +244,10 @@ class TestVectorRetrieverRetrieve:
             "app.services.embedding_service.get_embedding_provider",
             lambda: fake_provider,
         )
+        monkeypatch.setattr(
+            "app.db.milvus.get_milvus",
+            lambda: _make_milvus(candidates=[("c1", 0.5)]),
+        )
 
         conn, cur = _make_conn(fetchall_value=[])
         r = VectorRetriever(conn)
@@ -142,7 +257,8 @@ class TestVectorRetrieverRetrieve:
         sql = cur.execute.call_args.args[0]
         assert "dc.document_type = %s" not in sql
 
-    async def test_sql_exception_returns_empty(self, monkeypatch):
+    async def test_pg_sql_exception_returns_empty(self, monkeypatch):
+        """PG metadata 조회가 실패해도 retrieve 는 빈 결과로 graceful 종료."""
         from app.services.retrieval.vector_retriever import VectorRetriever
 
         fake_provider = MagicMock()
@@ -150,6 +266,10 @@ class TestVectorRetrieverRetrieve:
         monkeypatch.setattr(
             "app.services.embedding_service.get_embedding_provider",
             lambda: fake_provider,
+        )
+        monkeypatch.setattr(
+            "app.db.milvus.get_milvus",
+            lambda: _make_milvus(candidates=[("c1", 0.85)]),
         )
         conn, _ = _make_conn(raise_on_execute=True)
         r = VectorRetriever(conn)

@@ -158,47 +158,53 @@ class TestAdminCapabilitiesTier3:
         # private 또는 no-store 둘 중 하나 이상 있으면 OK (no-store 는 private 보다 엄격)
         assert ("private" in cc) or ("no-store" in cc)
 
-    # --- pgvector / RAG 조합 검증 (Tier 3에서만 가능) ---
+    # --- pgvector / chunking / Milvus + RAG 조합 검증 (Tier 3에서만 가능) ---
+    # 2026-05-11 정정: 본 시스템은 Milvus 가 벡터 정본. pgvector_enabled 응답은 정보성으로
+    # 유지하되 RAG / chunking 가용성은 Milvus + PG document_chunks 기반으로 결정한다.
 
-    def test_pgvector_enabled_true(self, client, auth_admin):
-        """PGVECTOR_ENABLED=true → pgvector_enabled=true."""
+    def test_pgvector_enabled_true_reports_information(self, client, auth_admin):
+        """PGVECTOR_ENABLED=true → pgvector_enabled=true (정보성 필드)."""
         _reset_cap_cache()
         with patch.dict("os.environ", {"PGVECTOR_ENABLED": "true"}):
             r = client.get("/api/v1/admin/system/capabilities", headers=auth_admin)
         cap = r.json()["data"]
         assert cap["pgvector_enabled"] is True
-        assert cap["chunking_enabled"] is True
 
-    def test_pgvector_enabled_false(self, client, auth_admin):
-        """PGVECTOR_ENABLED=false → pgvector_enabled=false, chunking_enabled=false."""
+    def test_chunking_enabled_independent_of_pgvector(self, client, auth_admin):
+        """chunking_enabled 은 PG document_chunks 기반이라 pgvector 와 무관 — 항상 True."""
         _reset_cap_cache()
         with patch.dict("os.environ", {"PGVECTOR_ENABLED": "false"}):
             r = client.get("/api/v1/admin/system/capabilities", headers=auth_admin)
         cap = r.json()["data"]
+        # 정정 (logical fix): pgvector 가 비활성이어도 chunking 은 PG 기반이므로 가용.
         assert cap["pgvector_enabled"] is False
-        assert cap["chunking_enabled"] is False
+        assert cap["chunking_enabled"] is True
 
-    def test_pgvector_false_rag_unavailable(self, client, auth_admin):
-        """pgvector=false 이면 LLM 키가 있어도 rag_available=false."""
+    def test_milvus_unavailable_rag_unavailable(self, client, auth_admin):
+        """Milvus 미가용이면 LLM 키가 있어도 rag_available=false."""
         _reset_cap_cache()
-        with patch.dict(
-            "os.environ",
-            {"PGVECTOR_ENABLED": "false", "OPENAI_API_KEY": "sk-test"},
-        ):
-            r = client.get("/api/v1/admin/system/capabilities", headers=auth_admin)
+        import app.api.v1.system as sys_mod
+        from unittest.mock import MagicMock
+
+        fake_null_milvus = MagicMock()
+        fake_null_milvus.is_available = MagicMock(return_value=False)
+
+        with patch.dict("os.environ", {"OPENAI_API_KEY": "sk-test"}):
+            with patch.object(sys_mod.settings, "openai_api_key", "sk-test"):
+                with patch("app.db.milvus.get_milvus", return_value=fake_null_milvus):
+                    r = client.get("/api/v1/admin/system/capabilities", headers=auth_admin)
         assert r.json()["data"]["rag_available"] is False
 
-    def test_pgvector_true_no_llm_rag_unavailable(self, client, auth_admin):
-        """pgvector=true 이지만 LLM 키 없음 → rag_available=false.
+    def test_milvus_available_no_llm_rag_unavailable(self, client, auth_admin):
+        """Milvus 가용 + LLM 부재 → rag_available=false.
 
-        DB 에 llm_providers 가 이미 등록되어 있을 수 있으므로, `has_llm` 이 DB 경로로도
-        True 가 되지 않도록 llm_providers 조회도 빈 결과로 패치한다.
+        DB 의 llm_providers 가 이미 등록돼 있을 수 있어 has_llm 이 DB 경로로도 True 되지
+        않도록 llm_providers 조회를 빈 결과로 패치.
         """
         _reset_cap_cache()
         import app.api.v1.system as sys_mod
         from unittest.mock import MagicMock
 
-        # DB llm_providers 조회를 "결과 없음" 으로 모킹
         fake_cur = MagicMock()
         fake_cur.__enter__ = MagicMock(return_value=fake_cur)
         fake_cur.__exit__ = MagicMock(return_value=False)
@@ -209,19 +215,27 @@ class TestAdminCapabilitiesTier3:
         fake_ctx.__enter__ = MagicMock(return_value=fake_conn)
         fake_ctx.__exit__ = MagicMock(return_value=False)
 
-        with patch.dict("os.environ", {"PGVECTOR_ENABLED": "true"}):
-            with patch.object(sys_mod.settings, "openai_api_key", ""):
-                with patch.object(sys_mod.settings, "anthropic_api_key", ""):
-                    with patch("app.db.connection.get_db", return_value=fake_ctx):
+        fake_milvus = MagicMock()
+        fake_milvus.is_available = MagicMock(return_value=True)
+
+        with patch.object(sys_mod.settings, "openai_api_key", ""):
+            with patch.object(sys_mod.settings, "anthropic_api_key", ""):
+                with patch("app.db.connection.get_db", return_value=fake_ctx):
+                    with patch("app.db.milvus.get_milvus", return_value=fake_milvus):
                         r = client.get("/api/v1/admin/system/capabilities", headers=auth_admin)
         assert r.json()["data"]["rag_available"] is False
 
-    def test_pgvector_true_with_openai_rag_available(self, client, auth_admin):
-        """pgvector=true + openai_api_key 설정 → rag_available=true."""
+    def test_milvus_available_with_openai_rag_available(self, client, auth_admin):
+        """Milvus 가용 + openai_api_key 설정 → rag_available=true."""
         _reset_cap_cache()
         import app.api.v1.system as sys_mod
-        with patch.dict("os.environ", {"PGVECTOR_ENABLED": "true"}):
-            with patch.object(sys_mod.settings, "openai_api_key", "sk-test"):
+        from unittest.mock import MagicMock
+
+        fake_milvus = MagicMock()
+        fake_milvus.is_available = MagicMock(return_value=True)
+
+        with patch.object(sys_mod.settings, "openai_api_key", "sk-test"):
+            with patch("app.db.milvus.get_milvus", return_value=fake_milvus):
                 r = client.get("/api/v1/admin/system/capabilities", headers=auth_admin)
         assert r.json()["data"]["rag_available"] is True
 

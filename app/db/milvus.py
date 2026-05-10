@@ -38,6 +38,11 @@ class _NullMilvusClient:
     def search(self, embedding: list[float], top_k: int) -> list[str]:
         return []
 
+    def search_with_score(
+        self, embedding: list[float], top_k: int,
+    ) -> list[tuple[str, float]]:
+        return []
+
 
 class _MilvusClientWrapper:
     def __init__(self, host: str, port: int, dim: int, user: str = "", password: str = "") -> None:
@@ -96,6 +101,18 @@ class _MilvusClientWrapper:
         )
 
     def search(self, embedding: list[float], top_k: int) -> list[str]:
+        return [chunk_id for chunk_id, _ in self.search_with_score(embedding, top_k)]
+
+    def search_with_score(
+        self, embedding: list[float], top_k: int,
+    ) -> list[tuple[str, float]]:
+        """Milvus 벡터 유사도 검색 — (chunk_id, similarity) 튜플 반환.
+
+        similarity 정의: ``1 - distance`` (metric_type=COSINE 기준).
+          - PyMilvus 2.4+ 의 COSINE metric 은 distance 를 ``1 - cos_sim`` 로 반환.
+          - 따라서 similarity = 1 - distance 가 직관적 cosine 유사도 (1=동일, 0=무관, -1=정반대).
+          - VectorRetriever 의 ``similarity_threshold`` 와 직접 비교 가능.
+        """
         results = self._client.search(
             collection_name=COLLECTION_NAME,
             data=[embedding],
@@ -106,7 +123,14 @@ class _MilvusClientWrapper:
         )
         if not results:
             return []
-        return [hit["entity"]["chunk_id"] for hit in results[0]]
+        out: list[tuple[str, float]] = []
+        for hit in results[0]:
+            chunk_id = hit["entity"]["chunk_id"]
+            # PyMilvus hit 는 dict-like — distance 키 우선, 없으면 0.0 fallback
+            distance = float(hit.get("distance", 0.0)) if hasattr(hit, "get") else 0.0
+            similarity = 1.0 - distance
+            out.append((chunk_id, similarity))
+        return out
 
 
 def get_milvus() -> _MilvusClientWrapper | _NullMilvusClient:

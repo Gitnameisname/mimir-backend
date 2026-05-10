@@ -119,14 +119,20 @@ def _build_capabilities() -> dict:
     # ── FTS는 PostgreSQL 기반으로 항상 활성 ──
     fts_enabled = True
 
-    # ── pgvector 확장 감지 (PGVECTOR_ENABLED env > pg_extension 조회) ──
+    # ── pgvector 확장 감지 (정보성 — RAG 가용성과 무관) ──
+    # 2026-05-11 정정: 본 시스템은 Milvus 가 벡터 정본이며 pgvector 확장은 사용하지 않는다.
+    # `pgvector_enabled` 응답 필드는 frontend 호환성을 위해 유지하지만 RAG / chunking
+    # 가용성 결정에는 더 이상 사용하지 않는다 (이전 로직은 logical bug — Milvus 가용 +
+    # pgvector 부재인 정상 환경에서 RAG 를 false 로 잘못 보고했다).
     pgvector_enabled = _detect_pgvector()
 
-    # ── RAG = pgvector + default LLM (embedding 모델은 settings 폴백 허용) ──
-    # chunking_enabled 은 pgvector 기반이므로 pgvector 가 off 이면 chunking 도 off.
+    # ── RAG = Milvus + LLM (embedding 모델은 settings 폴백 허용) ──
+    # chunking_enabled: PostgreSQL `document_chunks` 테이블이 boot-time DDL 로 항상
+    # 존재하므로 기본 True. PG 연결 자체가 끊어진 환경은 다른 헬스 체크에서 잡힘.
     has_llm = (default_llm_model is not None) or bool(settings.openai_api_key or settings.anthropic_api_key)
     has_embed = default_embed_model is not None
-    rag_available = pgvector_enabled and has_llm
+    rag_available = milvus_ok and has_llm
+    chunking_enabled = True
 
     # ── 저하 원인 수집 ──
     degraded_reasons: list[str] = []
@@ -147,7 +153,7 @@ def _build_capabilities() -> dict:
         "version": settings.api_version,
         "pgvector_enabled": pgvector_enabled,
         "rag_available": rag_available,
-        "chunking_enabled": pgvector_enabled,
+        "chunking_enabled": chunking_enabled,
         "supported_providers": providers,
         "mcp_spec_version": None,
         # 프론트엔드 SystemCapabilities 필드

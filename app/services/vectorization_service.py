@@ -139,7 +139,11 @@ class VectorizationResult:
 # ---------------------------------------------------------------------------
 
 class VectorizationPipeline:
-    """청킹 → 임베딩 → pgvector 저장 전체 파이프라인."""
+    """청킹 → 임베딩 → Milvus 저장 + PG document_chunks 메타 저장 전체 파이프라인.
+
+    벡터 정본은 Milvus 이며, PostgreSQL `document_chunks` 는 메타데이터 + ACL 스냅샷만
+    보관 (embedding 컬럼 없음). 검색은 Milvus → chunk_id → PG JOIN 흐름.
+    """
 
     def __init__(self, embedding_provider: Optional[EmbeddingProvider] = None):
         self._embedding_provider = embedding_provider
