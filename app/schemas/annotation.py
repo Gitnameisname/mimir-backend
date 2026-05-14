@@ -26,6 +26,18 @@ class AnnotationCreateRequest(BaseModel):
     version_id: Optional[str] = Field(
         default=None, description="작성 시점의 version UUID (옵셔널)",
     )
+    # S3 Phase 5 FG 5-5 (2026-05-14): frontend typeahead 가 선택한 user_id 명시 전송.
+    # backend 는 viewer scope 안에 있는 id 만 통과 (R-A4 정합). 본문 정규식 매칭과 합집합.
+    # 사용자가 typeahead 외부에서 직접 @display_name 입력해도 backend 가 추가 매칭.
+    mentioned_user_ids: list[str] = Field(
+        default_factory=list,
+        max_length=50,
+        description=(
+            "Typeahead 선택 결과 user_id (UUID) 목록. "
+            "backend 가 viewer scope 검증 후 mention 알림 발생. "
+            "본문 정규식 매칭과 합집합 — 명시 IDs 와 본문 매칭 모두 반영."
+        ),
+    )
 
 
 class AnnotationUpdateRequest(BaseModel):

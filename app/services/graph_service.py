@@ -171,7 +171,9 @@ def _fetch_documents(
     folder_id: Optional[str],
     tag_name_normalized: Optional[str],
 ) -> list[dict[str, Any]]:
-    where_parts: list[str] = ["d.deleted_at IS NULL"]
+    # documents 테이블은 soft-delete 컬럼 없음 — status='archived'/'deprecated' 만 그래프에서 제외.
+    # search_service 의 visible_statuses 패턴과 정합 (deprecated 는 표시 안 함).
+    where_parts: list[str] = ["d.status != 'archived'", "d.status != 'deprecated'"]
     params: list[Any] = []
 
     if viewer_scope_profile_ids is not None:
@@ -231,7 +233,9 @@ def _count_documents(
     tag_name_normalized: Optional[str],
 ) -> int:
     """truncated 시 전체 documents 수 보고용. _fetch_documents 와 동일 필터."""
-    where_parts: list[str] = ["d.deleted_at IS NULL"]
+    # documents 테이블은 soft-delete 컬럼 없음 — status='archived'/'deprecated' 만 그래프에서 제외.
+    # search_service 의 visible_statuses 패턴과 정합 (deprecated 는 표시 안 함).
+    where_parts: list[str] = ["d.status != 'archived'", "d.status != 'deprecated'"]
     params: list[Any] = []
 
     if viewer_scope_profile_ids is not None:

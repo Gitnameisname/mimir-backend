@@ -200,6 +200,93 @@ class UsersRepository:
         """아이디(username)로 사용자를 조회한다. 대소문자 구분 없음."""
         return fetch_one_as(conn, "SELECT * FROM users WHERE LOWER(username) = LOWER(%s)", (username,), lambda row: _row_to_user(row))
 
+    def find_by_display_name_in_viewer_orgs(
+        self,
+        conn: psycopg2.extensions.connection,
+        *,
+        viewer_user_id: str,
+        display_name: str,
+    ) -> Optional[User]:
+        """S3 Phase 5 FG 5-5 (2026-05-14) — display_name 으로 사용자 조회 (viewer scope).
+
+        viewer 와 같은 organization (user_org_roles JOIN) 안 ACTIVE 사용자 중 display_name
+        이 정확히 일치하는 사용자를 반환. **org scope 안에서 unique** 일 때만 반환 —
+        2명 이상 충돌 시 None (silently skip, mention 알림 누락).
+
+        본 메서드는 한국어 display_name mention 의 핵심 — 영문 username 시도 후
+        annotations_service 가 fallback 으로 호출.
+
+        Args:
+            viewer_user_id: 호출자 user_id — ActorContext 에서만 추출 (R-A4 정합).
+                keyword-only required.
+            display_name: 정확 매칭할 표시명 (대소문자 구분).
+
+        Returns:
+            unique 일치 사용자 또는 None (미존재 또는 충돌).
+        """
+        if not display_name:
+            return None
+        sql = """
+            SELECT DISTINCT u.*
+            FROM users u
+            JOIN user_org_roles target_uor ON target_uor.user_id = u.id
+            JOIN user_org_roles viewer_uor ON viewer_uor.org_id = target_uor.org_id
+            WHERE viewer_uor.user_id = %s
+              AND u.status = 'ACTIVE'
+              AND u.display_name = %s
+            LIMIT 2
+        """
+        with conn.cursor() as cur:
+            cur.execute(sql, (viewer_user_id, display_name))
+            rows = cur.fetchall()
+        if len(rows) != 1:
+            # 0건 (미존재) 또는 2건 이상 (충돌) → silently skip
+            return None
+        return _row_to_user(rows[0])
+
+    def filter_user_ids_in_viewer_orgs(
+        self,
+        conn: psycopg2.extensions.connection,
+        *,
+        viewer_user_id: str,
+        user_ids: list[str],
+    ) -> list[str]:
+        """S3 Phase 5 FG 5-5 (2026-05-14) — user_ids 중 viewer 와 같은 org 안만 통과.
+
+        Frontend typeahead 가 직접 user_id 명시 전송할 때 R-A4 정합 검증.
+        악의적 클라이언트가 다른 org user_id 를 주입해도 backend 가 차단.
+
+        Args:
+            viewer_user_id: keyword-only required.
+            user_ids: 검증 대상 UUID 리스트 (frontend 명시).
+
+        Returns:
+            통과한 user_id 만 (입력 순서 보존). 미통과는 silently drop.
+        """
+        if not user_ids:
+            return []
+        sql = """
+            SELECT DISTINCT u.id
+            FROM users u
+            JOIN user_org_roles target_uor ON target_uor.user_id = u.id
+            JOIN user_org_roles viewer_uor ON viewer_uor.org_id = target_uor.org_id
+            WHERE viewer_uor.user_id = %s
+              AND u.status = 'ACTIVE'
+              AND u.id = ANY(%s::uuid[])
+        """
+        with conn.cursor() as cur:
+            cur.execute(sql, (viewer_user_id, user_ids))
+            allowed = {str(r["id"]) for r in cur.fetchall()}
+        # 입력 순서 보존 + 중복 제거
+        out: list[str] = []
+        seen: set[str] = set()
+        for uid in user_ids:
+            uid_str = str(uid)
+            if uid_str in allowed and uid_str not in seen:
+                out.append(uid_str)
+                seen.add(uid_str)
+        return out
+
     def get_by_identifier(
         self, conn: psycopg2.extensions.connection, identifier: str
     ) -> Optional[User]:

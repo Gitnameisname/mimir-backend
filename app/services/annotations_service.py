@@ -49,9 +49,14 @@ __all__ = [
 ]
 
 
-# 멘션 정규식: `@username` 또는 `@user.name` (영문/숫자/`._-`, 2~64 자).
-# 한글 멘션은 별 라운드 (사용자 이름 정책 합의 후).
-MENTION_REGEX = re.compile(r"(?:^|[^\w])@([a-zA-Z][a-zA-Z0-9._\-]{1,63})")
+# 멘션 정규식: `@token`. token = 공백/구두점 외 모든 문자 1~64자 (한국어 포함).
+# S3 Phase 5 FG 5-5 (2026-05-14): 한국어 display_name 매칭 허용.
+#  boundary (앞): 시작 또는 비-단어 문자
+#  token: `[^\s@,;.!?…\(\)\[\]{}<>"']` 1~64자 — 공백·구두점·중첩 @ 제외
+#  주의: 끝의 마침표/콤마는 token 에 포함 안 됨 (자연어 본문 호환).
+MENTION_REGEX = re.compile(
+    r"(?:^|[^\w])@([^\s@,;.!?…\(\)\[\]{}<>\"']{1,64})"
+)
 MAX_CONTENT_LENGTH: int = 10_000
 
 
@@ -59,10 +64,11 @@ _users_repository = UsersRepository()
 
 
 def extract_mentions(content: str) -> list[str]:
-    """본문에서 `@username` 패턴 추출 (정규화 + 중복 제거).
+    """본문에서 `@token` 패턴 추출 (중복 제거).
 
     Returns:
-        username 문자열 리스트 (DB lookup 전 raw). 호출자가 user 존재 검증 책임.
+        raw token 문자열 리스트. username 또는 display_name 가능 — 호출자가 user 존재 검증.
+        영문은 소문자 정규화. 한국어는 원문 보존 (display_name 매칭용).
     """
     if not content:
         return []
@@ -70,8 +76,13 @@ def extract_mentions(content: str) -> list[str]:
     seen: set[str] = set()
     result: list[str] = []
     for raw in matches:
-        norm = raw.strip().lower()
-        if norm and norm not in seen:
+        norm = raw.strip()
+        if not norm:
+            continue
+        # ASCII 영문만 소문자 정규화 (한국어/유니코드는 원문 보존)
+        if norm.isascii():
+            norm = norm.lower()
+        if norm not in seen:
             seen.add(norm)
             result.append(norm)
     return result
@@ -79,18 +90,62 @@ def extract_mentions(content: str) -> list[str]:
 
 def _resolve_mention_user_ids(
     conn: psycopg2.extensions.connection,
-    usernames: list[str],
+    tokens: list[str],
+    *,
+    viewer_user_id: Optional[str] = None,
 ) -> list[str]:
-    """username 리스트 → 존재하는 사용자만 user_id 로 변환. 미존재는 silently skip."""
-    if not usernames:
+    """token 리스트 → 존재하는 사용자만 user_id 로 변환. 미존재는 silently skip.
+
+    매칭 우선순위:
+      1) username (영문 handle) — 정확 일치
+      2) display_name — viewer 와 같은 org 안에서 unique 일 때만 (FG 5-5, 2026-05-14)
+
+    Args:
+        viewer_user_id: viewer scope 정합 — display_name fallback 시 viewer 와 같은 org
+            안 사용자만 통과. None 이면 username 매칭만 시도 (backward compat).
+    """
+    if not tokens:
         return []
     user_ids: list[str] = []
-    for uname in usernames:
-        user = _users_repository.get_by_username(conn, uname)
-        if user and user.id:
-            user_ids.append(user.id)
-    # uniqueness
+    for token in tokens:
+        # 1) username 시도 (영문 ASCII 토큰만)
+        if token.isascii():
+            user = _users_repository.get_by_username(conn, token)
+            if user and user.id:
+                user_ids.append(user.id)
+                continue
+        # 2) display_name fallback — viewer scope 안 unique 일 때만
+        if viewer_user_id:
+            matched = _users_repository.find_by_display_name_in_viewer_orgs(
+                conn, viewer_user_id=viewer_user_id, display_name=token
+            )
+            if matched and matched.id:
+                user_ids.append(matched.id)
+    # uniqueness 보존 + 순서 유지
     return list(dict.fromkeys(user_ids))
+
+
+def _validate_explicit_mention_user_ids(
+    conn: psycopg2.extensions.connection,
+    user_ids: list[str],
+    *,
+    viewer_user_id: str,
+) -> list[str]:
+    """Frontend typeahead 가 명시한 user_ids → viewer scope 안만 통과 (R-A4 정합).
+
+    S3 Phase 5 FG 5-5 (2026-05-14). viewer 와 같은 org 안 사용자만 mention 가능 —
+    악의적 클라이언트가 다른 org user_id 를 주입해도 backend 가 차단.
+    """
+    if not user_ids:
+        return []
+    # 빈 문자열 / 중복 제거
+    cleaned = [str(uid).strip() for uid in user_ids if uid and str(uid).strip()]
+    if not cleaned:
+        return []
+    validated = _users_repository.filter_user_ids_in_viewer_orgs(
+        conn, viewer_user_id=viewer_user_id, user_ids=cleaned
+    )
+    return list(dict.fromkeys(validated))
 
 
 def _normalize_actor_type(raw: Optional[str]) -> str:
@@ -147,6 +202,7 @@ class AnnotationsService:
         span_end: Optional[int] = None,
         parent_id: Optional[str] = None,
         version_id: Optional[str] = None,
+        explicit_mentioned_user_ids: Optional[list[str]] = None,
     ) -> Annotation:
         if actor is None or not actor.is_authenticated or not actor.actor_id:
             raise ApiPermissionDeniedError("인증된 사용자만 주석을 작성할 수 있습니다.")
@@ -185,9 +241,23 @@ class AnnotationsService:
             parent_id=parent_id,
         )
 
-        # 멘션 처리 (정상 / valid user_id 만)
-        mention_usernames = extract_mentions(content)
-        mention_user_ids = _resolve_mention_user_ids(conn, mention_usernames)
+        # 멘션 처리 — S3 Phase 5 FG 5-5 (2026-05-14):
+        #   1) frontend 명시 user_ids (typeahead 선택) — viewer scope 검증 후 통과
+        #   2) 본문 정규식 매칭 (username + display_name fallback)
+        #   3) 합집합 → uniqueness
+        viewer_id = str(actor.actor_id) if actor.actor_id else None
+        explicit_ids = (
+            _validate_explicit_mention_user_ids(
+                conn, explicit_mentioned_user_ids or [], viewer_user_id=viewer_id,
+            )
+            if viewer_id
+            else []
+        )
+        mention_tokens = extract_mentions(content)
+        body_ids = _resolve_mention_user_ids(
+            conn, mention_tokens, viewer_user_id=viewer_id,
+        )
+        mention_user_ids = list(dict.fromkeys(explicit_ids + body_ids))
         if mention_user_ids:
             annotations_repository.replace_mentions(conn, annotation.id, mention_user_ids)
             for recipient_id in mention_user_ids:
@@ -242,9 +312,12 @@ class AnnotationsService:
         if updated is None:
             raise ApiNotFoundError(f"주석을 찾을 수 없습니다: {annotation_id}")
 
-        # 멘션 재계산
-        mention_usernames = extract_mentions(new_content)
-        mention_user_ids = _resolve_mention_user_ids(conn, mention_usernames)
+        # 멘션 재계산 — FG 5-5 (2026-05-14): viewer scope + display_name fallback
+        viewer_id = str(actor.actor_id) if actor.actor_id else None
+        mention_tokens = extract_mentions(new_content)
+        mention_user_ids = _resolve_mention_user_ids(
+            conn, mention_tokens, viewer_user_id=viewer_id,
+        )
         annotations_repository.replace_mentions(conn, annotation_id, mention_user_ids)
         # 신규 멘션만 알림 (기존 멘션 → 알림 재발생 방지). 단순화: 차이 계산
         new_recipients = set(mention_user_ids) - set(annotation.mentioned_user_ids or [])

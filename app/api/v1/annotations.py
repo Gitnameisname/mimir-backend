@@ -88,6 +88,8 @@ def create_annotation(
             span_end=body.span_end,
             parent_id=body.parent_id,
             version_id=body.version_id,
+            # S3 Phase 5 FG 5-5 (2026-05-14): typeahead 명시 user_ids. service 가 scope 검증.
+            explicit_mentioned_user_ids=body.mentioned_user_ids,
         )
     return success_response(
         data=_to_response(ann).model_dump(),

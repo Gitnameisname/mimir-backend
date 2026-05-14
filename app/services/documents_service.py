@@ -220,6 +220,8 @@ class DocumentsService:
         """문서 목록과 전체 건수를 반환한다.
 
         FG 2-0 ACL: actor 가 전달되면 viewer Scope 로 자동 필터.
+        FG 2-4 보강 (2026-05-14): 응답에 folder_id / in_collection_ids 배치 채움 —
+        TreeLayout / 컬렉션 분류 표시에 필수. N+1 회피 위해 단일 IN 쿼리.
 
         Returns:
             (document_responses, total_count)
@@ -228,6 +230,45 @@ class DocumentsService:
         docs, total = documents_repository.list(
             conn, query, viewer_scope_profile_ids=viewer_ids,
         )
+
+        # FG 2-4 (2026-05-14): folder_id / in_collection_ids 배치 채우기.
+        # get_document 와 일관 — service layer 에서 후처리 (N+1 회피 단일 쿼리).
+        doc_ids = [d.id for d in docs]
+        if doc_ids:
+            folder_map: dict[str, str] = {}
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT document_id, folder_id FROM document_folder "
+                    "WHERE document_id = ANY(%s::uuid[])",
+                    (doc_ids,),
+                )
+                for row in cur.fetchall():
+                    folder_map[str(row["document_id"])] = str(row["folder_id"])
+
+            col_map: dict[str, list[str]] = {}
+            if actor is not None and actor.actor_id:
+                # owner 격리: 자기 소유 컬렉션의 멤버십만 노출 (collections_repository
+                # 의 list_collection_ids_for_document 와 동일 정책)
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT cd.document_id, cd.collection_id
+                        FROM collection_documents cd
+                        JOIN collections c ON c.id = cd.collection_id
+                        WHERE cd.document_id = ANY(%s::uuid[])
+                          AND c.owner_id = %s
+                        """,
+                        (doc_ids, str(actor.actor_id)),
+                    )
+                    for row in cur.fetchall():
+                        col_map.setdefault(str(row["document_id"]), []).append(
+                            str(row["collection_id"])
+                        )
+
+            for d in docs:
+                d.folder_id = folder_map.get(d.id)
+                d.in_collection_ids = col_map.get(d.id, [])
+
         return [_to_response(doc) for doc in docs], total
 
     # ------------------------------------------------------------------
