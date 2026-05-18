@@ -179,6 +179,11 @@ class RetentionJob:
             return {"candidates": candidates, "archived": 0, "deleted": 0}
 
         # archive-first — 단일 트랜잭션 안에 INSERT + DELETE.
+        # Codex 2차 P1-1 (2026-05-18) 시정:
+        #   - DELETE 기준을 "archive 성공 id 집합" 으로 제한 (이전엔 expired 후보).
+        #   - 이전 retry 등으로 archive 에 이미 존재하던 row 도 같이 source 에서 정리
+        #     해야 batch idempotency 가 보장된다 → already_archived CTE 로 union.
+        #   - archive 성공 / 이미 존재 외 어떤 row 도 DELETE 대상이 되지 않는다.
         with self._conn.cursor() as cur:
             cur.execute(
                 f"""
@@ -190,7 +195,7 @@ class RetentionJob:
                     ORDER BY occurred_at ASC
                     LIMIT %s
                 ),
-                moved AS (
+                inserted AS (
                     INSERT INTO audit_events_archive (
                         id, event_type, occurred_at, actor_user_id, actor_role,
                         document_id, version_id, target_version_id,
@@ -204,9 +209,19 @@ class RetentionJob:
                     INNER JOIN expired e ON e.id = ae.id
                     ON CONFLICT (id) DO NOTHING
                     RETURNING id
+                ),
+                already_archived AS (
+                    SELECT a.id
+                    FROM audit_events_archive a
+                    INNER JOIN expired e ON e.id = a.id
+                ),
+                deletable AS (
+                    SELECT id FROM inserted
+                    UNION
+                    SELECT id FROM already_archived
                 )
                 DELETE FROM audit_events
-                WHERE id IN (SELECT id FROM moved)
+                WHERE id IN (SELECT id FROM deletable)
                 RETURNING id
                 """,
                 (str(self._viewed_days), self._batch_limit),
@@ -214,7 +229,8 @@ class RetentionJob:
             deleted_rows = cur.fetchall()
             deleted = len(deleted_rows)
         self._conn.commit()
-        # archived == deleted (RETURNING 가 같은 id 만 반환).
+        # archived 는 "archive 테이블에 존재 보장된 id 수" — 이번 회차 INSERT + 이전
+        # 회차 잔존 모두 포함. deleted 와 동치 (deletable 의 정의).
         return {"candidates": candidates, "archived": deleted, "deleted": deleted}
 
     # ------------------------------------------------------------------
@@ -242,12 +258,18 @@ class RetentionJob:
         if self._dry_run or candidates == 0:
             return {"candidates": candidates, "archived": 0, "deleted": 0}
 
-        # archive 1단계: root + 직속 답글 모두 archive 테이블로 INSERT.
-        # delete 단계: root id 로 cascade DELETE (parent_id FK ON DELETE CASCADE).
+        # Codex 2차 P1-1 (2026-05-18) 시정:
+        #   (a) **recursive CTE** 로 root 의 전체 descendant (nested replies 임의 depth)
+        #       를 수집 → annotations.parent_id FK ON DELETE CASCADE 가 archive
+        #       전에 답글을 삭제하는 경로 차단.
+        #   (b) DELETE 기준을 archive 성공 + already_archived UNION 으로 제한 →
+        #       어떤 상황에서도 archive 미통과 row 가 source 에서 사라지지 않음.
+        #   (c) archived row 수와 deleted row 수 가 일치하지 않으면 rollback +
+        #       error 반환 → archive-first 위반을 즉시 가시화.
         with self._conn.cursor() as cur:
             cur.execute(
                 f"""
-                WITH expired_roots AS (
+                WITH RECURSIVE expired_roots AS (
                     SELECT id
                     FROM annotations
                     WHERE status = 'resolved'
@@ -257,13 +279,19 @@ class RetentionJob:
                     ORDER BY resolved_at ASC
                     LIMIT %s
                 ),
-                expired_all AS (
-                    SELECT a.id
+                descendants AS (
+                    SELECT a.id, a.parent_id
                     FROM annotations a
-                    INNER JOIN expired_roots r
-                      ON a.id = r.id OR a.parent_id = r.id
+                    INNER JOIN expired_roots r ON a.id = r.id
+                    UNION ALL
+                    SELECT a.id, a.parent_id
+                    FROM annotations a
+                    INNER JOIN descendants d ON a.parent_id = d.id
                 ),
-                archived AS (
+                expired_all AS (
+                    SELECT DISTINCT id FROM descendants
+                ),
+                inserted AS (
                     INSERT INTO annotations_archive (
                         id, document_id, version_id, node_id, span_start, span_end,
                         author_id, actor_type, content, status, resolved_at, resolved_by,
@@ -276,17 +304,60 @@ class RetentionJob:
                     INNER JOIN expired_all e ON e.id = a.id
                     ON CONFLICT (id) DO NOTHING
                     RETURNING id
+                ),
+                already_archived AS (
+                    SELECT a.id
+                    FROM annotations_archive a
+                    INNER JOIN expired_all e ON e.id = a.id
+                ),
+                deletable AS (
+                    SELECT id FROM inserted
+                    UNION
+                    SELECT id FROM already_archived
                 )
                 DELETE FROM annotations
-                WHERE id IN (SELECT id FROM expired_all)
+                WHERE id IN (SELECT id FROM deletable)
                 RETURNING id
                 """,
                 (str(self._resolved_days), self._batch_limit),
             )
             deleted_rows = cur.fetchall()
             deleted = len(deleted_rows)
+
+            # archive-first 무결성 게이트: DELETE 한 모든 id 가 archive 에 존재해야 함.
+            #   ON DELETE CASCADE 가 archive 안 거친 reply 를 함께 삭제하면 여기서 발견.
+            if deleted > 0:
+                cur.execute(
+                    """
+                    SELECT COUNT(*)::int AS c
+                    FROM (
+                        SELECT id FROM annotations_archive
+                        WHERE id = ANY(%s)
+                    ) t
+                    """,
+                    ([self._row_id(r) for r in deleted_rows],),
+                )
+                row = cur.fetchone()
+                archived_count = int(
+                    (row.get("c") if isinstance(row, dict) else row[0]) or 0
+                ) if row else 0
+                if archived_count != deleted:
+                    # 데이터 손실 가능성 — rollback 후 error.
+                    self._conn.rollback()
+                    raise RuntimeError(
+                        "annotation retention archive-first violation: "
+                        f"deleted={deleted} archived={archived_count}"
+                    )
+
         self._conn.commit()
         return {"candidates": candidates, "archived": deleted, "deleted": deleted}
+
+    @staticmethod
+    def _row_id(row) -> str:
+        """RETURNING id 결과 row 에서 id 값 추출 (dict / tuple 모두 지원)."""
+        if isinstance(row, dict):
+            return row.get("id")
+        return row[0]
 
     # ------------------------------------------------------------------
     def _safe_rollback(self) -> None:

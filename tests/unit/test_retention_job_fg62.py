@@ -63,14 +63,16 @@ def test_actual_run_invokes_commit():
     cursor = MagicMock()
     cursor.__enter__ = MagicMock(return_value=cursor)
     cursor.__exit__ = MagicMock(return_value=False)
-    # 시퀀스:
+    # 시퀀스 (Codex 2차 P1-1 시정 후):
     #   1) audit count → 2
-    #   2) audit INSERT/DELETE RETURNING → [{"id":...}, {"id":...}]
+    #   2) audit INSERT/DELETE RETURNING → [a1, a2]
     #   3) ann count → 1
-    #   4) ann INSERT/DELETE RETURNING → [{"id":...}]
+    #   4) ann INSERT/DELETE RETURNING → [n1]
+    #   5) ann archive 무결성 verify COUNT(*) → 1 (deleted 와 일치 → OK)
     cursor.fetchone.side_effect = [
-        {"c": 2},
-        {"c": 1},
+        {"c": 2},   # audit candidates
+        {"c": 1},   # annotations candidates
+        {"c": 1},   # annotations archive 무결성 verify
     ]
     cursor.fetchall.side_effect = [
         [{"id": "a1"}, {"id": "a2"}],
@@ -90,6 +92,97 @@ def test_actual_run_invokes_commit():
     assert result["resolved_annotations"]["candidates"] == 1
     assert result["resolved_annotations"]["archived"] == 1
     assert conn.commit.call_count == 2  # audit + annotations 각 1회.
+
+
+# Codex 2차 P1-1 — archive-first 무결성 회귀 ----------------------------------
+
+def test_archive_first_violation_rolls_back():
+    """annotation archive 후 verify count 가 deleted 와 불일치 → rollback + error."""
+    cursor = MagicMock()
+    cursor.__enter__ = MagicMock(return_value=cursor)
+    cursor.__exit__ = MagicMock(return_value=False)
+    cursor.fetchone.side_effect = [
+        {"c": 0},   # audit candidates 0 (skip)
+        {"c": 2},   # annotations candidates
+        {"c": 1},   # archive verify — deleted=2 인데 archive 에 1 만 → 위반!
+    ]
+    cursor.fetchall.side_effect = [
+        [{"id": "n1"}, {"id": "n2"}],   # DELETE RETURNING — 2 row
+    ]
+    conn = MagicMock()
+    conn.cursor.return_value = cursor
+
+    job = RetentionJob(
+        conn, viewed_days=7, resolved_annotation_days=90,
+        batch_limit=100, dry_run=False,
+    )
+    result = job.run(request_id="t-violation")
+    # error 가 errors list 에 잡힘, status = partial.
+    assert result["status"] == "partial"
+    assert any("archive-first" in e for e in result["errors"])
+    conn.rollback.assert_called()
+    # archive 부분만 rollback — audit 은 commit 시도 없음 (candidates=0).
+    assert conn.commit.call_count == 0
+
+
+def test_annotation_retention_uses_recursive_cte_sql():
+    """nested reply (depth>1) 가 archive 누락 없이 처리되려면 SQL 에 RECURSIVE
+    CTE 가 있어야 한다 — Codex P1-1.
+    """
+    cursor = MagicMock()
+    cursor.__enter__ = MagicMock(return_value=cursor)
+    cursor.__exit__ = MagicMock(return_value=False)
+    cursor.fetchone.side_effect = [
+        {"c": 0},   # audit skip
+        {"c": 1},   # ann candidates
+        {"c": 1},   # archive verify OK
+    ]
+    cursor.fetchall.side_effect = [[{"id": "n1"}]]
+    conn = MagicMock()
+    conn.cursor.return_value = cursor
+
+    job = RetentionJob(
+        conn, viewed_days=7, resolved_annotation_days=90,
+        batch_limit=100, dry_run=False,
+    )
+    job.run(request_id="t-recursive")
+
+    executed_sql = [
+        (call.args[0] if call.args else "")
+        for call in cursor.execute.call_args_list
+    ]
+    assert any("RECURSIVE" in s and "descendants" in s for s in executed_sql), (
+        "annotation retention SQL must use recursive CTE for nested replies"
+    )
+
+
+def test_audit_retention_uses_deletable_union():
+    """audit retention DELETE 기준이 inserted ∪ already_archived UNION 임을 보장."""
+    cursor = MagicMock()
+    cursor.__enter__ = MagicMock(return_value=cursor)
+    cursor.__exit__ = MagicMock(return_value=False)
+    cursor.fetchone.side_effect = [
+        {"c": 1},   # audit candidates
+        {"c": 0},   # ann skip
+    ]
+    cursor.fetchall.side_effect = [[{"id": "a1"}]]
+    conn = MagicMock()
+    conn.cursor.return_value = cursor
+
+    job = RetentionJob(
+        conn, viewed_days=7, resolved_annotation_days=90,
+        batch_limit=100, dry_run=False,
+    )
+    job.run(request_id="t-audit-deletable")
+
+    executed_sql = [
+        (call.args[0] if call.args else "")
+        for call in cursor.execute.call_args_list
+    ]
+    assert any(
+        "deletable" in s and "already_archived" in s and "UNION" in s
+        for s in executed_sql
+    ), "audit retention DELETE must target deletable = inserted UNION already_archived"
 
 
 def test_env_int_fallback_on_bad_value():
