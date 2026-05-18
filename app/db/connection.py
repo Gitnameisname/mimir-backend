@@ -1855,6 +1855,64 @@ CREATE INDEX IF NOT EXISTS idx_notifications_user_created
     ON notifications(user_id, created_at DESC);
 """
 
+# S3 Phase 6 FG 6-2 (2026-05-18): retention archive — 데이터 폐기 전 보존 테이블.
+# R-O2: archive-first. cron 이 INSERT INTO ... SELECT + DELETE 트랜잭션.
+_AUDIT_EVENTS_ARCHIVE_DDL = """
+CREATE TABLE IF NOT EXISTS audit_events_archive (
+    id                UUID PRIMARY KEY,
+    event_type        VARCHAR(100) NOT NULL,
+    occurred_at       TIMESTAMPTZ NOT NULL,
+    actor_user_id     VARCHAR(255),
+    actor_role        VARCHAR(100),
+    document_id       UUID,
+    version_id        UUID,
+    target_version_id UUID,
+    previous_state    VARCHAR(100),
+    new_state         VARCHAR(100),
+    action_result     VARCHAR(50) NOT NULL DEFAULT 'success',
+    reason            VARCHAR(500),
+    request_id        VARCHAR(255),
+    archived_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_events_archive_event_type
+    ON audit_events_archive(event_type);
+CREATE INDEX IF NOT EXISTS idx_audit_events_archive_archived_at
+    ON audit_events_archive(archived_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_events_archive_occurred_at
+    ON audit_events_archive(occurred_at DESC);
+"""
+
+_ANNOTATIONS_ARCHIVE_DDL = """
+CREATE TABLE IF NOT EXISTS annotations_archive (
+    id            UUID PRIMARY KEY,
+    document_id   UUID NOT NULL,
+    version_id    UUID NULL,
+    node_id       UUID NOT NULL,
+    span_start    INT NULL,
+    span_end      INT NULL,
+    author_id     VARCHAR(255) NOT NULL,
+    actor_type    VARCHAR(32) NOT NULL,
+    content       TEXT NOT NULL,
+    status        VARCHAR(16) NOT NULL,
+    resolved_at   TIMESTAMPTZ NULL,
+    resolved_by   VARCHAR(255) NULL,
+    parent_id     UUID NULL,
+    is_orphan     BOOLEAN NOT NULL DEFAULT FALSE,
+    orphaned_at   TIMESTAMPTZ NULL,
+    created_at    TIMESTAMPTZ NOT NULL,
+    updated_at    TIMESTAMPTZ NOT NULL,
+    archived_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_annotations_archive_document_id
+    ON annotations_archive(document_id);
+CREATE INDEX IF NOT EXISTS idx_annotations_archive_archived_at
+    ON annotations_archive(archived_at DESC);
+CREATE INDEX IF NOT EXISTS idx_annotations_archive_resolved_at
+    ON annotations_archive(resolved_at DESC);
+"""
+
 
 def init_db() -> None:
     """앱 시작 시 모든 테이블을 생성하고 마이그레이션을 적용한다 (idempotent).
@@ -1952,6 +2010,9 @@ def init_db() -> None:
         ("ANNOTATIONS_DDL", _ANNOTATIONS_DDL),
         ("ANNOTATION_MENTIONS_DDL", _ANNOTATION_MENTIONS_DDL),
         ("NOTIFICATIONS_DDL", _NOTIFICATIONS_DDL),
+        # S3 Phase 6 FG 6-2 (2026-05-18): retention archive (audit_events / annotations)
+        ("AUDIT_EVENTS_ARCHIVE_DDL", _AUDIT_EVENTS_ARCHIVE_DDL),
+        ("ANNOTATIONS_ARCHIVE_DDL", _ANNOTATIONS_ARCHIVE_DDL),
     ]
 
     skipped: list[str] = []

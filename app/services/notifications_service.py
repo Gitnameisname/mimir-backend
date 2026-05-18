@@ -88,6 +88,9 @@ class NotificationsService:
                 )
                 return None
 
+        # S3 Phase 6 FG 6-3 (2026-05-18): snippet 도 응답에 그대로 노출되므로
+        # read-시점 sanitize 와 같은 정규화를 enqueue 단계에서 미리 적용 (저장 정합성).
+        from app.utils.content_sanitizer import sanitize_for_response
         return notifications_repository.enqueue(
             conn,
             user_id=recipient_id,
@@ -96,7 +99,7 @@ class NotificationsService:
                 "author_id": author_id,
                 "annotation_id": annotation_id,
                 "document_id": document_id,
-                "snippet": (snippet or "")[:200],
+                "snippet": sanitize_for_response((snippet or "")[:200]),
             },
         )
 

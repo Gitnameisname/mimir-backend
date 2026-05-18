@@ -180,7 +180,11 @@ def _validate_content(content: str) -> str:
         raise ApiValidationError(
             f"주석 본문은 {MAX_CONTENT_LENGTH}자를 초과할 수 없습니다."
         )
-    return content
+    # S3 Phase 6 FG 6-3 (2026-05-18): write 시 위험 문자 reject (R-O3).
+    #   - null byte / BOM / RTL override / surrogate 코드포인트.
+    #   - sanitize 가 아닌 reject — 사용자 입력 손실 없이 명시적 에러 전달.
+    from app.utils.content_sanitizer import reject_dangerous_chars
+    return reject_dangerous_chars(content, field_label="주석 본문", max_length=MAX_CONTENT_LENGTH)
 
 
 class AnnotationsService:

@@ -56,6 +56,9 @@ router = APIRouter()
 # 기존 _ADMIN_ROLES 모듈 상수와 _require_admin 함수는 thin re-export 로 호환 유지.
 from app.utils.actor import ADMIN_ROLES as _ADMIN_ROLES, require_admin as _require_admin  # noqa: F401
 
+# S3 Phase 6 FG 6-4 (2026-05-18): admin organization 격리 — SUPER_ADMIN 만 횡단 허용.
+from app.utils.admin_org_guard import ensure_actor_can_access_org
+
 
 def _get_affected_agents(conn, profile_id: str) -> list[dict]:
     """Scope Profile에 바인딩된 에이전트 목록을 반환한다."""
@@ -138,6 +141,13 @@ def create_scope_profile(
     )
     try:
         with get_db() as conn:
+            # FG 6-4 R-O4: 다른 조직 자원 생성 차단.
+            ensure_actor_can_access_org(
+                conn, actor,
+                target_org_id=body.organization_id,
+                action="scope_profile.create",
+                resource_type="scope_profile",
+            )
             repo = ScopeProfileRepository(conn)
             profile = repo.create(
                 name=body.name,
@@ -172,7 +182,37 @@ def list_scope_profiles(
     actor: ActorContext = Depends(resolve_current_actor),
 ):
     _require_admin(actor)
+    # FG 6-4 R-O4: non-SUPER_ADMIN 은 자기 조직만. organization_id 미지정 시 본인 조직
+    # 으로 강제, 다른 조직 지정 시 거부 (또는 SUPER_ADMIN 이면 통과).
+    from app.utils.admin_org_guard import is_super_admin, actor_org_ids
     with get_db() as conn:
+        if not is_super_admin(actor):
+            allowed_orgs = actor_org_ids(
+                conn, actor, role_filter=frozenset({"ORG_ADMIN", "SUPER_ADMIN"}),
+            )
+            if organization_id is None:
+                # 미지정 — 본인 첫 org 으로 강제. (다중 조직 admin 은 향후 확장)
+                if not allowed_orgs:
+                    return ScopeProfileListResponse(
+                        items=[], total=0, limit=limit, offset=offset,
+                    )
+                organization_id = sorted(allowed_orgs)[0]
+            elif str(organization_id) not in allowed_orgs:
+                ensure_actor_can_access_org(
+                    conn, actor,
+                    target_org_id=organization_id,
+                    action="scope_profile.list",
+                    resource_type="scope_profile",
+                )
+        else:
+            # SUPER_ADMIN 이면서 organization_id 명시 시 횡단 audit 자동 emit.
+            if organization_id is not None:
+                ensure_actor_can_access_org(
+                    conn, actor,
+                    target_org_id=organization_id,
+                    action="scope_profile.list",
+                    resource_type="scope_profile",
+                )
         repo = ScopeProfileRepository(conn)
         profiles = repo.list_profiles(organization_id=organization_id, limit=limit, offset=offset)
         total = repo.count(organization_id=organization_id)
@@ -197,8 +237,16 @@ def get_scope_profile(
     with get_db() as conn:
         repo = ScopeProfileRepository(conn)
         profile = repo.get_by_id(profile_id)
-    if not profile:
-        raise not_found("Scope Profile을 찾을 수 없습니다.")
+        if not profile:
+            raise not_found("Scope Profile을 찾을 수 없습니다.")
+        # FG 6-4 R-O4: 본 actor 조직 자원만 노출. SUPER_ADMIN 만 횡단 (audit emit).
+        ensure_actor_can_access_org(
+            conn, actor,
+            target_org_id=profile.organization_id,
+            action="scope_profile.read",
+            resource_type="scope_profile",
+            resource_id=profile_id,
+        )
     return _profile_response(profile)
 
 
@@ -227,16 +275,25 @@ def update_scope_profile(
         with get_db() as conn:
             affected_agents = _get_affected_agents(conn, profile_id)
             repo = ScopeProfileRepository(conn)
+            # FG 6-4 R-O4: 본 actor 조직 자원만 수정. 변경 전 상태 캡쳐 시 함께 확인.
+            existing = repo.get_by_id(profile_id)
+            if existing is None:
+                raise not_found("Scope Profile을 찾을 수 없습니다.")
+            ensure_actor_can_access_org(
+                conn, actor,
+                target_org_id=existing.organization_id,
+                action="scope_profile.update",
+                resource_type="scope_profile",
+                resource_id=profile_id,
+            )
             # settings.changed / allowed_tools.changed audit 를 위해 변경 전 값 캡쳐
             if settings_patch is not None or body.allowed_tools is not None:
-                existing = repo.get_by_id(profile_id)
-                if existing is not None:
-                    if settings_patch is not None:
-                        settings_before = {
-                            "expose_viewers": bool(existing.settings.expose_viewers),
-                        }
-                    if body.allowed_tools is not None:
-                        allowed_tools_before = list(existing.allowed_tools or [])
+                if settings_patch is not None:
+                    settings_before = {
+                        "expose_viewers": bool(existing.settings.expose_viewers),
+                    }
+                if body.allowed_tools is not None:
+                    allowed_tools_before = list(existing.allowed_tools or [])
             profile = repo.update(
                 profile_id,
                 name=body.name,
@@ -308,6 +365,17 @@ def delete_scope_profile(
     with get_db() as conn:
         affected_agents = _get_affected_agents(conn, profile_id)
         repo = ScopeProfileRepository(conn)
+        # FG 6-4 R-O4: 본 actor 조직 자원만 삭제.
+        existing = repo.get_by_id(profile_id)
+        if existing is None:
+            raise not_found("Scope Profile을 찾을 수 없습니다.")
+        ensure_actor_can_access_org(
+            conn, actor,
+            target_org_id=existing.organization_id,
+            action="scope_profile.delete",
+            resource_type="scope_profile",
+            resource_id=profile_id,
+        )
         deleted = repo.delete(profile_id)
     if not deleted:
         raise not_found("Scope Profile을 찾을 수 없습니다.")
@@ -396,6 +464,13 @@ def create_agent(
 ):
     _require_admin(actor)
     with get_db() as conn:
+        # FG 6-4 R-O4: 다른 조직 agent 생성 차단.
+        ensure_actor_can_access_org(
+            conn, actor,
+            target_org_id=body.organization_id,
+            action="agent.create",
+            resource_type="agent",
+        )
         repo = AgentRepository(conn)
         agent = repo.create(
             name=body.name,
@@ -429,7 +504,31 @@ def list_agents(
     actor: ActorContext = Depends(resolve_current_actor),
 ):
     _require_admin(actor)
+    # FG 6-4 R-O4: non-SUPER_ADMIN 은 자기 조직만.
+    from app.utils.admin_org_guard import is_super_admin, actor_org_ids
     with get_db() as conn:
+        if not is_super_admin(actor):
+            allowed_orgs = actor_org_ids(
+                conn, actor, role_filter=frozenset({"ORG_ADMIN", "SUPER_ADMIN"}),
+            )
+            if organization_id is None:
+                if not allowed_orgs:
+                    return AgentListResponse(items=[], total=0, limit=limit, offset=offset)
+                organization_id = sorted(allowed_orgs)[0]
+            elif str(organization_id) not in allowed_orgs:
+                ensure_actor_can_access_org(
+                    conn, actor,
+                    target_org_id=organization_id,
+                    action="agent.list",
+                    resource_type="agent",
+                )
+        elif organization_id is not None:
+            ensure_actor_can_access_org(
+                conn, actor,
+                target_org_id=organization_id,
+                action="agent.list",
+                resource_type="agent",
+            )
         repo = AgentRepository(conn)
         agents = repo.list_agents(organization_id=organization_id, limit=limit, offset=offset)
         total = repo.count(organization_id=organization_id)
@@ -454,8 +553,16 @@ def get_agent(
     with get_db() as conn:
         repo = AgentRepository(conn)
         agent = repo.get_by_id(agent_id)
-    if not agent:
-        raise not_found("에이전트를 찾을 수 없습니다.")
+        if not agent:
+            raise not_found("에이전트를 찾을 수 없습니다.")
+        # FG 6-4 R-O4.
+        ensure_actor_can_access_org(
+            conn, actor,
+            target_org_id=agent.organization_id,
+            action="agent.read",
+            resource_type="agent",
+            resource_id=agent_id,
+        )
     return _agent_response(agent)
 
 
@@ -472,6 +579,17 @@ def update_agent(
     _require_admin(actor)
     with get_db() as conn:
         repo = AgentRepository(conn)
+        existing = repo.get_by_id(agent_id)
+        if not existing:
+            raise not_found("에이전트를 찾을 수 없습니다.")
+        # FG 6-4 R-O4.
+        ensure_actor_can_access_org(
+            conn, actor,
+            target_org_id=existing.organization_id,
+            action="agent.update",
+            resource_type="agent",
+            resource_id=agent_id,
+        )
         agent = repo.update(
             agent_id,
             name=body.name,
@@ -504,6 +622,17 @@ def delete_agent(
     _require_admin(actor)
     with get_db() as conn:
         repo = AgentRepository(conn)
+        existing = repo.get_by_id(agent_id)
+        if not existing:
+            raise not_found("에이전트를 찾을 수 없습니다.")
+        # FG 6-4 R-O4.
+        ensure_actor_can_access_org(
+            conn, actor,
+            target_org_id=existing.organization_id,
+            action="agent.delete",
+            resource_type="agent",
+            resource_id=agent_id,
+        )
         deleted = repo.delete(agent_id)
     if not deleted:
         raise not_found("에이전트를 찾을 수 없습니다.")

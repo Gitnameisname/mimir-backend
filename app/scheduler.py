@@ -10,10 +10,16 @@ S2 원칙 ⑦ (폐쇄망 호환):
   - cron_util.next_run() 으로 다음 실행 시각 계산
   - 실행 실패 시 로그만 기록, 다음 주기에 재시도
   - stop() 으로 graceful shutdown (이벤트 방식)
+
+S3 Phase 6 FG 6-2 (2026-05-18):
+  - retention 배치 (audit_events.document.viewed 7일 / 해결 annotation 90일) 추가.
+  - 기본 cron: 매일 RETENTION_CRON_HOUR (기본 02시).
+  - 두 스케줄러를 별 thread 로 분리 — 한 쪽 실패가 다른 쪽 영향 없음.
 """
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from datetime import datetime
 from typing import Callable, Optional
@@ -26,6 +32,8 @@ logger = logging.getLogger(__name__)
 
 # 기본 배치 스케줄: 매일 자정 0시
 _DEFAULT_EXPIRATION_SCHEDULE = "0 0 * * *"
+# Phase 6 FG 6-2: retention 은 off-peak 시간 (기본 02시).
+_DEFAULT_RETENTION_HOUR = 2
 
 
 class BatchScheduler:
@@ -141,33 +149,81 @@ def _default_expiration_job(*, request_id: Optional[str] = None) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Phase 6 FG 6-2: retention 작업 래퍼
+# ---------------------------------------------------------------------------
+
+def _default_retention_job(*, request_id: Optional[str] = None) -> None:
+    try:
+        from app.services.retention_job import run_retention_job
+        result = run_retention_job(request_id=request_id)
+        logger.info("retention_job_result %s", result)
+    except Exception as exc:
+        logger.error("retention_job_error error=%s", exc)
+
+
+def _retention_schedule() -> str:
+    """``RETENTION_CRON_HOUR`` 환경변수 → 5-field cron 표현식.
+
+    값이 0~23 범위가 아니면 기본 02시 사용.
+    """
+    raw = os.getenv("RETENTION_CRON_HOUR")
+    hour = _DEFAULT_RETENTION_HOUR
+    if raw is not None and raw.strip() != "":
+        try:
+            parsed = int(raw.strip())
+            if 0 <= parsed <= 23:
+                hour = parsed
+        except ValueError:
+            logger.warning("Invalid RETENTION_CRON_HOUR=%r, using default %d", raw, hour)
+    # 매일 hour:00.
+    return f"0 {hour} * * *"
+
+
+# ---------------------------------------------------------------------------
 # 모듈 수준 싱글턴 (FastAPI startup/shutdown 에서 사용)
 # ---------------------------------------------------------------------------
 
 _scheduler: Optional[BatchScheduler] = None
+_retention_scheduler: Optional[BatchScheduler] = None
 
 
 def get_scheduler() -> BatchScheduler:
     """모듈 수준 스케줄러 싱글턴."""
     global _scheduler
     if _scheduler is None:
-        import os
         schedule = os.getenv("EXPIRATION_BATCH_SCHEDULE", _DEFAULT_EXPIRATION_SCHEDULE)
         _scheduler = BatchScheduler(schedule=schedule)
     return _scheduler
 
 
+def get_retention_scheduler() -> BatchScheduler:
+    global _retention_scheduler
+    if _retention_scheduler is None:
+        _retention_scheduler = BatchScheduler(
+            schedule=_retention_schedule(),
+            job_fn=_default_retention_job,
+        )
+    return _retention_scheduler
+
+
 def start_scheduler() -> None:
     """FastAPI startup 이벤트에서 호출."""
-    import os
     if os.getenv("AUTO_EXPIRATION_ENABLED", "true").lower() == "false":
         logger.info("AUTO_EXPIRATION_ENABLED=false → BatchScheduler 비활성")
-        return
-    get_scheduler().start()
+    else:
+        get_scheduler().start()
+
+    # Phase 6 FG 6-2: retention 활성화 (기본 on, off 는 환경변수로).
+    if os.getenv("RETENTION_BATCH_ENABLED", "true").lower() == "false":
+        logger.info("RETENTION_BATCH_ENABLED=false → RetentionScheduler 비활성")
+    else:
+        get_retention_scheduler().start()
 
 
 def stop_scheduler() -> None:
     """FastAPI shutdown 이벤트에서 호출."""
-    global _scheduler
+    global _scheduler, _retention_scheduler
     if _scheduler and _scheduler.is_running:
         _scheduler.stop()
+    if _retention_scheduler and _retention_scheduler.is_running:
+        _retention_scheduler.stop()

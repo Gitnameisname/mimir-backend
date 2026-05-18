@@ -17,6 +17,7 @@ from app.api.auth import resolve_current_actor
 from app.api.auth.models import ActorContext
 from app.api.context import get_request_ids
 from app.api.errors.exceptions import ApiPermissionDeniedError
+from app.api.rate_limit import limiter
 from app.api.responses import SuccessResponse, list_response, success_response
 from app.db import get_db
 from app.models.annotation import Notification
@@ -24,6 +25,11 @@ from app.schemas.annotation import NotificationResponse, NotificationsMarkReadRe
 from app.services.notifications_service import notifications_service
 
 router = APIRouter()
+
+# S3 Phase 6 FG 6-1 (2026-05-18): notifications polling 은 frontend 가 빈번 호출.
+# 120/min (= 0.5s 당 1회) 로 폴링 보호. mark-read 는 쓰기 보호로 60/min.
+_NOTIFICATIONS_POLL_LIMIT = "120/minute"
+_NOTIFICATIONS_WRITE_LIMIT = "60/minute"
 
 
 def _require_authenticated(actor: ActorContext) -> None:
@@ -47,6 +53,7 @@ def _to_response(n: Notification) -> NotificationResponse:
     summary="본인 알림 목록",
     response_model=SuccessResponse,
 )
+@limiter.limit(_NOTIFICATIONS_POLL_LIMIT)
 def list_notifications(
     request: Request,
     unread_only: bool = Query(default=False),
@@ -71,6 +78,7 @@ def list_notifications(
     summary="미읽음 알림 카운트",
     response_model=SuccessResponse,
 )
+@limiter.limit(_NOTIFICATIONS_POLL_LIMIT)
 def unread_count(
     request: Request,
     actor: ActorContext = Depends(resolve_current_actor),
@@ -91,6 +99,7 @@ def unread_count(
     summary="알림 읽음 처리 (본인 알림만)",
     response_model=SuccessResponse,
 )
+@limiter.limit(_NOTIFICATIONS_WRITE_LIMIT)
 def mark_read(
     body: NotificationsMarkReadRequest,
     request: Request,

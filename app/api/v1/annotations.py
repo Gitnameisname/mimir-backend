@@ -22,6 +22,7 @@ from fastapi import APIRouter, Depends, Query, Request
 from app.api.auth import resolve_current_actor
 from app.api.auth.models import ActorContext
 from app.api.context import get_request_ids
+from app.api.rate_limit import limiter
 from app.api.responses import SuccessResponse, list_response, success_response
 from app.db import get_db
 from app.models.annotation import Annotation
@@ -36,8 +37,16 @@ from app.services.annotations_service import annotations_service
 documents_annotations_router = APIRouter()
 annotations_router = APIRouter()
 
+# S3 Phase 6 FG 6-1 (2026-05-18): Rate limit 일괄 — 쓰기는 30/min, 읽기는 60/min.
+# 기존 patterns (citations / users_search / search / rag) 와 동일 dependency.
+_ANNOTATION_WRITE_LIMIT = "30/minute"
+_ANNOTATION_READ_LIMIT = "60/minute"
+
 
 def _to_response(a: Annotation) -> AnnotationResponse:
+    # S3 Phase 6 FG 6-3 (2026-05-18): 응답 직렬화 시 ANSI/control byte sanitize.
+    # DB 원본은 raw 그대로 (R-O3: write 시 raw 보존). read 시에만 정규화.
+    from app.utils.content_sanitizer import sanitize_for_response
     return AnnotationResponse(
         id=a.id,
         document_id=a.document_id,
@@ -47,7 +56,7 @@ def _to_response(a: Annotation) -> AnnotationResponse:
         span_end=a.span_end,
         author_id=a.author_id,
         actor_type=a.actor_type,  # type: ignore[arg-type]
-        content=a.content,
+        content=sanitize_for_response(a.content),
         status=a.status,  # type: ignore[arg-type]
         resolved_at=a.resolved_at,
         resolved_by=a.resolved_by,
@@ -70,6 +79,7 @@ def _to_response(a: Annotation) -> AnnotationResponse:
     response_model=SuccessResponse,
     status_code=201,
 )
+@limiter.limit(_ANNOTATION_WRITE_LIMIT)
 def create_annotation(
     document_id: str,
     body: AnnotationCreateRequest,
@@ -103,6 +113,7 @@ def create_annotation(
     summary="문서의 주석 목록",
     response_model=SuccessResponse,
 )
+@limiter.limit(_ANNOTATION_READ_LIMIT)
 def list_annotations(
     document_id: str,
     request: Request,
@@ -141,6 +152,7 @@ def list_annotations(
     summary="주석 단건",
     response_model=SuccessResponse,
 )
+@limiter.limit(_ANNOTATION_READ_LIMIT)
 def get_annotation(
     annotation_id: str,
     request: Request,
@@ -163,6 +175,7 @@ def get_annotation(
     summary="주석 본문 수정 (작성자 본인만)",
     response_model=SuccessResponse,
 )
+@limiter.limit(_ANNOTATION_WRITE_LIMIT)
 def update_annotation(
     annotation_id: str,
     body: AnnotationUpdateRequest,
@@ -189,6 +202,7 @@ def update_annotation(
     summary="주석 해결 (작성자 또는 admin)",
     response_model=SuccessResponse,
 )
+@limiter.limit(_ANNOTATION_WRITE_LIMIT)
 def resolve_annotation(
     annotation_id: str,
     request: Request,
@@ -211,6 +225,7 @@ def resolve_annotation(
     summary="주석 재오픈 (작성자 또는 admin)",
     response_model=SuccessResponse,
 )
+@limiter.limit(_ANNOTATION_WRITE_LIMIT)
 def reopen_annotation(
     annotation_id: str,
     request: Request,
@@ -233,6 +248,7 @@ def reopen_annotation(
     summary="주석 삭제 (cascade 답글)",
     response_model=SuccessResponse,
 )
+@limiter.limit(_ANNOTATION_WRITE_LIMIT)
 def delete_annotation(
     annotation_id: str,
     request: Request,

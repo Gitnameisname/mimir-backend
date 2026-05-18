@@ -25,6 +25,7 @@ from fastapi import APIRouter, Depends, Query, Request, Response
 from app.api.auth import ResourceRef, authorization_service, resolve_current_actor
 from app.api.auth.models import ActorContext
 from app.api.context import get_request_ids
+from app.api.rate_limit import limiter
 from app.api.responses import SuccessResponse, success_response
 from app.db import get_db
 from app.schemas.contributors import ContributorItem, ContributorsResponse
@@ -35,6 +36,9 @@ from app.services.contributors_service import (
 )
 
 router = APIRouter()
+
+# S3 Phase 6 FG 6-1 (2026-05-18): per-IP rate limit (citations 패턴 정합).
+_CONTRIBUTORS_LIMIT = "60/minute"
 
 
 def _to_item(contributor) -> ContributorItem:
@@ -59,6 +63,7 @@ def _to_item(contributor) -> ContributorItem:
     ),
     response_model=SuccessResponse,
 )
+@limiter.limit(_CONTRIBUTORS_LIMIT)
 def get_contributors(
     document_id: str,
     request: Request,

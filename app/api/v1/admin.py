@@ -1263,15 +1263,36 @@ class AssignOrgRoleBody(BaseModel):
 
 
 @router.post("/users/{user_id}/org-roles", summary="사용자 조직 역할 부여", status_code=201)
-def assign_user_org_role(user_id: str, body: AssignOrgRoleBody, _=Depends(require_admin_access)):
+def assign_user_org_role(
+    user_id: str,
+    body: AssignOrgRoleBody,
+    actor: ActorContext = Depends(resolve_current_actor),
+):
+    # FG 6-4 R-O4: ORG_ADMIN 은 본인 조직 내 부여만, SUPER_ADMIN 만 횡단.
+    from app.utils.admin_org_guard import ensure_actor_can_access_org
     if body.role_name not in _VALID_ROLES:
         raise unprocessable_entity(f"유효하지 않은 역할입니다: {body.role_name}")
 
     with get_db() as conn:
+        # admin 자체 권한 검증 — require_admin_access 와 동치.
+        from app.api.auth import authorization_service, ResourceRef
+        authorization_service.authorize(
+            actor=actor,
+            action="admin.write",
+            resource=ResourceRef(resource_type="admin"),
+            require_authenticated=True,
+        )
         if not users_repository.get_by_id(conn, user_id):
             raise not_found("사용자를 찾을 수 없습니다.")
         if not organizations_repository.get_by_id(conn, body.org_id):
             raise not_found("조직을 찾을 수 없습니다.")
+        ensure_actor_can_access_org(
+            conn, actor,
+            target_org_id=body.org_id,
+            action="user.org_role.assign",
+            resource_type="user_org_role",
+            resource_id=user_id,
+        )
         mapping = users_repository.assign_org_role(
             conn, user_id=user_id, org_id=body.org_id, role_name=body.role_name,
         )
@@ -1286,8 +1307,28 @@ def assign_user_org_role(user_id: str, body: AssignOrgRoleBody, _=Depends(requir
 
 
 @router.delete("/users/{user_id}/org-roles/{org_id}", summary="사용자 조직 역할 제거", status_code=204)
-def remove_user_org_role(user_id: str, org_id: str, _=Depends(require_admin_access)):
+def remove_user_org_role(
+    user_id: str,
+    org_id: str,
+    actor: ActorContext = Depends(resolve_current_actor),
+):
+    # FG 6-4 R-O4: 본인 조직 내 회수만 허용 (SUPER_ADMIN 만 횡단).
+    from app.utils.admin_org_guard import ensure_actor_can_access_org
+    from app.api.auth import authorization_service, ResourceRef
     with get_db() as conn:
+        authorization_service.authorize(
+            actor=actor,
+            action="admin.write",
+            resource=ResourceRef(resource_type="admin"),
+            require_authenticated=True,
+        )
+        ensure_actor_can_access_org(
+            conn, actor,
+            target_org_id=org_id,
+            action="user.org_role.remove",
+            resource_type="user_org_role",
+            resource_id=user_id,
+        )
         removed = users_repository.remove_org_role(conn, user_id=user_id, org_id=org_id)
     if not removed:
         raise not_found("매핑을 찾을 수 없습니다.")
@@ -1326,8 +1367,28 @@ def create_organization(body: CreateOrganizationBody, _=Depends(require_admin_ac
 
 
 @router.patch("/organizations/{org_id}", summary="조직 수정")
-def update_organization(org_id: str, body: UpdateOrganizationBody, _=Depends(require_admin_access)):
+def update_organization(
+    org_id: str,
+    body: UpdateOrganizationBody,
+    actor: ActorContext = Depends(resolve_current_actor),
+):
+    # FG 6-4 R-O4: 본인 조직만 수정 (SUPER_ADMIN 만 횡단).
+    from app.utils.admin_org_guard import ensure_actor_can_access_org
+    from app.api.auth import authorization_service, ResourceRef
     with get_db() as conn:
+        authorization_service.authorize(
+            actor=actor,
+            action="admin.write",
+            resource=ResourceRef(resource_type="admin"),
+            require_authenticated=True,
+        )
+        ensure_actor_can_access_org(
+            conn, actor,
+            target_org_id=org_id,
+            action="organization.update",
+            resource_type="organization",
+            resource_id=org_id,
+        )
         org = organizations_repository.update(
             conn, org_id,
             name=body.name,
@@ -1347,8 +1408,27 @@ def update_organization(org_id: str, body: UpdateOrganizationBody, _=Depends(req
 
 
 @router.delete("/organizations/{org_id}", summary="조직 삭제", status_code=204)
-def delete_organization(org_id: str, _=Depends(require_admin_access)):
+def delete_organization(
+    org_id: str,
+    actor: ActorContext = Depends(resolve_current_actor),
+):
+    # FG 6-4 R-O4: 본인 조직만 삭제 (SUPER_ADMIN 만 횡단).
+    from app.utils.admin_org_guard import ensure_actor_can_access_org
+    from app.api.auth import authorization_service, ResourceRef
     with get_db() as conn:
+        authorization_service.authorize(
+            actor=actor,
+            action="admin.write",
+            resource=ResourceRef(resource_type="admin"),
+            require_authenticated=True,
+        )
+        ensure_actor_can_access_org(
+            conn, actor,
+            target_org_id=org_id,
+            action="organization.delete",
+            resource_type="organization",
+            resource_id=org_id,
+        )
         deleted = organizations_repository.delete(conn, org_id)
     if not deleted:
         raise not_found("조직을 찾을 수 없습니다.")
