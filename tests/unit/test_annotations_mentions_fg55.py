@@ -162,13 +162,15 @@ class TestUsersRepositoryFG55:
 
         repo = UsersRepository()
         # _row_to_user 는 dict 형태 user 행 받음 — minimal stub
+        # `role_name` 은 users 테이블 의 실제 컬럼명 (`role` 이 아님 — UsersRepository
+        # ._row_to_user 가 row["role_name"] 으로 직접 인덱싱).
         row = {
             "id": "u-1",
             "username": "alice",
             "email": "alice@example.com",
             "display_name": "Alice",
             "status": "ACTIVE",
-            "role": "VIEWER",
+            "role_name": "VIEWER",
             "created_at": None,
             "updated_at": None,
             "password_hash": None,
@@ -188,7 +190,7 @@ class TestUsersRepositoryFG55:
         repo = UsersRepository()
         row1 = {
             "id": "u-1", "username": "u1", "email": "u1@e.com",
-            "display_name": "홍길동", "status": "ACTIVE", "role": "VIEWER",
+            "display_name": "홍길동", "status": "ACTIVE", "role_name": "VIEWER",
             "created_at": None, "updated_at": None, "password_hash": None,
             "external_id": None,
         }

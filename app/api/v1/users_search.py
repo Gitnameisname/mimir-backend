@@ -30,7 +30,7 @@ from app.api.context import get_request_ids
 from app.api.errors.exceptions import ApiAuthenticationError
 from app.api.rate_limit import limiter
 from app.api.responses import SuccessResponse, success_response
-from app.db import get_db
+from app.db.connection import db_dependency
 from app.repositories.users_repository import UsersRepository
 from app.schemas.user_search import UserSearchItem, UserSearchResponse
 
@@ -64,6 +64,7 @@ def search_users(
     ),
     limit: int = Query(default=20, ge=1, le=50),
     actor: ActorContext = Depends(resolve_current_actor),
+    conn=Depends(db_dependency),
 ) -> SuccessResponse:
     if not actor.is_authenticated or not actor.actor_id:
         raise ApiAuthenticationError("로그인이 필요합니다")
@@ -83,13 +84,12 @@ def search_users(
     # **viewer_user_id 는 ActorContext 에서만 추출** — query/body 주입 차단 (R-A4)
     viewer_user_id = actor.actor_id
 
-    with get_db() as conn:
-        rows = _users_repository.search_by_display_name_in_orgs(
-            conn,
-            viewer_user_id=viewer_user_id,
-            query=q_trimmed,
-            limit=limit,
-        )
+    rows = _users_repository.search_by_display_name_in_orgs(
+        conn,
+        viewer_user_id=viewer_user_id,
+        query=q_trimmed,
+        limit=limit,
+    )
 
     items = [UserSearchItem(user_id=r["user_id"], display_name=r["display_name"]) for r in rows]
     response = UserSearchResponse(

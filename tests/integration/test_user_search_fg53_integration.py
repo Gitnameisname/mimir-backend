@@ -46,15 +46,27 @@ pytestmark = pytest.mark.unit  # testcontainers 의존 없음 — 빠른 in-proc
 
 
 def _make_client(actor_factory, repo_factory):
-    """ASGI app + auth/DB dependency override 가 적용된 TestClient 반환."""
+    """ASGI app + auth/DB dependency override 가 적용된 TestClient 반환.
+
+    DB 의존성도 in-process generator 로 교체 — 실제 PostgreSQL 접속을 시도하지 않는다.
+    repository 가 mock 이라 conn 객체는 호출만 통과시키면 충분.
+    """
     from fastapi.testclient import TestClient
     from app.main import app
     from app.api.auth import resolve_current_actor
     from app.api.v1 import users_search as users_search_module
+    from app.db.connection import db_dependency
 
     # 1. 인증 override
     app.dependency_overrides[resolve_current_actor] = actor_factory
-    # 2. repository 싱글턴 교체 (모듈 수준 _users_repository)
+
+    # 2. DB dependency override — 실제 connection pool 우회 (psycopg2 OperationalError 방지)
+    def _fake_db_dependency():
+        yield MagicMock(name="conn_stub")
+
+    app.dependency_overrides[db_dependency] = _fake_db_dependency
+
+    # 3. repository 싱글턴 교체 (모듈 수준 _users_repository)
     repo = repo_factory()
     original_repo = users_search_module._users_repository
     users_search_module._users_repository = repo
@@ -63,6 +75,7 @@ def _make_client(actor_factory, repo_factory):
 
     def restore():
         app.dependency_overrides.pop(resolve_current_actor, None)
+        app.dependency_overrides.pop(db_dependency, None)
         users_search_module._users_repository = original_repo
 
     return client, repo, restore
