@@ -228,6 +228,32 @@ class RetentionJob:
             )
             deleted_rows = cur.fetchall()
             deleted = len(deleted_rows)
+
+            # Codex 3차 §4 추가 권고 (2026-05-18): annotation 과 대칭으로 audit 도
+            # archive 존재성 verify. audit_events 에는 FK cascade 가 없어 위험은
+            # 낮지만 archive-first 보증을 SQL 외부에서도 명시적으로 cross-check.
+            if deleted > 0:
+                cur.execute(
+                    """
+                    SELECT COUNT(*)::int AS c
+                    FROM (
+                        SELECT id FROM audit_events_archive
+                        WHERE id = ANY(%s)
+                    ) t
+                    """,
+                    ([self._row_id(r) for r in deleted_rows],),
+                )
+                row = cur.fetchone()
+                archived_count = int(
+                    (row.get("c") if isinstance(row, dict) else row[0]) or 0
+                ) if row else 0
+                if archived_count != deleted:
+                    self._conn.rollback()
+                    raise RuntimeError(
+                        "audit retention archive-first violation: "
+                        f"deleted={deleted} archived={archived_count}"
+                    )
+
         self._conn.commit()
         # archived 는 "archive 테이블에 존재 보장된 id 수" — 이번 회차 INSERT + 이전
         # 회차 잔존 모두 포함. deleted 와 동치 (deletable 의 정의).

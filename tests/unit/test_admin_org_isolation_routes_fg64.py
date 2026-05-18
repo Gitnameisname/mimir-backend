@@ -128,6 +128,176 @@ def test_route_agent_delete_cross_org_reject():
 # ---------------------------------------------------------------------------
 
 
+def test_route_scope_profile_delete_cross_org_reject():
+    """ORG_ADMIN (org-A) 이 org-B 의 scope-profile 삭제 시도 → 403.
+
+    agent 외 다른 endpoint group 의 guard 가 실제로 라우터에 wired 되어 있는지
+    검증 (Codex 3차 P2-1 잔존 보강).
+    """
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.api.auth import resolve_current_actor
+    from app.api.v1 import scope_profiles as scope_profiles_module
+
+    actor = _make_actor(role="ORG_ADMIN")
+    app.dependency_overrides[resolve_current_actor] = lambda: actor
+
+    profile_id = "00000000-0000-0000-0000-0000000000d0"
+    fake_profile = MagicMock()
+    fake_profile.organization_id = "org-B"
+
+    class FakeScopeProfileRepo:
+        def __init__(self, conn):
+            self.conn = conn
+        def get_by_id(self, _id):
+            return fake_profile
+        def delete(self, _id):
+            return True
+
+    # `_get_affected_agents` 가 conn.cursor SELECT 를 호출 — 빈 리스트 반환.
+    original_repo = scope_profiles_module.ScopeProfileRepository
+    scope_profiles_module.ScopeProfileRepository = FakeScopeProfileRepo
+
+    # _get_affected_agents 은 internal — fetchall 시퀀스: 1) affected agents [], 2) actor_org_ids [{org-A}]
+    cursor = MagicMock()
+    cursor.__enter__ = MagicMock(return_value=cursor)
+    cursor.__exit__ = MagicMock(return_value=False)
+    cursor.fetchall.side_effect = [
+        [],                                  # _get_affected_agents
+        [{"org_id": "org-A"}],                # actor_org_ids
+    ]
+    conn = MagicMock()
+    conn.cursor.return_value = cursor
+    conn.__enter__ = MagicMock(return_value=conn)
+    conn.__exit__ = MagicMock(return_value=False)
+    original_get_db = scope_profiles_module.get_db
+    scope_profiles_module.get_db = lambda: conn
+
+    try:
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.delete(f"/api/v1/admin/scope-profiles/{profile_id}")
+        assert resp.status_code == 403, resp.text
+    finally:
+        scope_profiles_module.ScopeProfileRepository = original_repo
+        scope_profiles_module.get_db = original_get_db
+        app.dependency_overrides.pop(resolve_current_actor, None)
+
+
+def test_route_user_org_role_assign_cross_org_reject():
+    """ORG_ADMIN (org-A) 이 org-B 에 user role 부여 시도 → 403.
+
+    admin.py 의 별 endpoint group — `assign_user_org_role` 의 wired guard 검증.
+    """
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.api.auth import resolve_current_actor
+    from app.api.v1 import admin as admin_module
+
+    actor = _make_actor(role="ORG_ADMIN")
+    app.dependency_overrides[resolve_current_actor] = lambda: actor
+
+    user_id = "00000000-0000-0000-0000-0000000000e0"
+
+    # users_repository / organizations_repository / authorization_service 패치.
+    fake_user = MagicMock()
+    fake_org = MagicMock()
+    original_users = admin_module.users_repository
+    original_orgs = admin_module.organizations_repository
+
+    users_stub = MagicMock()
+    users_stub.get_by_id.return_value = fake_user
+    orgs_stub = MagicMock()
+    orgs_stub.get_by_id.return_value = fake_org
+    admin_module.users_repository = users_stub
+    admin_module.organizations_repository = orgs_stub
+
+    # admin.py 가 ResourceRef + authorization_service.authorize 직접 호출 — 통과시킴.
+    # actor.role == ORG_ADMIN 이면 admin.write 가 거부될 수 있어서 우회: actor 를 SUPER_ADMIN
+    # 으로 두면 cross_org 가 통과되어 검증 무효 → 대신 authorization_service 자체를 패치.
+    from app.api.auth import authorization_service as authz_module_attr
+    import app.api.v1.admin as admin_v1
+    original_authorize = admin_v1.authorization_service.authorize
+    admin_v1.authorization_service.authorize = lambda **kw: None
+
+    # ORG_ADMIN 의 user_org_roles 조회 → org-A 만.
+    cursor = MagicMock()
+    cursor.__enter__ = MagicMock(return_value=cursor)
+    cursor.__exit__ = MagicMock(return_value=False)
+    cursor.fetchall.return_value = [{"org_id": "org-A"}]
+    conn = MagicMock()
+    conn.cursor.return_value = cursor
+    conn.__enter__ = MagicMock(return_value=conn)
+    conn.__exit__ = MagicMock(return_value=False)
+    original_get_db = admin_module.get_db
+    admin_module.get_db = lambda: conn
+
+    try:
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.post(
+            f"/api/v1/admin/users/{user_id}/org-roles",
+            json={"org_id": "org-B", "role_name": "AUTHOR"},
+        )
+        assert resp.status_code == 403, resp.text
+        # users_repository.assign_org_role 은 호출되어선 안 됨.
+        users_stub.assign_org_role.assert_not_called()
+    finally:
+        admin_module.users_repository = original_users
+        admin_module.organizations_repository = original_orgs
+        admin_module.get_db = original_get_db
+        admin_v1.authorization_service.authorize = original_authorize
+        app.dependency_overrides.pop(resolve_current_actor, None)
+
+
+def test_route_organization_patch_cross_org_reject():
+    """ORG_ADMIN (org-A) 이 org-B PATCH 시도 → 403.
+
+    admin.py 의 organization endpoint group — `update_organization` 의 wired guard.
+    """
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.api.auth import resolve_current_actor
+    from app.api.v1 import admin as admin_module
+
+    actor = _make_actor(role="ORG_ADMIN")
+    app.dependency_overrides[resolve_current_actor] = lambda: actor
+
+    target_org = "00000000-0000-0000-0000-0000000000f0"
+
+    original_orgs = admin_module.organizations_repository
+    orgs_stub = MagicMock()
+    admin_module.organizations_repository = orgs_stub
+
+    import app.api.v1.admin as admin_v1
+    original_authorize = admin_v1.authorization_service.authorize
+    admin_v1.authorization_service.authorize = lambda **kw: None
+
+    cursor = MagicMock()
+    cursor.__enter__ = MagicMock(return_value=cursor)
+    cursor.__exit__ = MagicMock(return_value=False)
+    cursor.fetchall.return_value = [{"org_id": "org-A"}]
+    conn = MagicMock()
+    conn.cursor.return_value = cursor
+    conn.__enter__ = MagicMock(return_value=conn)
+    conn.__exit__ = MagicMock(return_value=False)
+    original_get_db = admin_module.get_db
+    admin_module.get_db = lambda: conn
+
+    try:
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.patch(
+            f"/api/v1/admin/organizations/{target_org}",
+            json={"name": "should-not-apply"},
+        )
+        assert resp.status_code == 403, resp.text
+        # organizations_repository.update 는 호출되어선 안 됨.
+        orgs_stub.update.assert_not_called()
+    finally:
+        admin_module.organizations_repository = original_orgs
+        admin_module.get_db = original_get_db
+        admin_v1.authorization_service.authorize = original_authorize
+        app.dependency_overrides.pop(resolve_current_actor, None)
+
+
 def test_route_agent_delete_super_admin_cross_org_audited():
     """SUPER_ADMIN 이 다른 조직 agent 삭제 → 204 + `admin.cross_org_access` emit."""
     from fastapi.testclient import TestClient

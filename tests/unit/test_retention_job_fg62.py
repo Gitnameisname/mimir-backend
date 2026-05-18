@@ -63,16 +63,18 @@ def test_actual_run_invokes_commit():
     cursor = MagicMock()
     cursor.__enter__ = MagicMock(return_value=cursor)
     cursor.__exit__ = MagicMock(return_value=False)
-    # 시퀀스 (Codex 2차 P1-1 시정 후):
+    # 시퀀스 (Codex 3차 §4 audit verify 추가 후):
     #   1) audit count → 2
     #   2) audit INSERT/DELETE RETURNING → [a1, a2]
-    #   3) ann count → 1
-    #   4) ann INSERT/DELETE RETURNING → [n1]
-    #   5) ann archive 무결성 verify COUNT(*) → 1 (deleted 와 일치 → OK)
+    #   3) audit archive 무결성 verify COUNT(*) → 2 (deleted 와 일치 → OK)
+    #   4) ann count → 1
+    #   5) ann INSERT/DELETE RETURNING → [n1]
+    #   6) ann archive 무결성 verify COUNT(*) → 1 (deleted 와 일치 → OK)
     cursor.fetchone.side_effect = [
         {"c": 2},   # audit candidates
+        {"c": 2},   # audit archive verify
         {"c": 1},   # annotations candidates
-        {"c": 1},   # annotations archive 무결성 verify
+        {"c": 1},   # annotations archive verify
     ]
     cursor.fetchall.side_effect = [
         [{"id": "a1"}, {"id": "a2"}],
@@ -163,6 +165,7 @@ def test_audit_retention_uses_deletable_union():
     cursor.__exit__ = MagicMock(return_value=False)
     cursor.fetchone.side_effect = [
         {"c": 1},   # audit candidates
+        {"c": 1},   # audit archive verify (Codex 3차 §4 — 통과)
         {"c": 0},   # ann skip
     ]
     cursor.fetchall.side_effect = [[{"id": "a1"}]]
@@ -183,6 +186,31 @@ def test_audit_retention_uses_deletable_union():
         "deletable" in s and "already_archived" in s and "UNION" in s
         for s in executed_sql
     ), "audit retention DELETE must target deletable = inserted UNION already_archived"
+
+
+def test_audit_archive_first_violation_rolls_back():
+    """audit retention 도 archive 무결성 verify 가 동일하게 동작 — Codex 3차 §4."""
+    cursor = MagicMock()
+    cursor.__enter__ = MagicMock(return_value=cursor)
+    cursor.__exit__ = MagicMock(return_value=False)
+    cursor.fetchone.side_effect = [
+        {"c": 2},   # audit candidates
+        {"c": 1},   # audit archive verify — deleted=2 인데 archive 1 → 위반!
+    ]
+    cursor.fetchall.side_effect = [
+        [{"id": "a1"}, {"id": "a2"}],
+    ]
+    conn = MagicMock()
+    conn.cursor.return_value = cursor
+
+    job = RetentionJob(
+        conn, viewed_days=7, resolved_annotation_days=90,
+        batch_limit=100, dry_run=False,
+    )
+    result = job.run(request_id="t-audit-violation")
+    assert result["status"] == "partial"
+    assert any("audit retention archive-first" in e for e in result["errors"])
+    conn.rollback.assert_called()
 
 
 def test_env_int_fallback_on_bad_value():
