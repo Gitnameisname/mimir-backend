@@ -219,3 +219,139 @@ class TestCache:
 
     def test_default_ttl_constant(self):
         assert policy.DEFAULT_CACHE_TTL_SEC == 30
+
+
+# --------------------------------------------------------------------------- #
+# S3 Phase 7 FG 7-3 — cluster-wide invalidation
+# --------------------------------------------------------------------------- #
+
+
+class TestClusterWideInvalidation:
+    def test_broadcast_true_calls_publish(self, monkeypatch):
+        """invalidate_cache(broadcast=True) 가 pubsub.publish_invalidate 호출."""
+        from app.cache import pubsub
+
+        calls: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            pubsub,
+            "publish_invalidate",
+            lambda feature, key, **kw: calls.append((feature, key)) or True,
+        )
+
+        policy.invalidate_cache("sp-1", broadcast=True)
+        assert calls == [("scope_policy", "sp-1")]
+
+    def test_broadcast_false_skips_publish(self, monkeypatch):
+        """loop 방지 — broadcast=False 면 publish 호출 안 함."""
+        from app.cache import pubsub
+
+        calls: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            pubsub,
+            "publish_invalidate",
+            lambda feature, key, **kw: calls.append((feature, key)) or True,
+        )
+
+        policy.invalidate_cache("sp-1", broadcast=False)
+        assert calls == []
+
+    def test_default_broadcast_is_false(self, monkeypatch):
+        """기본값은 broadcast=False — 명시적 호출자만 broadcast."""
+        from app.cache import pubsub
+
+        calls: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            pubsub,
+            "publish_invalidate",
+            lambda feature, key, **kw: calls.append((feature, key)) or True,
+        )
+
+        policy.invalidate_cache("sp-1")
+        assert calls == []
+
+    def test_wildcard_when_no_profile_id(self, monkeypatch):
+        from app.cache import pubsub
+
+        calls: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            pubsub,
+            "publish_invalidate",
+            lambda feature, key, **kw: calls.append((feature, key)) or True,
+        )
+
+        policy.invalidate_cache(None, broadcast=True)
+        assert calls == [("scope_policy", "*")]
+
+    def test_remote_invalidate_clears_specific_key(self, monkeypatch):
+        """다른 워커가 발행한 메시지 수신 시 local cache 비움."""
+        from app.cache import pubsub
+
+        # publish 호출 없음 — loop 방지 확인
+        calls: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            pubsub,
+            "publish_invalidate",
+            lambda feature, key, **kw: calls.append((feature, key)) or True,
+        )
+
+        # local cache 에 값 세팅
+        fake_profile = SimpleNamespace(
+            settings=SimpleNamespace(expose_viewers=True),
+        )
+
+        class _FakeRepo:
+            def __init__(self, conn):
+                pass
+            def get_by_id(self, pid):
+                return fake_profile
+
+        monkeypatch.setattr(policy, "ScopeProfileRepository", _FakeRepo)
+
+        actor = _actor(scope_profile_id="sp-remote")
+        policy.should_expose_viewers(actor)  # populate
+        assert "sp-remote" in policy._cache
+
+        # remote 메시지 처리
+        policy._handle_remote_invalidate("sp-remote")
+        assert "sp-remote" not in policy._cache
+        # broadcast 발행 없음 (loop 방지)
+        assert calls == []
+
+    def test_remote_invalidate_wildcard_clears_all(self, monkeypatch):
+        from app.cache import pubsub
+        monkeypatch.setattr(pubsub, "publish_invalidate", lambda *a, **kw: True)
+
+        policy._cache["sp-A"] = (True, 0.0)
+        policy._cache["sp-B"] = (False, 0.0)
+
+        policy._handle_remote_invalidate("*")
+
+        assert len(policy._cache) == 0
+
+    def test_broadcast_swallows_pubsub_import_failure(self, monkeypatch):
+        """pubsub 모듈 import 실패해도 local invalidate 는 통과."""
+        # local cache 에 값 미리 세팅
+        policy._cache["sp-X"] = (True, 0.0)
+
+        # sys.modules 에서 강제 제거 + import 막기
+        import sys
+        original = sys.modules.pop("app.cache.pubsub", None)
+
+        class _ImportBlocker:
+            def find_module(self, name, path=None):
+                if name == "app.cache.pubsub":
+                    return self
+                return None
+            def load_module(self, name):
+                raise ImportError("blocked for test")
+
+        sys.meta_path.insert(0, _ImportBlocker())
+        try:
+            # 예외 전파 안 함
+            policy.invalidate_cache("sp-X", broadcast=True)
+            # local cache 는 비워짐
+            assert "sp-X" not in policy._cache
+        finally:
+            sys.meta_path.pop(0)
+            if original is not None:
+                sys.modules["app.cache.pubsub"] = original

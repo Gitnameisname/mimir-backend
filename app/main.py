@@ -127,6 +127,13 @@ def create_app() -> FastAPI:
         except Exception as exc:
             logger.warning("BatchScheduler 시작 실패 (서비스 계속): %s", exc)
 
+        # S3 Phase 7 FG 7-3: scope_profile_policy cluster-wide invalidation subscriber
+        try:
+            from app.services.scope_profile_policy import start_subscriber
+            start_subscriber()
+        except Exception as exc:
+            logger.warning("scope_profile_policy subscriber 시작 실패 (캐시 TTL 만료에 의존): %s", exc)
+
     @app.on_event("shutdown")
     def on_shutdown() -> None:
         try:
@@ -134,6 +141,13 @@ def create_app() -> FastAPI:
             stop_scheduler()
         except Exception as exc:
             logger.warning("BatchScheduler 종료 실패: %s", exc)
+
+        # S3 Phase 7 FG 7-3: subscriber stop
+        try:
+            from app.services.scope_profile_policy import stop_subscriber
+            stop_subscriber()
+        except Exception as exc:
+            logger.warning("scope_profile_policy subscriber 종료 실패: %s", exc)
 
     return app
 

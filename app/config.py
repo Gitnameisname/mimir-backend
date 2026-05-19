@@ -113,6 +113,11 @@ class Settings(BaseSettings):
     valkey_password: str = ""
     valkey_user: str = ""
     valkey_db: int = 0
+    # S3 Phase 7 FG 7-1 — 폐쇄망 fallback / fail policy override
+    valkey_disabled: str = ""              # "1" 또는 "true" 면 강제 disable
+    valkey_namespace: str = ""             # 미설정 시 "mimir:<environment>" 자동 합성
+    valkey_fail_open_features: str = ""    # comma-separated override
+    valkey_fail_closed_features: str = ""  # comma-separated override
 
     @model_validator(mode="after")
     def _validate_production_secrets(self) -> "Settings":

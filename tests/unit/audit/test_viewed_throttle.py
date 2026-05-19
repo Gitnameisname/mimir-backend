@@ -17,6 +17,18 @@ def _reset_throttle_state():
     viewed_throttle.reset_for_tests()
 
 
+@pytest.fixture(autouse=True)
+def _force_lru_fallback(monkeypatch):
+    """S3 Phase 7 FG 7-2 — 본 파일의 기존 case 는 LRU 경로를 검증한다.
+
+    Valkey 가용한 환경에서도 LRU fallback 만 동작하도록 강제 (monkeypatch).
+    Cluster-wide Valkey 경로는 ``test_viewed_throttle_cluster.py`` 가 별도 검증.
+    """
+    from app.audit import viewed_throttle as vt
+    monkeypatch.setattr(vt, "_try_valkey_setnx", lambda actor, doc, window: None)
+    yield
+
+
 @pytest.fixture
 def _clean_env(monkeypatch):
     for key in (

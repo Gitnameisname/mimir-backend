@@ -333,9 +333,10 @@ def update_scope_profile(
                 },
             )
     # S3 Phase 3 FG 3-2 (2026-04-27): settings 변경 별도 audit + 정책 캐시 invalidate.
+    # S3 Phase 7 FG 7-3 (2026-05-18): broadcast=True — cluster-wide 즉시 invalidate.
     if settings_patch is not None:
         from app.services.scope_profile_policy import invalidate_cache
-        invalidate_cache(profile_id)
+        invalidate_cache(profile_id, broadcast=True)
         audit_emitter.emit(
             event_type="scope_profile.settings.changed",
             action="scope_profile.settings.update",
