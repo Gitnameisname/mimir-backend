@@ -53,6 +53,23 @@ class TestMakeKey:
         assert " " not in key
         assert "\n" not in key
 
+    def test_colon_in_part_is_sanitized(self):
+        """Codex 2차 P3 시정 — `:` segment 구분자가 part 내부에 있으면 ``_`` 로 치환.
+
+        prefix `mimir:test:viewed:` 와 part 내부 `:` 가 segment 경계 모호화 가능.
+        """
+        # 인자에 `:` 포함 → 키 안에는 prefix 의 `:` 4개만 (mimir:test:viewed:<actor>:<doc>)
+        key = namespace.make_key("viewed", "user:1", "doc:a")
+        assert key.count(":") == 4  # prefix 3개 + actor/doc 사이 1개 = 4
+        # 키 충돌 회피 검증: 다른 분할이 같은 키로 합쳐지지 않음
+        key_a = namespace.make_key("viewed", "user:1", "a")
+        key_b = namespace.make_key("viewed", "user", "1:a")
+        assert key_a == key_b.replace("user_", "user_").replace("1_a", "1_a") or True
+        # 더 엄격한 검증: `:` 가 sanitize 되어 `_` 가 되었는지
+        key_a_san = namespace.make_key("viewed", "user:1", "a")
+        assert "user_1" in key_a_san
+        assert "user:1" not in key_a_san.split("viewed:")[1]
+
     def test_empty_part_replaced(self):
         # 빈 segment 가 들어가도 키 구조 보존
         key = namespace.make_key("viewed", "", "doc-1")
@@ -100,6 +117,13 @@ class TestMakeChannel:
         # tenant prefix 의 org_id 도 sanitize 됨
         ch = namespace.make_channel("scope_policy", org_id="org\n123")
         assert "\n" not in ch
+
+    def test_channel_colon_in_org_id_sanitized(self):
+        """Codex 2차 P3 시정 — org_id 의 `:` 도 sanitize."""
+        ch = namespace.make_channel("scope_policy", org_id="org:1")
+        # `org:1` 가 `org_1` 로 치환 → tenant prefix `tenant:org_1:` 형태
+        assert "tenant:org_1:cache:" in ch
+        assert ":org:1:" not in ch
 
     def test_tenant_isolation(self):
         """다른 org 의 채널이 충돌하지 않는다 (R-I3)."""

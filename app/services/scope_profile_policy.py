@@ -16,8 +16,15 @@
       ``invalidate_cache(profile_id, broadcast=True)`` 호출 시 Valkey pub/sub
       브로드캐스트 발행. 모든 워커가 subscribe 되어 있어 즉시 process-local
       cache 비움.
-    - Valkey 장애 / disabled 시: broadcast 는 best-effort skip. process-local
-      TTL 30s 자연 만료에 의존 (다른 워커는 최대 30s stale 허용).
+    - **strict fail-closed (Codex 2차 P1 시정, 2026-05-19)**:
+      `policy.is_fail_closed("scope_policy")` 기본 True. Valkey 가 설정되었으나
+      subscriber 미연결 (cluster-wide invalidation 신뢰 불가) 시 **process-local
+      캐시 우회** — 매 호출 DB 재조회. admin PATCH 후 stale 노출 위험 차단.
+    - 운영자 opt-out: `VALKEY_FAIL_OPEN_FEATURES=scope_policy` 설정 시 TTL 30s
+      best-effort 동작 (Phase 7 1차 종결 시점 동작 — 호환성 유지용).
+    - 단일 워커 모드 (`VALKEY_DISABLED=1` / `VALKEY_HOST=""`): 운영자가 명시적
+      disable → 단일 워커 가정 → process-local cache 그대로 사용 (cluster-wide
+      문제가 없으므로 안전).
 
 함수 도서관: ``docs/함수도서관/backend.md`` §1.7-fg32 (FG 3-2 신설, FG 7-3 갱신).
 """
@@ -41,6 +48,7 @@ __all__ = [
     "invalidate_cache",
     "start_subscriber",
     "stop_subscriber",
+    "should_bypass_cache",
     "DEFAULT_CACHE_TTL_SEC",
     "FEATURE_NAME",
 ]
@@ -154,15 +162,50 @@ def stop_subscriber() -> None:
         _subscriber = None
 
 
+def should_bypass_cache() -> bool:
+    """strict fail-closed gate (Codex 2차 P1 시정, 2026-05-19).
+
+    cluster-wide invalidation 이 신뢰 가능하지 않은 상태면 process-local 캐시를
+    우회해서 매 호출 DB 재조회하도록 한다.
+
+    분기:
+        1. `policy.is_fail_open("scope_policy")` True (운영자 opt-out env override)
+           → bypass False (best-effort TTL 동작 — 호환성)
+        2. `is_valkey_disabled()` True (단일 워커 / 폐쇄망 명시) → bypass False
+           (cluster-wide 문제 없음 — 캐시 안전)
+        3. Valkey 설정됨 + subscriber 미연결 (장애) → bypass True (strict fail-closed)
+        4. 정상 → bypass False
+    """
+    try:
+        # 지연 import — 캐시 의존성 강제하지 않음
+        from app.cache.policy import is_fail_open
+        from app.cache.valkey import is_valkey_disabled
+    except Exception:  # pragma: no cover
+        return False
+
+    if is_fail_open(FEATURE_NAME):
+        return False
+    if is_valkey_disabled():
+        return False
+    sub = _subscriber
+    if sub is None or not sub.is_connected():
+        return True
+    return False
+
+
 def _get_expose_viewers_for_profile(scope_profile_id: str) -> bool:
     """캐시 우선 조회. miss 시 DB 조회. 실패 시 fail-closed False.
 
     psycopg2 connection 은 매 호출마다 잠깐 열고 닫음 (정책 조회는 가벼운 SELECT).
+
+    strict fail-closed (Codex 2차 P1 시정): cluster-wide invalidation 이 신뢰
+    불가능한 상태 (Valkey 설정됨 + subscriber 미연결) → 캐시 우회.
     """
     ttl = _cache_ttl()
     now_ts = utcnow().timestamp()
+    bypass = should_bypass_cache()
 
-    if ttl > 0:
+    if ttl > 0 and not bypass:
         with _lock:
             entry = _cache.get(scope_profile_id)
             if entry is not None:
@@ -186,7 +229,8 @@ def _get_expose_viewers_for_profile(scope_profile_id: str) -> bool:
         )
         value = False  # fail-closed
 
-    if ttl > 0:
+    # bypass 모드에서는 캐시 저장도 skip — 다음 호출도 DB 재조회.
+    if ttl > 0 and not bypass:
         with _lock:
             _cache[scope_profile_id] = (value, now_ts)
 

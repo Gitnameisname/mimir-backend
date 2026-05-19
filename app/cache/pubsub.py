@@ -113,7 +113,16 @@ class Subscriber:
         sub.start()
         # ...
         sub.stop()
+
+    자동 재구독 (Codex 2차 P2 시정, 2026-05-19):
+        - ``start()`` 가 disabled / subscribe 실패하면 supervisor 만 띄움 (subscribe 없이).
+        - supervisor 가 주기적으로 ``is_valkey_disabled()`` 와 connection 회복 확인.
+        - subscribe 성공 시 message loop 진입. loop 내 connection error → backoff 후 재시도.
     """
+
+    # supervisor reconnect 주기 (초). disabled 모드여도 이 주기로 깨어나 확인.
+    RECONNECT_BACKOFF_MIN_SEC: float = 1.0
+    RECONNECT_BACKOFF_MAX_SEC: float = 30.0
 
     def __init__(
         self,
@@ -128,6 +137,7 @@ class Subscriber:
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._pubsub: Any = None
+        self._connected = False
 
     def dispatch(self, raw_message: Any) -> None:
         """단일 메시지를 처리한다. 단위 테스트에서 직접 호출 가능.
@@ -185,26 +195,30 @@ class Subscriber:
             )
 
     def start(self) -> bool:
-        """subscriber thread 시작. disabled 모드면 silent skip + False."""
+        """subscriber 시작 — supervisor thread 띄움.
+
+        Returns:
+            ``True``: supervisor thread 시작 성공 (subscribe 자체는 비동기 시도).
+                disabled 모드여도 ``True`` 반환 — supervisor 가 회복 시 자동 재구독.
+                **단** 이전 호환을 위해 disabled 모드는 startup 시점에 ``False`` 반환
+                (이미 등록된 호출자가 disabled = no-op 으로 가정).
+            ``False``: disabled 모드 (supervisor 미시작).
+
+        Codex 2차 P2 시정 (2026-05-19): supervisor 가 connection 회복 시 자동 재구독.
+        """
+        if self._thread is not None and self._thread.is_alive():
+            logger.debug("Subscriber(%s): already running", self._feature)
+            return True
         if is_valkey_disabled():
-            logger.info("Subscriber(%s): Valkey disabled — skip start", self._feature)
-            return False
-
-        client = get_valkey_or_none()
-        if client is None:
-            return False
-
-        try:
-            self._pubsub = client.pubsub(ignore_subscribe_messages=True)
-            self._pubsub.subscribe(self._channel)
-        except Exception as exc:
-            logger.warning(
-                "Subscriber(%s): subscribe failed: %s", self._feature, exc
+            logger.info(
+                "Subscriber(%s): Valkey disabled — skip start (no supervisor)",
+                self._feature,
             )
             return False
 
+        self._stop_event.clear()
         self._thread = threading.Thread(
-            target=self._run,
+            target=self._supervisor,
             name=f"pubsub-{self._feature}",
             daemon=True,
         )
@@ -212,27 +226,93 @@ class Subscriber:
         return True
 
     def stop(self) -> None:
-        """subscriber thread 종료 신호."""
+        """subscriber 종료 신호. supervisor + message loop 모두 종료."""
         self._stop_event.set()
+        self._connected = False
         if self._pubsub is not None:
             try:
                 self._pubsub.close()
             except Exception:
                 pass
+            self._pubsub = None
 
-    def _run(self) -> None:
-        if self._pubsub is None:
-            return
+    def is_connected(self) -> bool:
+        """현재 subscribe 상태. 운영 모니터링 / 테스트 용."""
+        return self._connected
+
+    def _try_subscribe(self) -> bool:
+        """1회 subscribe 시도. 성공 시 True, 실패 시 False."""
+        if is_valkey_disabled():
+            return False
+        client = get_valkey_or_none()
+        if client is None:
+            return False
+        try:
+            pubsub = client.pubsub(ignore_subscribe_messages=True)
+            pubsub.subscribe(self._channel)
+        except Exception as exc:
+            logger.debug(
+                "Subscriber(%s): subscribe attempt failed: %s",
+                self._feature, exc,
+            )
+            return False
+        self._pubsub = pubsub
+        self._connected = True
+        return True
+
+    def _message_loop(self) -> None:
+        """subscribe 된 상태에서 message dispatch loop.
+
+        connection / message error 발생 시 break — supervisor 가 재구독.
+        """
         while not self._stop_event.is_set():
             try:
-                # 짧은 timeout 으로 stop_event 응답성 보장
                 message = self._pubsub.get_message(timeout=1.0)
-                if message is not None:
-                    self.dispatch(message)
             except Exception as exc:
                 logger.warning(
-                    "Subscriber(%s) loop error: %s", self._feature, exc
+                    "Subscriber(%s): get_message error — will reconnect: %s",
+                    self._feature, exc,
                 )
-                # 백오프 — Valkey 일시 장애에서 burst 회피
-                if self._stop_event.wait(1.0):
-                    break
+                return
+            if message is not None:
+                try:
+                    self.dispatch(message)
+                except Exception as exc:  # pragma: no cover — dispatch already swallows
+                    logger.warning(
+                        "Subscriber(%s): dispatch raised: %s",
+                        self._feature, exc,
+                    )
+
+    def _supervisor(self) -> None:
+        """주기적 재구독 supervisor (Codex 2차 P2 시정).
+
+        - subscribe 미연결 시: backoff 후 재시도
+        - subscribe 연결 시: message loop 진입. loop 종료 후 재구독 사이클
+        """
+        backoff = self.RECONNECT_BACKOFF_MIN_SEC
+        while not self._stop_event.is_set():
+            if not self._connected:
+                if self._try_subscribe():
+                    logger.info(
+                        "Subscriber(%s): connected to %s",
+                        self._feature, self._channel,
+                    )
+                    backoff = self.RECONNECT_BACKOFF_MIN_SEC  # 회복 시 backoff 리셋
+                else:
+                    # disabled 또는 connection 실패 — backoff 후 재시도
+                    if self._stop_event.wait(backoff):
+                        return
+                    backoff = min(backoff * 2, self.RECONNECT_BACKOFF_MAX_SEC)
+                    continue
+
+            # 연결됨 — message loop 진입
+            self._message_loop()
+
+            # loop 가 종료됨 (stop 또는 error) → 정리 + 재구독 사이클로
+            self._connected = False
+            if self._pubsub is not None:
+                try:
+                    self._pubsub.close()
+                except Exception:
+                    pass
+                self._pubsub = None

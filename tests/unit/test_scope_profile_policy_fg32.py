@@ -31,6 +31,13 @@ def _reset_cache():
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
     monkeypatch.delenv("SCOPE_PROFILE_POLICY_CACHE_TTL_SEC", raising=False)
+    # S3 Phase 7 FG 7-3 + Codex 2차 P1 — 단위 테스트는 기본 single-worker 모드
+    # (Valkey disabled) 로 가정. strict fail-closed bypass 끔.
+    # cluster-wide / strict 경로를 검증하는 케이스는 개별 fixture override.
+    from app.config import settings as app_settings
+    monkeypatch.setattr(app_settings, "valkey_disabled", "1")
+    monkeypatch.setattr(app_settings, "valkey_fail_open_features", "")
+    monkeypatch.setattr(app_settings, "valkey_fail_closed_features", "")
 
 
 @pytest.fixture(autouse=True)
@@ -327,6 +334,88 @@ class TestClusterWideInvalidation:
         policy._handle_remote_invalidate("*")
 
         assert len(policy._cache) == 0
+
+    def test_strict_fail_closed_when_valkey_set_but_subscriber_down(self, monkeypatch):
+        """Codex 2차 P1 시정 — Valkey 설정됨 + subscriber 미연결 시 캐시 우회.
+
+        시나리오: 운영 환경 (Valkey 사용 중) 인데 subscriber 가 disconnect 됨.
+        cluster-wide invalidation 신뢰 불가 → strict fail-closed → 매 호출 DB.
+        """
+        from app.config import settings as app_settings
+        from app.cache import valkey as valkey_mod
+
+        # Valkey 사용 환경 — disabled 아님
+        monkeypatch.setattr(app_settings, "valkey_disabled", "")
+        monkeypatch.setattr(app_settings, "valkey_host", "valkey-host")
+        monkeypatch.setattr(app_settings, "valkey_fail_open_features", "")
+
+        # subscriber 미연결 시뮬레이션
+        policy._subscriber = None
+
+        assert policy.should_bypass_cache() is True
+
+        # 캐시 우회 검증 — 같은 actor 두 번 조회 시 DB 두 번 hit
+        fake_profile = SimpleNamespace(
+            settings=SimpleNamespace(expose_viewers=True),
+        )
+        call_count = {"n": 0}
+
+        class _FakeRepo:
+            def __init__(self, conn):
+                pass
+            def get_by_id(self, pid):
+                call_count["n"] += 1
+                return fake_profile
+
+        monkeypatch.setattr(policy, "ScopeProfileRepository", _FakeRepo)
+
+        actor = _actor(scope_profile_id="sp-strict")
+        policy.should_expose_viewers(actor)
+        policy.should_expose_viewers(actor)
+        # bypass 시 캐시 저장 안 함 → 두 번 모두 DB hit
+        assert call_count["n"] == 2
+
+    def test_strict_fail_closed_disabled_when_valkey_off(self, monkeypatch):
+        """단일 워커 모드 (VALKEY_DISABLED=1 / VALKEY_HOST="") → cluster-wide
+        문제 없음 → 캐시 안전 (bypass False).
+        """
+        from app.config import settings as app_settings
+
+        monkeypatch.setattr(app_settings, "valkey_disabled", "1")
+        monkeypatch.setattr(app_settings, "valkey_fail_open_features", "")
+        policy._subscriber = None
+
+        assert policy.should_bypass_cache() is False
+
+    def test_strict_fail_closed_disabled_via_env_override(self, monkeypatch):
+        """운영자 opt-out — `VALKEY_FAIL_OPEN_FEATURES=scope_policy` 시 종전 동작."""
+        from app.config import settings as app_settings
+
+        monkeypatch.setattr(app_settings, "valkey_disabled", "")
+        monkeypatch.setattr(app_settings, "valkey_host", "valkey-host")
+        monkeypatch.setattr(app_settings, "valkey_fail_open_features", "scope_policy")
+        policy._subscriber = None
+
+        # fail-open override → bypass False (caching 그대로)
+        assert policy.should_bypass_cache() is False
+
+    def test_strict_fail_closed_off_when_subscriber_connected(self, monkeypatch):
+        """subscriber 연결됨 → 정상 — bypass False."""
+        from app.config import settings as app_settings
+
+        monkeypatch.setattr(app_settings, "valkey_disabled", "")
+        monkeypatch.setattr(app_settings, "valkey_host", "valkey-host")
+        monkeypatch.setattr(app_settings, "valkey_fail_open_features", "")
+
+        class _ConnectedSub:
+            def is_connected(self):
+                return True
+
+        policy._subscriber = _ConnectedSub()
+        try:
+            assert policy.should_bypass_cache() is False
+        finally:
+            policy._subscriber = None
 
     def test_broadcast_swallows_pubsub_import_failure(self, monkeypatch):
         """pubsub 모듈 import 실패해도 local invalidate 는 통과."""

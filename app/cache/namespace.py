@@ -27,15 +27,21 @@ __all__ = [
 ]
 
 
-# Valkey 키에 ``:`` 는 segment 구분자. 인자에 포함되면 escape.
-_INVALID_KEY_CHARS = re.compile(r"[\s\r\n\x00]")
+# Valkey 키에 ``:`` 는 segment 구분자. 인자에 포함되면 segment 경계가 모호해지므로
+# whitespace/null/`:` 모두 ``_`` 로 치환한다 (Codex 2차 P3 시정 — 2026-05-19).
+_INVALID_KEY_CHARS = re.compile(r"[\s\r\n\x00:]")
 
 
 def _quote_part(value: object) -> str:
     """키 segment 1개를 안전하게 직렬화한다.
 
-    - whitespace / null byte 차단 (R-I4 — 키 조작 방어)
+    - whitespace / null byte / ``:`` (segment 구분자) 차단 (R-I4 — 키 조작 방어)
     - 빈 문자열은 명시 placeholder ``_`` 로 대체 (segment 누락 방지)
+
+    Notes:
+        ``:`` 는 Valkey 키의 segment 구분자. 인자에 ``:`` 포함 시 segment 경계가
+        모호해져 키 충돌 가능 (예: ``user:1`` 의 actor + ``a`` 의 doc 과
+        ``user`` 의 actor + ``1:a`` 의 doc 이 동일 키). Codex 2차 P3 시정.
     """
     s = str(value)
     if _INVALID_KEY_CHARS.search(s):

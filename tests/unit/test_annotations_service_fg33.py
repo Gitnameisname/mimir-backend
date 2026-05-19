@@ -51,18 +51,22 @@ class TestExtractMentions:
         # case-insensitive — Alice → alice
         assert extract_mentions("@Alice @ALICE @alice") == ["alice"]
 
-    def test_dot_dash_underscore_allowed(self):
-        result = extract_mentions("@first.last @user_name @user-name")
-        assert result == ["first.last", "user_name", "user-name"]
+    def test_dash_underscore_allowed_dot_terminates(self):
+        # S3 Phase 5 FG 5-5 (2026-05-14) 이후 regex: 구두점 (.,;!?…괄호'") 은 token 종료자.
+        # `_` 와 `-` 는 token 내 허용. `.` 는 token 종료 — `@first.last` → "first" 만 매치.
+        assert extract_mentions("@user_name @user-name") == ["user_name", "user-name"]
+        assert extract_mentions("@first.last") == ["first"]
 
-    def test_must_start_with_letter(self):
-        # 숫자 시작 멘션 → 무시
-        assert extract_mentions("@123abc") == []
-        assert extract_mentions("@_underscore") == []
+    def test_first_char_no_letter_restriction(self):
+        # FG 5-5 이후 한국어 display_name 매칭 허용 — letter-only 시작 제약 없음.
+        # 숫자 / underscore 시작도 매치된다.
+        assert extract_mentions("@123abc") == ["123abc"]
+        assert extract_mentions("@_underscore") == ["_underscore"]
 
-    def test_min_length_2(self):
-        # @a (1 글자) → 매치 안 됨 ({1,63} 이라 최소 2 글자 필요)
-        assert extract_mentions("@a") == []
+    def test_min_length_1(self):
+        # FG 5-5 이후 regex `{1,64}` — 1 글자도 매치 (token 호스트가 username/display_name 매칭 시
+        # silent skip 책임).
+        assert extract_mentions("@a") == ["a"]
         assert extract_mentions("@ab") == ["ab"]
 
     def test_max_length_64(self):
@@ -127,6 +131,9 @@ def _mock_repo(monkeypatch):
 def _mock_users(monkeypatch):
     fake = MagicMock()
     fake.get_by_username = MagicMock(return_value=None)
+    # S3 Phase 5 FG 5-5 (2026-05-14) — display_name fallback 도 mock 기본값 None.
+    # 개별 테스트가 필요 시 override.
+    fake.find_by_display_name_in_viewer_orgs = MagicMock(return_value=None)
     monkeypatch.setattr(as_mod, "_users_repository", fake)
     return fake
 
